@@ -754,7 +754,7 @@ class KernelComponentFactoryGfx9(CompatibilityRuleFactoryGfx9):
             # gfx9 (non-gfx950): only F_bn0=64; F_bn0=128 variant is gfx950-only (see Gfx950).
             return {
                 (128, 128): [
-                    SageAttnFwdTileSize(128, 64, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 32, 32, 32, 32, 32, 32, -1),  # fmt: skip
+                    SageAttnFwdTileSize(128, 64, 64, 128, 32, 128, 4, 1, 1, 4, 1, 1, 32, 32, 32, 32, 32, 32, -1),  # fmt: skip
                 ],
             }
         else:
@@ -840,7 +840,7 @@ class KernelComponentFactoryGfx950(
             # gfx950 fp8-family: F_bn0=128 tile only (gfx9 uses F_bn0=64 only).
             return {
                 (128, 128): [
-                    SageAttnFwdTileSize(128, 128, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 32, 32, 32, 32, 32, 32, -1),  # fmt: skip
+                    SageAttnFwdTileSize(128, 128, 64, 128, 32, 128, 4, 1, 1, 4, 1, 1, 32, 32, 32, 32, 32, 32, -1),  # fmt: skip
                 ],
             }
         return super().get_hdim_tile_size_dict(dtype)

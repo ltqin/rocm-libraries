@@ -338,40 +338,6 @@ struct BlockSageAttentionPipelineQRKSVS
         // main loop
         do
         {
-            float k_descale = 1.0f;
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
-            {
-                const index_t kv_idx =
-                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
-                k_descale = k_descale_ptr[kv_idx];
-            }
-            constexpr index_t kNumKScalesPW =
-                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP
-                    ? kN0 / Problem::kBlockScaleSizeK
-                    : 1;
-            constexpr index_t kNumKScalesPT =
-                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD
-                    ? kN0 / Problem::kBlockScaleSizeK / 2
-                    : 1;
-            float k_scales_perwarp[kNumKScalesPW > 0 ? kNumKScalesPW : 1] = {};
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP)
-            {
-                const index_t kv_idx =
-                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
-#pragma unroll
-                for(index_t i = 0; i < kNumKScalesPW; i++)
-                    k_scales_perwarp[i] = k_descale_ptr[kv_idx + i];
-            }
-            float k_scales_reg[kNumKScalesPT > 0 ? kNumKScalesPT : 1] = {};
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD)
-            {
-                const index_t k_global_start    = seqlen_k_start + i_total_loops * kN0;
-                const index_t k_scale_start_idx = k_global_start / Problem::kBlockScaleSizeK;
-#pragma unroll
-                for(index_t i = 0; i < kNumKScalesPT; i++)
-                    k_scales_reg[i] = k_descale_ptr[k_scale_start_idx + 2 * i + sub_warp_idx];
-            }
-
             // STAGE 1, QK gemm
             auto k_dram_window = make_tile_window(
                 k_dram_block_window.get_bottom_tensor_view(),
@@ -439,6 +405,40 @@ struct BlockSageAttentionPipelineQRKSVS
                     store_k_block_tile_to_lds(k_block_tile); // LDS write i + 1
                     k_block_tile = load_tile(k_dram_window); // global read i + 2
                 });
+            }
+
+            float k_descale = 1.0f;
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
+            {
+                const index_t kv_idx =
+                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
+                k_descale = k_descale_ptr[kv_idx];
+            }
+            constexpr index_t kNumKScalesPW =
+                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP
+                    ? kN0 / Problem::kBlockScaleSizeK
+                    : 1;
+            constexpr index_t kNumKScalesPT =
+                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD
+                    ? kN0 / Problem::kBlockScaleSizeK / 2
+                    : 1;
+            float k_scales_perwarp[kNumKScalesPW > 0 ? kNumKScalesPW : 1] = {};
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP)
+            {
+                const index_t kv_idx =
+                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
+#pragma unroll
+                for(index_t i = 0; i < kNumKScalesPW; i++)
+                    k_scales_perwarp[i] = k_descale_ptr[kv_idx + i];
+            }
+            float k_scales_reg[kNumKScalesPT > 0 ? kNumKScalesPT : 1] = {};
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD)
+            {
+                const index_t k_global_start    = seqlen_k_start + i_total_loops * kN0;
+                const index_t k_scale_start_idx = k_global_start / Problem::kBlockScaleSizeK;
+#pragma unroll
+                for(index_t i = 0; i < kNumKScalesPT; i++)
+                    k_scales_reg[i] = k_descale_ptr[k_scale_start_idx + 2 * i + sub_warp_idx];
             }
 
             const auto v_prefetch = load_tile(v_dram_window); // prefetch load v tile

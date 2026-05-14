@@ -320,40 +320,6 @@ struct BlockSageAttentionPipelineQRKSVSAsync
         // main loop
         do
         {
-            float k_descale = 1.0f;
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
-            {
-                const index_t kv_idx =
-                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
-                k_descale = k_descale_ptr[kv_idx];
-            }
-            constexpr index_t kNumKScalesPW =
-                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP
-                    ? kN0 / Problem::kBlockScaleSizeK
-                    : 1;
-            constexpr index_t kNumKScalesPT =
-                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD
-                    ? kN0 / Problem::kBlockScaleSizeK / 2
-                    : 1;
-            float k_scales_perwarp[kNumKScalesPW > 0 ? kNumKScalesPW : 1] = {};
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP)
-            {
-                const index_t kv_idx =
-                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
-#pragma unroll
-                for(index_t i = 0; i < kNumKScalesPW; i++)
-                    k_scales_perwarp[i] = k_descale_ptr[kv_idx + i];
-            }
-            float k_scales_reg[kNumKScalesPT > 0 ? kNumKScalesPT : 1] = {};
-            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD)
-            {
-                const index_t k_global_start    = seqlen_k_start + i_total_loops * kN0;
-                const index_t k_scale_start_idx = k_global_start / Problem::kBlockScaleSizeK;
-#pragma unroll
-                for(index_t i = 0; i < kNumKScalesPT; i++)
-                    k_scales_reg[i] = k_descale_ptr[k_scale_start_idx + 2 * i + sub_warp_idx];
-            }
-
             // STAGE 1, QK gemm
             auto s_acc_gemm = SaccBlockTileType{};
             clear_tile(s_acc_gemm); // initialize C
@@ -387,6 +353,40 @@ struct BlockSageAttentionPipelineQRKSVSAsync
 
             async_load_fence();
             __builtin_amdgcn_s_barrier();
+
+            float k_descale = 1.0f;
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::BLOCKSCALE)
+            {
+                const index_t kv_idx =
+                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
+                k_descale = k_descale_ptr[kv_idx];
+            }
+            constexpr index_t kNumKScalesPW =
+                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP
+                    ? kN0 / Problem::kBlockScaleSizeK
+                    : 1;
+            constexpr index_t kNumKScalesPT =
+                QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD
+                    ? kN0 / Problem::kBlockScaleSizeK / 2
+                    : 1;
+            float k_scales_perwarp[kNumKScalesPW > 0 ? kNumKScalesPW : 1] = {};
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERWARP)
+            {
+                const index_t kv_idx =
+                    (seqlen_k_start + i_total_loops * kN0) / Problem::kBlockScaleSizeK;
+#pragma unroll
+                for(index_t i = 0; i < kNumKScalesPW; i++)
+                    k_scales_perwarp[i] = k_descale_ptr[kv_idx + i];
+            }
+            float k_scales_reg[kNumKScalesPT > 0 ? kNumKScalesPT : 1] = {};
+            if constexpr(QScaleEnum == BlockSageAttentionQuantScaleEnum::PERTHREAD)
+            {
+                const index_t k_global_start    = seqlen_k_start + i_total_loops * kN0;
+                const index_t k_scale_start_idx = k_global_start / Problem::kBlockScaleSizeK;
+#pragma unroll
+                for(index_t i = 0; i < kNumKScalesPT; i++)
+                    k_scales_reg[i] = k_descale_ptr[k_scale_start_idx + 2 * i + sub_warp_idx];
+            }
 
             auto v_buf = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});
             __builtin_amdgcn_sched_barrier(0);
