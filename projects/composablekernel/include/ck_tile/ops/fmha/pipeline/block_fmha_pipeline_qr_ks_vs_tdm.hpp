@@ -95,6 +95,15 @@ struct BlockFmhaPipelineQRKSVSTdm
     // Mirrors block_fmha_pipeline_qr_ks_vs_async_trload.hpp:90.
     static constexpr index_t kAlignmentOacc = Policy::template GetAlignmentO<Problem>();
 
+    // bias/randval DRAM view is [seqlen_q, seqlen_k] with contiguous (stride-1)
+    // dim being seqlen_k. Vectorized load packs along seqlen_k; unlike K (whose
+    // vector dim is hdim, always aligned), seqlen_k is runtime-arbitrary.
+    // - npad kernels (kPadSeqLenK=false) are dispatched only when seqlen_k is
+    //   aligned (dispatch predicate: seqlen_k % bn0 == 0), so bias can vectorize.
+    // - skpad kernels (kPadSeqLenK=true) accept arbitrary seqlen_k. K/V use
+    //   software padding via load_tile_tdm, but bias uses plain load_tile which
+    //   has no padding machinery - vectorized load would over-read and corrupt
+    //   the valid region. Force scalar (alignment 1) for skpad.
     static constexpr index_t kAlignmentBias =
         kPadSeqLenK ? 1 : Policy::template GetAlignmentBias<Problem>();
     static constexpr index_t kAlignmentRandVal =
