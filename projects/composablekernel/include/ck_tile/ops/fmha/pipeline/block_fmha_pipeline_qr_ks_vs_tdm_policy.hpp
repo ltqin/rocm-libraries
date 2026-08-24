@@ -676,9 +676,10 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
         }
         else
         {
-            // Decode: single buffer; Q, K, S, V laid out sequentially.
+            // Decode: double-buffer K for software pipelining (K ping-pong).
+            // Layout: Q (reused space), then [K0, K1, S, V] in sequence.
             return max(GetSmemSizeQ<Problem>(),
-                       GetSmemSizeK<Problem>() + GetSmemSizeS<Problem>() + GetSmemSizeV<Problem>());
+                       2 * GetSmemSizeK<Problem>() + GetSmemSizeS<Problem>() + GetSmemSizeV<Problem>());
         }
     }
 
