@@ -419,31 +419,25 @@ struct BlockFmhaPipelineQRKSVSTdm
                              {0, 0},
                              Policy::template MakeSRegTileDistribution<Problem>());
 
-        // V tile in LDS: loaded via load_tile_tdm (same TDM machinery as Q/K),
-        // with V's DRAM dist switched to trivial tile-major and the V LDS read
-        // view kept plain row-major (matches the write view).
+        // V tile in LDS: double-buffering (ping-pong) for outer loop (seqlen_k tiles).
+        // Allocate two V buffers: v_lds_ptr0 and v_lds_ptr1.
+        VDataType* v_lds_ptr0 = reinterpret_cast<VDataType*>(
+            static_cast<char*>(smem_ptr) + 2 * Policy::template GetSmemSizeK<Problem>() +
+            Policy::template GetSmemSizeS<Problem>());
+        VDataType* v_lds_ptr1 = reinterpret_cast<VDataType*>(
+            static_cast<char*>(smem_ptr) + 2 * Policy::template GetSmemSizeK<Problem>() +
+            Policy::template GetSmemSizeS<Problem>() + Policy::template GetSmemSizeV<Problem>());
+
         auto v_dram_window =
             make_tile_window(v_dram_block_window_tmp,
                              {kv_load_start, 0},
                              Policy::template MakeVDramTileDistribution<Problem>());
 
         auto v_lds_write_view = make_tensor_view<address_space_enum::lds>(
-            reinterpret_cast<VDataType*>(static_cast<char*>(smem_ptr) +
-                                         2 * Policy::template GetSmemSizeK<Problem>() +
-                                         Policy::template GetSmemSizeS<Problem>()),
-            Policy::template MakeVLdsBlockDescriptor<Problem>());
-        // V LDS read view uses the same plain row-major desc as the write
-        // view (Xor=false). This matches the TDM box-major writer (single
-        // plain box per V tile) and lets the existing MakeVRegTileDistribution
-        // outer-dist + QuadInputEncoding suffix (TransposedDstrEncode) drive
-        // ds_load_tr_b128 with per-lane VOFFSETs that satisfy the WMMA B
-        // operand expected pattern. Verified end-to-end on ABC + multi-stride
-        // GQA + d-sweep (d <= 128).
+            v_lds_ptr0, Policy::template MakeVLdsBlockDescriptor<Problem>());
         auto v_lds_read_view = make_tensor_view<address_space_enum::lds>(
-            reinterpret_cast<VDataType*>(static_cast<char*>(smem_ptr) +
-                                         2 * Policy::template GetSmemSizeK<Problem>() +
-                                         Policy::template GetSmemSizeS<Problem>()),
-            Policy::template MakeVLdsBlockDescriptor<Problem>());
+            v_lds_ptr0, Policy::template MakeVLdsBlockDescriptor<Problem>());
+
         auto v_lds_write_window =
             make_tile_window(v_lds_write_view,
                              Policy::template MakeVLdsBlockDescriptor<Problem>().get_lengths(),
@@ -475,12 +469,16 @@ struct BlockFmhaPipelineQRKSVSTdm
 
         do
         {
-            block_sync_lds();
-            // V uses load_tile_tdm (single-box plain LDS write). Both K and V
-            // are on the tensorcnt counter (s_wait_tensorcnt_barrier for sync).
-            load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window); // prefetch load v tile
+            // V ping-pong: alternate between v_lds_ptr0 and v_lds_ptr1 for each outer loop iteration
+            const bool v_j_in_buf0 = (i_total_loops % 2 == 0);
 
-            // move V tile windows
+            // Issue V[j] global→LDS at loop top (overlaps with QK GEMM + softmax below)
+            block_sync_lds();
+            v_lds_write_window.set_bottom_tensor_view_data_ptr(
+                v_j_in_buf0 ? v_lds_ptr0 : v_lds_ptr1);
+            load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
+
+            // move V tile windows for next iteration
             move_tile_window(v_dram_window, {kN0, 0});
 
             // STAGE 1, QK gemm
@@ -755,10 +753,13 @@ struct BlockFmhaPipelineQRKSVSTdm
                 });
             });
 
-            // V is on the tensorcnt counter (load_tile_tdm). Wait for V TDM
+            // V is on the tensorcnt counter (load_tile_tdm). Wait for V[j] TDM
             // write to fully commit before ds_load_tr reads.
             s_wait_tensorcnt_barrier<0>();
 
+            // Read V[j] from the buffer it was just written to
+            v_lds_read_window.set_bottom_tensor_view_data_ptr(
+                v_j_in_buf0 ? v_lds_ptr0 : v_lds_ptr1);
             auto v_tile = load_tile_transpose(v_lds_read_window);
 
             if constexpr(1 < k1_loops)
