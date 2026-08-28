@@ -989,7 +989,10 @@ struct BlockFmhaPipelineQRKSVSTdm
             tdm_config_q.pad_config.pad_amount   = LdsPaddingConfigQ[I1];
             tdm_config_q.pad_config.pad_interval = LdsPaddingConfigQ[number<2>{}];
 
-            constexpr auto LdsPaddingConfigK     = Policy::template GetLdsPaddingConfigK<Problem>();
+            // Prefill loads the full head dim (LoadOnce) into K LDS, so the pad
+            // config must be computed for the LoadOnce K descriptor width.
+            constexpr auto LdsPaddingConfigK =
+                Policy::template GetLdsPaddingConfigK<Problem, true>();
             tdm_config_k.pad_enable              = LdsPaddingConfigK[I0];
             tdm_config_k.pad_config.pad_amount   = LdsPaddingConfigK[I1];
             tdm_config_k.pad_config.pad_interval = LdsPaddingConfigK[number<2>{}];
