@@ -837,10 +837,16 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
         }
         else
         {
-            // Decode: double-buffer K and V for software pipelining (ping-pong).
-            // Layout: Q (reused space), then [K0, K1, S, V0, V1] in sequence.
+            // Decode: K uses k0_loops independent buffers so all k0_loops TDM
+            // loads of one K tile can be in flight together (memory-level
+            // parallelism); gemm waits per-chunk via s_wait_tensorcnt. V stays
+            // double-buffered (ping-pong).
+            // Layout: Q (reused space), then [K0..K{n-1}, S, V0, V1] in sequence.
+            constexpr index_t k0_loops =
+                Problem::BlockFmhaShape::kQKHeaddim / Problem::BlockFmhaShape::kK0;
             return max(GetSmemSizeQ<Problem>(),
-                       2 * GetSmemSizeK<Problem>() + GetSmemSizeS<Problem>() + 2 * GetSmemSizeV<Problem>());
+                       k0_loops * GetSmemSizeK<Problem>() + GetSmemSizeS<Problem>() +
+                           2 * GetSmemSizeV<Problem>());
         }
     }
 

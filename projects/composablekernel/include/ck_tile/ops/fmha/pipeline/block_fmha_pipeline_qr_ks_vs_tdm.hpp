@@ -385,16 +385,20 @@ struct BlockFmhaPipelineQRKSVSTdm
                              {kv_load_start, 0},
                              Policy::template MakeKDramTileDistribution<Problem>());
 
-        // K LDS: double-buffering (ping-pong) for single-buffer decode path (bm0=64).
-        // Allocate two K buffers: k_lds_ptr0 and k_lds_ptr1.
-        KDataType* k_lds_ptr0 = static_cast<KDataType*>(smem_ptr);
-        KDataType* k_lds_ptr1 = reinterpret_cast<KDataType*>(
-            reinterpret_cast<char*>(smem_ptr) + Policy::template GetSmemSizeK<Problem>());
+        // K LDS: k0_loops independent buffers so all k0_loops TDM loads of one
+        // K tile can be issued together and stay in flight (memory-level
+        // parallelism). gemm waits per-chunk via s_wait_tensorcnt<k0_loops-1-i>.
+        constexpr index_t k0_loops_smem = kQKHeaddim / kK0;
+        KDataType* k_lds_ptrs[k0_loops_smem];
+        static_for<0, k0_loops_smem, 1>{}([&](auto ib) {
+            k_lds_ptrs[ib] = reinterpret_cast<KDataType*>(
+                reinterpret_cast<char*>(smem_ptr) + ib * Policy::template GetSmemSizeK<Problem>());
+        });
 
         auto k_lds_write_view = make_tensor_view<address_space_enum::lds>(
-            k_lds_ptr0, Policy::template MakeKLdsBlockDescriptor<Problem>());
+            k_lds_ptrs[0], Policy::template MakeKLdsBlockDescriptor<Problem>());
         auto k_lds_read_view = make_tensor_view<address_space_enum::lds>(
-            k_lds_ptr0, Policy::template MakeKLdsBlockDescriptor<Problem>());
+            k_lds_ptrs[0], Policy::template MakeKLdsBlockDescriptor<Problem>());
 
         auto k_lds_write_window =
             make_tile_window(k_lds_write_view,
@@ -406,10 +410,11 @@ struct BlockFmhaPipelineQRKSVSTdm
                              {0, 0},
                              Policy::template MakeKRegTileDistribution<Problem>());
 
-        // S tile in LDS (offset by 2x K buffers now)
+        // S tile in LDS (offset by k0_loops K buffers now)
         auto s_lds = make_tensor_view<address_space_enum::lds>(
             reinterpret_cast<SaccDataType*>(reinterpret_cast<char*>(smem_ptr) +
-                                            2 * Policy::template GetSmemSizeK<Problem>()),
+                                            k0_loops_smem *
+                                                Policy::template GetSmemSizeK<Problem>()),
             Policy::template MakeSLdsBlockDescriptor<Problem>());
         auto s_write_lds_window = make_tile_window(
             s_lds, Policy::template MakeSLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
@@ -421,11 +426,13 @@ struct BlockFmhaPipelineQRKSVSTdm
 
         // V tile in LDS: double-buffering (ping-pong) for outer loop (seqlen_k tiles).
         // Allocate two V buffers: v_lds_ptr0 and v_lds_ptr1.
-        VDataType* v_lds_ptr0 = reinterpret_cast<VDataType*>(
-            static_cast<char*>(smem_ptr) + 2 * Policy::template GetSmemSizeK<Problem>() +
-            Policy::template GetSmemSizeS<Problem>());
+        VDataType* v_lds_ptr0 =
+            reinterpret_cast<VDataType*>(static_cast<char*>(smem_ptr) +
+                                         k0_loops_smem * Policy::template GetSmemSizeK<Problem>() +
+                                         Policy::template GetSmemSizeS<Problem>());
         VDataType* v_lds_ptr1 = reinterpret_cast<VDataType*>(
-            static_cast<char*>(smem_ptr) + 2 * Policy::template GetSmemSizeK<Problem>() +
+            static_cast<char*>(smem_ptr) +
+            k0_loops_smem * Policy::template GetSmemSizeK<Problem>() +
             Policy::template GetSmemSizeS<Problem>() + Policy::template GetSmemSizeV<Problem>());
 
         auto v_dram_window =
@@ -464,79 +471,55 @@ struct BlockFmhaPipelineQRKSVSTdm
         static_assert(1 <= k1_loops);
 
         fmha_tdm_enable_expert_sched();
-        block_sync_lds();
-        load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
 
         do
         {
-            // V ping-pong: alternate between v_lds_ptr0 and v_lds_ptr1 for each outer loop iteration
+            // V ping-pong: alternate between v_lds_ptr0 and v_lds_ptr1 for each outer loop
+            // iteration
             const bool v_j_in_buf0 = (i_total_loops % 2 == 0);
-
-            // Issue V[j] global→LDS at loop top (overlaps with QK GEMM + softmax below)
-            block_sync_lds();
-            v_lds_write_window.set_bottom_tensor_view_data_ptr(
-                v_j_in_buf0 ? v_lds_ptr0 : v_lds_ptr1);
-            load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
-
-            // move V tile windows for next iteration
-            move_tile_window(v_dram_window, {kN0, 0});
 
             // STAGE 1, QK gemm
             clear_tile(s_acc); // initialize C
 
-            // Declare k_tile outside if-else for use in last GEMM (line ~540)
-            decltype(load_tile(k_lds_read_window)) k_tile;
-
-            if constexpr(1 < k0_loops)
-            {
-                // K ping-pong double-buffering: overlap GEMM(K[i]) with DMA load of K[i+1].
-                // Initial: K[0] already loaded into buf0 (line ~474).
-                // Prefetch K[1] into buf1 BEFORE the loop, so GEMM(K[0]) overlaps with K[1] loading.
-
-                s_wait_tensorcnt_barrier<0>();
-                k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_ptr0);
-                k_tile = load_tile(k_lds_read_window);  // K[0] from buf0
-
-                // Main loop: issue K[i+1] load at top, GEMM(K[i]) overlaps, then wait & read K[i+1]
-                static_for<0, k0_loops - 1, 1>{}([&](auto i_k0) {
-                    constexpr bool k_i_in_buf0 = (i_k0 % 2 == 0);
-
-                    // Issue K[i+1] global→LDS FIRST (overlaps with GEMM below)
+            // K 4-buffer parallel load: issue all k0_loops TDM loads up front so
+            // they stay in flight together (memory-level parallelism), then gemm
+            // waits per-chunk. K is issued BEFORE V so the K loads are not stuck
+            // behind V on the DMA path -- they start filling immediately.
+            static_for<0, k0_loops, 1>{}([&](auto i_k0) {
+                if constexpr(i_k0 > 0)
                     move_tile_window(k_dram_window, {0, kK0});
-                    block_sync_lds();
-                    k_lds_write_window.set_bottom_tensor_view_data_ptr(
-                        k_i_in_buf0 ? k_lds_ptr1 : k_lds_ptr0);
-                    load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
+                block_sync_lds();
+                k_lds_write_window.set_bottom_tensor_view_data_ptr(k_lds_ptrs[i_k0]);
+                load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
+            });
+            // move K dram window back to the tile origin along hdim
+            move_tile_window(k_dram_window, {0, -kK0 * (k0_loops - 1)});
 
-                    // GEMM with K[i], while K[i+1] loads in background
-                    gemm_0(s_acc,
-                           get_slice_tile(q_tile,
-                                          sequence<0, i_k0 * kK0>{},
-                                          sequence<kM0, (i_k0 + 1) * kK0>{}),
-                           k_tile);
+            // Issue V[j] global→LDS AFTER the K loads (overlaps with QK GEMM +
+            // softmax below). Issue order is [K0..K{n-1}, V]; TDM retires in
+            // order, so when K[i] has landed the outstanding count is
+            // K[i+1..k0_loops-1] plus the still-in-flight V = (k0_loops - i).
+            // Hence the per-chunk wait below is s_wait_tensorcnt_barrier<k0_loops-i>.
+            block_sync_lds();
+            v_lds_write_window.set_bottom_tensor_view_data_ptr(v_j_in_buf0 ? v_lds_ptr0
+                                                                           : v_lds_ptr1);
+            load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
+            // move V tile windows for next iteration
+            move_tile_window(v_dram_window, {kN0, 0});
 
-                    // Wait for K[i+1] and load to register
-                    s_wait_tensorcnt_barrier<0>();
-                    k_lds_read_window.set_bottom_tensor_view_data_ptr(
-                        k_i_in_buf0 ? k_lds_ptr1 : k_lds_ptr0);
-                    k_tile = load_tile(k_lds_read_window);  // K[i+1] to register
-                });
-                // move back to the origin
-                move_tile_window(k_dram_window, {0, -kK0 * (k0_loops - 1)});
-            }
-            else  // k0_loops == 1
-            {
-                s_wait_tensorcnt_barrier<0>();
-                k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_ptr0);
-                k_tile = load_tile(k_lds_read_window);
-            }
-
-            // Last GEMM: k_tile already holds K[k0_loops-1] (loaded at end of last loop iteration or else branch)
-            gemm_0(s_acc,
-                   get_slice_tile(q_tile,
-                                  sequence<0, (k0_loops - 1) * kK0>{},
-                                  sequence<kM0, k0_loops * kK0>{}),
-                   k_tile);
+            // gemm per-chunk: wait only until K[i] has landed (V still in flight),
+            // then consume K[i] while the remaining K chunks keep loading.
+            // The barrier variant preserves cross-wave LDS visibility that the
+            // original <0> wait provided.
+            static_for<0, k0_loops, 1>{}([&](auto i_k0) {
+                s_wait_tensorcnt_barrier<k0_loops - i_k0>();
+                k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_ptrs[i_k0]);
+                auto k_tile = load_tile(k_lds_read_window); // K[i] from its buffer
+                gemm_0(s_acc,
+                       get_slice_tile(
+                           q_tile, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{}),
+                       k_tile);
+            });
 
             // STAGE 2: scale_s, add bias (mirrors baseline qr_ks_vs line 715-776)
             if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
@@ -636,13 +619,11 @@ struct BlockFmhaPipelineQRKSVSTdm
                 }
             }
 
-            // move K and bias tile windows after current status checked
-            // prefetch next-tile along [K]ey sequence length dimension
+            // move K and bias tile windows to the next tile along [K]ey seqlen.
+            // K is now loaded at the top of the next iteration (4-buffer parallel),
+            // so no prefetch here -- just advance the window.
             move_tile_window(k_dram_window, {kN0, 0});
             move_tile_window(bias_dram_window, {0, kN0});
-
-            block_sync_lds();
-            load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
 
             // Gemm1
             auto s_new = [&]() {
@@ -758,8 +739,8 @@ struct BlockFmhaPipelineQRKSVSTdm
             s_wait_tensorcnt_barrier<0>();
 
             // Read V[j] from the buffer it was just written to
-            v_lds_read_window.set_bottom_tensor_view_data_ptr(
-                v_j_in_buf0 ? v_lds_ptr0 : v_lds_ptr1);
+            v_lds_read_window.set_bottom_tensor_view_data_ptr(v_j_in_buf0 ? v_lds_ptr0
+                                                                          : v_lds_ptr1);
             auto v_tile = load_tile_transpose(v_lds_read_window);
 
             if constexpr(1 < k1_loops)
