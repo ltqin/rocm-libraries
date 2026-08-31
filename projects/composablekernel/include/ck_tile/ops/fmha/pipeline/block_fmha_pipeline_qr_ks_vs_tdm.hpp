@@ -26,6 +26,14 @@ CK_TILE_DEVICE void fmha_tdm_enable_expert_sched()
 #endif
 }
 
+// E3 experiment: retune IGLP sched_group_barrier MFMA/DS_READ ratio in the
+// double-buffer mainloop. ATT shows s_wait_dscnt is 33% of stall, i.e. LDS
+// reads are not hidden behind MFMA. Measured +0.79% avg on gfx1250 bf16 d128,
+// so on by default. Disable with -DCK_TILE_FMHA_TDM_IGLP_TUNE=0.
+#ifndef CK_TILE_FMHA_TDM_IGLP_TUNE
+#define CK_TILE_FMHA_TDM_IGLP_TUNE 1
+#endif
+
 // This pipeline is qkv all located in LDS, targeting gfx1250
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSTdmDefaultPolicy>
 struct BlockFmhaPipelineQRKSVSTdm
@@ -1278,6 +1286,21 @@ struct BlockFmhaPipelineQRKSVSTdm
                 -numeric<SMPLComputeDataType>::infinity()); // m_local = rowmax(S{j})
             block_tile_reduce_sync(m_local, f_max, bool_constant<false>{});
 
+#if CK_TILE_FMHA_TDM_IGLP_TUNE
+            // E3 gemm1 variant: front-load DS_READ (2 per MFMA early) so LDS
+            // reads issue sooner and hide behind later MFMA. Total DS_READ kept
+            // at 20 (8*2 + 4*1) across 12 MFMA groups.
+            static_for<0, 8, 1>{}([&](auto i) {
+                ignore = i;
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
+            });
+            static_for<0, 4, 1>{}([&](auto i) {
+                ignore = i;
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+            });
+#else
             static_for<0, 12, 1>{}([&](auto i) {
                 ignore = i;
                 __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
@@ -1289,6 +1312,7 @@ struct BlockFmhaPipelineQRKSVSTdm
                 __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
                 __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
             });
+#endif
 
             const auto m_old = m; // m{j-1}
             tile_elementwise_inout(
@@ -1410,6 +1434,21 @@ struct BlockFmhaPipelineQRKSVSTdm
             k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_read_ptr);
             k_tile = load_tile(k_lds_read_window);
 
+#if CK_TILE_FMHA_TDM_IGLP_TUNE
+            // E3 gemm0 variant: front-load DS_READ (3 per MFMA early) to surface
+            // the transposed K/V LDS reads sooner. Total DS_READ kept at 28
+            // (8*3 + 4*1) across 12 MFMA groups.
+            static_for<0, 8, 1>{}([&](auto i) {
+                ignore = i;
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                __builtin_amdgcn_sched_group_barrier(0x100, 3, 0); // DS_READ
+            });
+            static_for<0, 4, 1>{}([&](auto i) {
+                ignore = i;
+                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+            });
+#else
             static_for<0, 12, 1>{}([&](auto i) {
                 ignore = i;
                 __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
@@ -1421,6 +1460,7 @@ struct BlockFmhaPipelineQRKSVSTdm
                 __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
                 __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
             });
+#endif
         }; // mainloop
 
         do
