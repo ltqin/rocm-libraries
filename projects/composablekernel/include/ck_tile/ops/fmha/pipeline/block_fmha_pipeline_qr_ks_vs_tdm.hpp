@@ -34,6 +34,30 @@ CK_TILE_DEVICE void fmha_tdm_enable_expert_sched()
 #define CK_TILE_FMHA_TDM_IGLP_TUNE 1
 #endif
 
+// E1 experiment: partial tensorcnt wait in the double-buffer mainloop. ATT
+// shows s_wait_tensorcnt is 48.7% of stall. The <0> waits drain ALL in-flight
+// TDM loads including the just-issued next-block prefetch, over-synchronizing.
+// Allowing 1 outstanding load lets the next-block prefetch keep flying while we
+// consume the current block.
+//
+// Measured (gfx1250 bf16 d128, max of 5 to reject shared-GPU interference):
+//   long seqlen (num_total_loop >= 128, i.e. s>=8192): +9~13%
+//   short seqlen (s=4096, 64 loops): flat, and b=8 regressed -13.6%.
+// So the relaxation only pays off when the mainloop is long enough to hide the
+// prefetch; short loops lose from disturbed sync. We therefore gate it on
+// num_total_loop: at runtime we pick which compile-time specialization of the
+// mainloop runs (partial vs full wait), so the per-iteration barrier stays
+// branch-free. The threshold below is the loop count above which partial wait
+// is used. Measured +9.6% on gfx1250 bf16 d128 for s>=8192, so on by default.
+// Correctness is gated by -v=1. Disable with
+// -DCK_TILE_FMHA_TDM_PARTIAL_TENSORCNT=0.
+#ifndef CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT
+#define CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT 1
+#endif
+#ifndef CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT_MIN_LOOPS
+#define CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT_MIN_LOOPS 128
+#endif
+
 // This pipeline is qkv all located in LDS, targeting gfx1250
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSTdmDefaultPolicy>
 struct BlockFmhaPipelineQRKSVSTdm
@@ -1099,6 +1123,14 @@ struct BlockFmhaPipelineQRKSVSTdm
             integer_divide_ceil(physical_seqlen_k_end - physical_seqlen_k_start, kN0) +
             num_sink_loop;
 
+        // E1: only relax tensorcnt on long mainloops (see macro comment above).
+#if CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT
+        const bool use_partial_tensorcnt =
+            num_total_loop >= CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT_MIN_LOOPS;
+#else
+        const bool use_partial_tensorcnt = false;
+#endif
+
         index_t i_total_loops      = 0;
         constexpr index_t k0_loops = kQKHeaddim / kK0;
         constexpr index_t k1_loops = kN0 / kK1;
@@ -1123,7 +1155,11 @@ struct BlockFmhaPipelineQRKSVSTdm
 
         __builtin_amdgcn_sched_barrier(0);
 
-        auto mainloop = [&](KDataType* __restrict__ k_lds_write_ptr,
+        // partial_wait is a compile-time bool_constant (E1): when true, use
+        // s_wait_tensorcnt_barrier<1> (partial), else <0>. Passing it as a
+        // compile-time flag keeps the tensorcnt wait branch-free in the hot loop.
+        auto mainloop = [&](auto partial_wait,
+                            KDataType* __restrict__ k_lds_write_ptr,
                             KDataType* __restrict__ k_lds_read_ptr,
                             KDataType* __restrict__ v_lds_write_ptr,
                             KDataType* __restrict__ v_lds_read_ptr) {
@@ -1201,7 +1237,10 @@ struct BlockFmhaPipelineQRKSVSTdm
                 });
             }
 
-            s_wait_tensorcnt_barrier<0>();
+            if constexpr(partial_wait)
+                s_wait_tensorcnt_barrier<1>();
+            else
+                s_wait_tensorcnt_barrier<0>();
             v_lds_read_window.set_bottom_tensor_view_data_ptr(v_lds_read_ptr);
             auto v_tile = load_tile_transpose(v_lds_read_window);
 
@@ -1430,7 +1469,10 @@ struct BlockFmhaPipelineQRKSVSTdm
                                   sequence<kM0, k1_loops * kK1>{}),
                    v_tile);
 
-            s_wait_tensorcnt_barrier<0>();
+            if constexpr(partial_wait)
+                s_wait_tensorcnt_barrier<1>();
+            else
+                s_wait_tensorcnt_barrier<0>();
             k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_read_ptr);
             k_tile = load_tile(k_lds_read_window);
 
@@ -1463,20 +1505,36 @@ struct BlockFmhaPipelineQRKSVSTdm
 #endif
         }; // mainloop
 
-        do
-        {
-            bool is_even_loop    = i_total_loops % 2 == 0;
-            auto k_lds_write_ptr = is_even_loop ? static_cast<KDataType* __restrict__>(smem_ptrk0)
-                                                : static_cast<KDataType* __restrict__>(smem_ptrk1);
-            auto k_lds_read_ptr  = is_even_loop ? static_cast<KDataType* __restrict__>(smem_ptrk1)
-                                                : static_cast<KDataType* __restrict__>(smem_ptrk0);
-            auto v_lds_write_ptr = is_even_loop ? static_cast<VDataType* __restrict__>(smem_ptrv1)
-                                                : static_cast<VDataType* __restrict__>(smem_ptrv0);
-            auto v_lds_read_ptr  = is_even_loop ? static_cast<VDataType* __restrict__>(smem_ptrv0)
-                                                : static_cast<VDataType* __restrict__>(smem_ptrv1);
-            mainloop(k_lds_write_ptr, k_lds_read_ptr, v_lds_write_ptr, v_lds_read_ptr);
-            i_total_loops++;
-        } while(i_total_loops < num_total_loop);
+        // E1: pick the tensorcnt policy once, outside the hot loop, so the
+        // per-iteration barrier is compile-time (branch-free). The runtime
+        // decision (long vs short mainloop) only selects which specialization
+        // of the do-while runs.
+        auto run_loop = [&](auto partial_wait) {
+            do
+            {
+                bool is_even_loop    = i_total_loops % 2 == 0;
+                auto k_lds_write_ptr = is_even_loop
+                                           ? static_cast<KDataType* __restrict__>(smem_ptrk0)
+                                           : static_cast<KDataType* __restrict__>(smem_ptrk1);
+                auto k_lds_read_ptr  = is_even_loop
+                                           ? static_cast<KDataType* __restrict__>(smem_ptrk1)
+                                           : static_cast<KDataType* __restrict__>(smem_ptrk0);
+                auto v_lds_write_ptr = is_even_loop
+                                           ? static_cast<VDataType* __restrict__>(smem_ptrv1)
+                                           : static_cast<VDataType* __restrict__>(smem_ptrv0);
+                auto v_lds_read_ptr  = is_even_loop
+                                           ? static_cast<VDataType* __restrict__>(smem_ptrv0)
+                                           : static_cast<VDataType* __restrict__>(smem_ptrv1);
+                mainloop(
+                    partial_wait, k_lds_write_ptr, k_lds_read_ptr, v_lds_write_ptr, v_lds_read_ptr);
+                i_total_loops++;
+            } while(i_total_loops < num_total_loop);
+        };
+
+        if(use_partial_tensorcnt)
+            run_loop(bool_constant<true>{});
+        else
+            run_loop(bool_constant<false>{});
 
         if constexpr(kStoreLSE)
         {
