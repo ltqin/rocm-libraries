@@ -26,16 +26,28 @@ CK_TILE_DEVICE void fmha_tdm_enable_expert_sched()
 #endif
 }
 
-// E3 experiment: retune IGLP sched_group_barrier MFMA/DS_READ ratio in the
-// double-buffer mainloop. ATT shows s_wait_dscnt is 33% of stall, i.e. LDS
-// reads are not hidden behind MFMA. Measured +0.79% avg on gfx1250 bf16 d128,
-// so on by default. Disable with -DCK_TILE_FMHA_TDM_IGLP_TUNE=0.
+// Retune the IGLP sched_group_barrier MFMA/DS_READ ratio in the double-buffer
+// mainloop. Profiling shows s_wait_dscnt is ~33% of stall, i.e. LDS reads are
+// not hidden behind MFMA. Front-loading DS_READ measured +0.79% avg on gfx1250
+// bf16 d128, so on by default. Superseded by IGLP_BULK below when that is set.
+// Disable with -DCK_TILE_FMHA_TDM_IGLP_TUNE=0.
 #ifndef CK_TILE_FMHA_TDM_IGLP_TUNE
 #define CK_TILE_FMHA_TDM_IGLP_TUNE 1
 #endif
 
-// E1 experiment: partial tensorcnt wait in the double-buffer mainloop. ATT
-// shows s_wait_tensorcnt is 48.7% of stall. The <0> waits drain ALL in-flight
+// IGLP "bulk" grouping. Instead of the fine 1-MFMA:N-DS_READ interleave above,
+// issue ALL DS_READ first then ALL MFMA in the gemm0/gemm1 groups, so LDS-read
+// latency (the #1 stall, dscnt ~69% once the tensorcnt wait is relaxed) is
+// hidden behind a burst of back-to-back independent WMMAs. Takes priority over
+// IGLP_TUNE when set. Measured +3.46% avg on gfx1250 bf16 d128 s=16384
+// (same-batch, clean GPU), so on by default. Disable with
+// -DCK_TILE_FMHA_TDM_IGLP_BULK=0.
+#ifndef CK_TILE_FMHA_TDM_IGLP_BULK
+#define CK_TILE_FMHA_TDM_IGLP_BULK 1
+#endif
+
+// Partial tensorcnt wait in the double-buffer mainloop. Profiling shows
+// s_wait_tensorcnt is 48.7% of stall. The <0> waits drain ALL in-flight
 // TDM loads including the just-issued next-block prefetch, over-synchronizing.
 // Allowing 1 outstanding load lets the next-block prefetch keep flying while we
 // consume the current block.
@@ -1123,7 +1135,7 @@ struct BlockFmhaPipelineQRKSVSTdm
             integer_divide_ceil(physical_seqlen_k_end - physical_seqlen_k_start, kN0) +
             num_sink_loop;
 
-        // E1: only relax tensorcnt on long mainloops (see macro comment above).
+        // Only relax tensorcnt on long mainloops (see macro comment above).
 #if CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT
         const bool use_partial_tensorcnt =
             num_total_loop >= CK_TILE_FMHA_TDM_PARTIAL_TENSORCNT_MIN_LOOPS;
@@ -1155,7 +1167,7 @@ struct BlockFmhaPipelineQRKSVSTdm
 
         __builtin_amdgcn_sched_barrier(0);
 
-        // partial_wait is a compile-time bool_constant (E1): when true, use
+        // partial_wait is a compile-time bool_constant: when true, use
         // s_wait_tensorcnt_barrier<1> (partial), else <0>. Passing it as a
         // compile-time flag keeps the tensorcnt wait branch-free in the hot loop.
         auto mainloop = [&](auto partial_wait,
@@ -1325,8 +1337,14 @@ struct BlockFmhaPipelineQRKSVSTdm
                 -numeric<SMPLComputeDataType>::infinity()); // m_local = rowmax(S{j})
             block_tile_reduce_sync(m_local, f_max, bool_constant<false>{});
 
-#if CK_TILE_FMHA_TDM_IGLP_TUNE
-            // E3 gemm1 variant: front-load DS_READ (2 per MFMA early) so LDS
+#if CK_TILE_FMHA_TDM_IGLP_BULK
+            // gemm1 bulk variant: issue ALL DS_READ first, then ALL MFMA, so the
+            // V ds_load_tr16 latency is hidden behind a burst of back-to-back
+            // WMMAs (accumulators are independent). gemm1 has 20 DS_READ, 12 MFMA.
+            __builtin_amdgcn_sched_group_barrier(0x100, 20, 0); // DS_READ bulk
+            __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
+#elif CK_TILE_FMHA_TDM_IGLP_TUNE
+            // gemm1 fine variant: front-load DS_READ (2 per MFMA early) so LDS
             // reads issue sooner and hide behind later MFMA. Total DS_READ kept
             // at 20 (8*2 + 4*1) across 12 MFMA groups.
             static_for<0, 8, 1>{}([&](auto i) {
@@ -1476,8 +1494,14 @@ struct BlockFmhaPipelineQRKSVSTdm
             k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_read_ptr);
             k_tile = load_tile(k_lds_read_window);
 
-#if CK_TILE_FMHA_TDM_IGLP_TUNE
-            // E3 gemm0 variant: front-load DS_READ (3 per MFMA early) to surface
+#if CK_TILE_FMHA_TDM_IGLP_BULK
+            // gemm0 bulk variant: issue ALL DS_READ first, then ALL MFMA, so the
+            // K ds_load_b128 latency is hidden behind a burst of back-to-back
+            // WMMAs (accumulators are independent). gemm0 has 28 DS_READ, 12 MFMA.
+            __builtin_amdgcn_sched_group_barrier(0x100, 28, 0); // DS_READ bulk
+            __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
+#elif CK_TILE_FMHA_TDM_IGLP_TUNE
+            // gemm0 fine variant: front-load DS_READ (3 per MFMA early) to surface
             // the transposed K/V LDS reads sooner. Total DS_READ kept at 28
             // (8*3 + 4*1) across 12 MFMA groups.
             static_for<0, 8, 1>{}([&](auto i) {
@@ -1505,7 +1529,7 @@ struct BlockFmhaPipelineQRKSVSTdm
 #endif
         }; // mainloop
 
-        // E1: pick the tensorcnt policy once, outside the hot loop, so the
+        // Pick the tensorcnt policy once, outside the hot loop, so the
         // per-iteration barrier is compile-time (branch-free). The runtime
         // decision (long vs short mainloop) only selects which specialization
         // of the do-while runs.
