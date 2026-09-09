@@ -281,46 +281,98 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
         }
         else
         {
-            using KDataType                 = remove_cvref_t<typename Problem::KDataType>;
-            constexpr index_t BytesPerDword = sizeof(int32_t);
-            constexpr auto DataTypeSize     = sizeof(KDataType);
-            constexpr index_t PaddingAmount = LdsPaddingConfigK[number<1>{}];
-
-            constexpr index_t NLdsLayerRequired =
-                get_n_lds_banks() * get_n_dwords_per_128b() / kKPerBlock / DataTypeSize;
-            constexpr auto NLdsLayer = max(1, NLdsLayerRequired);
+            using KDataType                   = remove_cvref_t<typename Problem::KDataType>;
+            constexpr index_t BytesPerDword   = sizeof(int32_t);
+            constexpr auto DataTypeSize       = sizeof(KDataType);
+            constexpr index_t PaddingAmount   = LdsPaddingConfigK[number<1>{}];
+            constexpr index_t PaddingInterval = LdsPaddingConfigK[number<2>{}];
 
             constexpr index_t PaddingDataAmount = (PaddingAmount + 1) * BytesPerDword / DataTypeSize;
+            // TDM writer inserts padding every PaddingStride data elements
+            // (2^(PaddingInterval+1) dwords). GetLdsPaddingConfigK derives
+            // PaddingInterval via largest_pow2_divisor so PaddingStride evenly
+            // divides the row width kKPerBlock (see the chunk branch below).
+            constexpr index_t PaddingStride =
+                (1 << (PaddingInterval + 1)) * BytesPerDword / DataTypeSize;
 
-            constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
-                make_tuple(number<kNPerBlock / NLdsLayer>{},
-                           number<kKPerBlock / kKPack * NLdsLayer>{},
-                           number<kKPack>{}),
-                make_tuple(number<kKPerBlock * NLdsLayer + PaddingDataAmount>{},
-                           number<kKPack>{},
-                           number<1>{}),
-                number<kKPack>{},
-                number<1>{});
+            if constexpr(PaddingStride >= kKPerBlock)
+            {
+                // stride >= row: padding lands at row (band) boundaries. One pad
+                // per NLdsLayer stacked rows. This is the only case for the
+                // shipped configs (decode kK0=32, prefill hdim=128); byte
+                // identical to the pre-Change-A layout.
+                constexpr index_t NLdsLayerRequired =
+                    get_n_lds_banks() * get_n_dwords_per_128b() / kKPerBlock / DataTypeSize;
+                constexpr auto NLdsLayer = max(1, NLdsLayerRequired);
 
-            constexpr auto k_lds_block_desc_1 = transform_tensor_descriptor(
-                k_lds_block_desc_0,
-                make_tuple(make_pass_through_transform(number<kNPerBlock / NLdsLayer>{}),
-                           make_unmerge_transform(
-                               make_tuple(number<NLdsLayer>{}, number<kKPerBlock / kKPack>{})),
-                           make_pass_through_transform(number<kKPack>{})),
-                make_tuple(sequence<0>{}, sequence<1>{}, sequence<2>{}),
-                make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}));
+                constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
+                    make_tuple(number<kNPerBlock / NLdsLayer>{},
+                               number<kKPerBlock / kKPack * NLdsLayer>{},
+                               number<kKPack>{}),
+                    make_tuple(number<kKPerBlock * NLdsLayer + PaddingDataAmount>{},
+                               number<kKPack>{},
+                               number<1>{}),
+                    number<kKPack>{},
+                    number<1>{});
 
-            constexpr auto k_lds_block_desc = transform_tensor_descriptor(
-                k_lds_block_desc_1,
-                make_tuple(make_merge_transform_v3_division_mod(
-                               make_tuple(number<kNPerBlock / NLdsLayer>{}, number<NLdsLayer>{})),
-                           make_merge_transform_v3_division_mod(
-                               make_tuple(number<kKPerBlock / kKPack>{}, number<kKPack>{}))),
-                make_tuple(sequence<0, 1>{}, sequence<2, 3>{}),
-                make_tuple(sequence<0>{}, sequence<1>{}));
+                constexpr auto k_lds_block_desc_1 = transform_tensor_descriptor(
+                    k_lds_block_desc_0,
+                    make_tuple(make_pass_through_transform(number<kNPerBlock / NLdsLayer>{}),
+                               make_unmerge_transform(
+                                   make_tuple(number<NLdsLayer>{}, number<kKPerBlock / kKPack>{})),
+                               make_pass_through_transform(number<kKPack>{})),
+                    make_tuple(sequence<0>{}, sequence<1>{}, sequence<2>{}),
+                    make_tuple(sequence<0>{}, sequence<1, 2>{}, sequence<3>{}));
 
-            return k_lds_block_desc;
+                constexpr auto k_lds_block_desc = transform_tensor_descriptor(
+                    k_lds_block_desc_1,
+                    make_tuple(make_merge_transform_v3_division_mod(make_tuple(
+                                   number<kNPerBlock / NLdsLayer>{}, number<NLdsLayer>{})),
+                               make_merge_transform_v3_division_mod(
+                                   make_tuple(number<kKPerBlock / kKPack>{}, number<kKPack>{}))),
+                    make_tuple(sequence<0, 1>{}, sequence<2, 3>{}),
+                    make_tuple(sequence<0>{}, sequence<1>{}));
+
+                return k_lds_block_desc;
+            }
+            else
+            {
+                // stride < row: multiple pads inside one hdim row (e.g. hdim=160
+                // prefill, row=160 elem split into 160/32=5 chunks each followed
+                // by PaddingDataAmount). Split kKPerBlock (the padded dim), keep
+                // kNPerBlock (=kN0 stacking) whole. Top logical shape stays
+                // (kNPerBlock, kKPerBlock) so MakeKRegTileDistribution is
+                // unaffected.
+                static_assert(kKPerBlock % PaddingStride == 0,
+                              "PaddingStride must divide the K row width; ensured by "
+                              "largest_pow2_divisor in GetLdsPaddingConfigK.");
+                static_assert(PaddingStride % kKPack == 0,
+                              "PaddingStride must be a multiple of kKPack.");
+                constexpr index_t Chunks = kKPerBlock / PaddingStride;
+
+                constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
+                    make_tuple(number<kNPerBlock>{},
+                               number<Chunks>{},
+                               number<PaddingStride / kKPack>{},
+                               number<kKPack>{}),
+                    make_tuple(number<Chunks*(PaddingStride + PaddingDataAmount)>{},
+                               number<PaddingStride + PaddingDataAmount>{},
+                               number<kKPack>{},
+                               number<1>{}),
+                    number<kKPack>{},
+                    number<1>{});
+
+                constexpr auto k_lds_block_desc = transform_tensor_descriptor(
+                    k_lds_block_desc_0,
+                    make_tuple(
+                        make_pass_through_transform(number<kNPerBlock>{}),
+                        make_merge_transform_v3_division_mod(make_tuple(
+                            number<Chunks>{}, number<PaddingStride / kKPack>{}, number<kKPack>{}))),
+                    make_tuple(sequence<0>{}, sequence<1, 2, 3>{}),
+                    make_tuple(sequence<0>{}, sequence<1>{}));
+
+                return k_lds_block_desc;
+            }
         }
     }
 
@@ -478,6 +530,16 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
                     }
                     else
                     {
+                        // stride < free dim (e.g. hdim_v=160): multiple pads
+                        // inside one V row. NLdsLayer chunks each of PaddingStride
+                        // elements. GetLdsPaddingConfigV picks pad_interval via
+                        // largest_pow2_divisor so PaddingStride evenly tiles the
+                        // row; these static_asserts pin that invariant here (the K
+                        // path asserts the same for its chunk branch).
+                        static_assert(kNPerBlock % PaddingStride == 0,
+                                      "PaddingStride must divide the V free-dim width.");
+                        static_assert(PaddingStride % kKPack == 0,
+                                      "PaddingStride must be a multiple of kKPack.");
                         constexpr auto NLdsLayer    = kNPerBlock / PaddingStride;
                         constexpr auto v_lds_desc_0 = make_naive_tensor_descriptor(
                             make_tuple(number<kKPerBlock * NLdsLayer>{},
@@ -885,6 +947,15 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
             return result;
         };
 
+        // Largest power-of-2 that divides x (lowest set bit). The TDM writer
+        // inserts padding every 2^(pad_interval+1) cumulative dwords, so the
+        // stride must evenly tile the row (stride | row_dwords) for padding to
+        // land at the same intra-row position each row. For power-of-2 row
+        // widths this equals the full width (unchanged); for non-power-of-2
+        // widths (e.g. hdim 160 -> 80 dwords) it picks the coarsest stride that
+        // still divides the row (80 -> 16 dwords).
+        auto largest_pow2_divisor = [](index_t x) constexpr { return x & (-x); };
+
         constexpr index_t BytesPerDword = sizeof(int32_t);
         constexpr auto DataTypeSize     = sizeof(DataType);
         constexpr auto PackedSize       = numeric_traits<DataType>::PackedSize;
@@ -903,9 +974,10 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
             {
                 constexpr index_t bank_of_vecs = 16 * sizeof(DataType) / PackedSize / BytesPerDword;
                 constexpr index_t pad_amount   = bank_of_vecs - 1;
-                constexpr index_t pad_interval = (banks_per_mblk < get_n_lds_banks())
-                                                     ? constexpr_log2_floor(get_n_lds_banks()) - 1
-                                                     : constexpr_log2_floor(banks_per_mblk) - 1;
+                constexpr index_t pad_interval =
+                    (banks_per_mblk < get_n_lds_banks())
+                        ? constexpr_log2_floor(get_n_lds_banks()) - 1
+                        : constexpr_log2_floor(largest_pow2_divisor(banks_per_mblk)) - 1;
                 return make_tuple(number<true>{}, number<pad_amount>{}, number<pad_interval>{});
             }
         }
@@ -913,9 +985,10 @@ struct BlockFmhaPipelineQRKSVSTdmDefaultPolicy
         {
             constexpr index_t banks_per_kblk =
                 KPerBlock * DataTypeSize / PackedSize / BytesPerDword;
-            constexpr index_t pad_interval = (banks_per_kblk < get_n_lds_banks())
-                                                 ? constexpr_log2_floor(get_n_lds_banks()) - 1
-                                                 : constexpr_log2_floor(banks_per_kblk) - 1;
+            constexpr index_t pad_interval =
+                (banks_per_kblk < get_n_lds_banks())
+                    ? constexpr_log2_floor(get_n_lds_banks()) - 1
+                    : constexpr_log2_floor(largest_pow2_divisor(banks_per_kblk)) - 1;
             constexpr index_t banks_per_128b = get_n_dwords_per_128b();
             constexpr index_t pad_amount     = banks_per_128b - 1;
             return make_tuple(number<true>{}, number<pad_amount>{}, number<pad_interval>{});

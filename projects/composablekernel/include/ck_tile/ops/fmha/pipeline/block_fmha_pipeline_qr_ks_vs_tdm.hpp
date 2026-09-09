@@ -1337,39 +1337,46 @@ struct BlockFmhaPipelineQRKSVSTdm
                 -numeric<SMPLComputeDataType>::infinity()); // m_local = rowmax(S{j})
             block_tile_reduce_sync(m_local, f_max, bool_constant<false>{});
 
+            // IGLP sched_group_barrier counts below are hand-tuned for the d128
+            // double-buffer tile (gemm1 N=hdim_v=128). For other hdim the
+            // ds_read/wmma counts differ, so a d128-shaped grouping is
+            // mismatched; gate it to d128 and let the compiler schedule the rest.
+            if constexpr(kSubQKHeaddim == 128 && kN1 == 128)
+            {
 #if CK_TILE_FMHA_TDM_IGLP_BULK
-            // gemm1 bulk variant: issue ALL DS_READ first, then ALL MFMA, so the
-            // V ds_load_tr16 latency is hidden behind a burst of back-to-back
-            // WMMAs (accumulators are independent). gemm1 has 20 DS_READ, 12 MFMA.
-            __builtin_amdgcn_sched_group_barrier(0x100, 20, 0); // DS_READ bulk
-            __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
+                // gemm1 bulk variant: issue ALL DS_READ first, then ALL MFMA, so
+                // the V ds_load_tr16 latency is hidden behind a burst of back-to-
+                // back WMMAs (accumulators are independent). gemm1: 20 DS_READ, 12 MFMA.
+                __builtin_amdgcn_sched_group_barrier(0x100, 20, 0); // DS_READ bulk
+                __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
 #elif CK_TILE_FMHA_TDM_IGLP_TUNE
-            // gemm1 fine variant: front-load DS_READ (2 per MFMA early) so LDS
-            // reads issue sooner and hide behind later MFMA. Total DS_READ kept
-            // at 20 (8*2 + 4*1) across 12 MFMA groups.
-            static_for<0, 8, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
-            });
-            static_for<0, 4, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
-            });
+                // gemm1 fine variant: front-load DS_READ (2 per MFMA early) so LDS
+                // reads issue sooner and hide behind later MFMA. Total DS_READ kept
+                // at 20 (8*2 + 4*1) across 12 MFMA groups.
+                static_for<0, 8, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
+                });
+                static_for<0, 4, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+                });
 #else
-            static_for<0, 12, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
-            });
+                static_for<0, 12, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+                });
 
-            static_for<0, 4, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
-            });
+                static_for<0, 4, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
+                });
 #endif
+            }
 
             const auto m_old = m; // m{j-1}
             tile_elementwise_inout(
@@ -1494,39 +1501,44 @@ struct BlockFmhaPipelineQRKSVSTdm
             k_lds_read_window.set_bottom_tensor_view_data_ptr(k_lds_read_ptr);
             k_tile = load_tile(k_lds_read_window);
 
+            // IGLP counts hand-tuned for the d128 double-buffer tile (gemm0
+            // K=hdim_q=128). Mismatched for other hdim; gate to d128.
+            if constexpr(kSubQKHeaddim == 128 && kN1 == 128)
+            {
 #if CK_TILE_FMHA_TDM_IGLP_BULK
-            // gemm0 bulk variant: issue ALL DS_READ first, then ALL MFMA, so the
-            // K ds_load_b128 latency is hidden behind a burst of back-to-back
-            // WMMAs (accumulators are independent). gemm0 has 28 DS_READ, 12 MFMA.
-            __builtin_amdgcn_sched_group_barrier(0x100, 28, 0); // DS_READ bulk
-            __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
+                // gemm0 bulk variant: issue ALL DS_READ first, then ALL MFMA, so
+                // the K ds_load_b128 latency is hidden behind a burst of back-to-
+                // back WMMAs (accumulators are independent). gemm0: 28 DS_READ, 12 MFMA.
+                __builtin_amdgcn_sched_group_barrier(0x100, 28, 0); // DS_READ bulk
+                __builtin_amdgcn_sched_group_barrier(0x008, 12, 0); // MFMA bulk
 #elif CK_TILE_FMHA_TDM_IGLP_TUNE
-            // gemm0 fine variant: front-load DS_READ (3 per MFMA early) to surface
-            // the transposed K/V LDS reads sooner. Total DS_READ kept at 28
-            // (8*3 + 4*1) across 12 MFMA groups.
-            static_for<0, 8, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 3, 0); // DS_READ
-            });
-            static_for<0, 4, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
-            });
+                // gemm0 fine variant: front-load DS_READ (3 per MFMA early) to
+                // surface the transposed K/V LDS reads sooner. Total DS_READ kept
+                // at 28 (8*3 + 4*1) across 12 MFMA groups.
+                static_for<0, 8, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 3, 0); // DS_READ
+                });
+                static_for<0, 4, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+                });
 #else
-            static_for<0, 12, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
-            });
+                static_for<0, 12, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); // DS_READ
+                });
 
-            static_for<0, 4, 1>{}([&](auto i) {
-                ignore = i;
-                __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
-                __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
-            });
+                static_for<0, 4, 1>{}([&](auto i) {
+                    ignore = i;
+                    __builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // MFMA
+                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0); // DS_READ
+                });
 #endif
+            }
         }; // mainloop
 
         // Pick the tensorcnt policy once, outside the hot loop, so the
