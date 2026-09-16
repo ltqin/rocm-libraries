@@ -218,6 +218,55 @@ endif()
 list(APPEND FMHA_BWD_PRIVATE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
 list(APPEND FMHA_BWD_INTERFACE_COMPILE_OPTIONS -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3)
 
+# ============================================================================
+# Expert Scheduling Mode (ESM) for GFX1250 TDM kernels
+# ============================================================================
+# Enable -mllvm -amdgpu-expert-scheduling-mode for specific qr_tdm kernels
+# on gfx1250 to allow compiler to generate s_setreg_imm32_b32 instructions
+# for fine-grained wave scheduling control.
+#
+# ESM2 configuration flags (optional, default OFF):
+#   FMHA_FWD_GFX1250_D192_TDM_ESM2 - Enable for d192 TDM kernels
+#   FMHA_FWD_GFX1250_TDM_V128_ESM2 - Enable for d128/d192 v128 TDM kernels
+# ============================================================================
+
+function(ck_tile_fmha_fwd_get_source_compile_options fwd_blob_name out_var)
+  set(compile_options)
+
+  # Determine ESM2 family configuration
+  set(family_esm2 OFF)
+  if(DEFINED FMHA_FWD_GFX1250_D192_TDM_ESM2)
+    set(family_esm2 ${FMHA_FWD_GFX1250_D192_TDM_ESM2})
+  endif()
+  if(DEFINED FMHA_FWD_GFX1250_TDM_V128_ESM2)
+    set(family_esm2 ${FMHA_FWD_GFX1250_TDM_V128_ESM2})
+  endif()
+
+  # Match specific qr_tdm kernels on gfx1250 and append ESM option
+  if(family_esm2)
+    if(fwd_blob_name MATCHES "^fmha_fwd_d192_bf16_.*_qr_tdm_d192_v128_.*_gfx125\\.cpp$" OR
+       fwd_blob_name MATCHES "^fmha_fwd_d128_bf16_.*_qr_tdm_v128_.*_gfx125\\.cpp$" OR
+       fwd_blob_name MATCHES "^fmha_fwd_d128_bf16_.*_qr_tdm_.*_gfx125\\.cpp$")
+      list(APPEND compile_options -mllvm -amdgpu-expert-scheduling-mode)
+      message(DEBUG "ESM enabled for: ${fwd_blob_name}")
+    endif()
+  endif()
+
+  set(${out_var} ${compile_options} PARENT_SCOPE)
+endfunction()
+
+# Apply per-source compile options for ESM-enabled kernels
+if(FMHA_HAS_RDNA_TARGET)
+  foreach(fwd_blob ${FMHA_FWD_GEN_BLOBS})
+    get_filename_component(fwd_blob_name ${fwd_blob} NAME)
+    ck_tile_fmha_fwd_get_source_compile_options(${fwd_blob_name} blob_compile_options)
+    if(blob_compile_options)
+      set_property(SOURCE ${fwd_blob}
+        APPEND PROPERTY COMPILE_OPTIONS ${blob_compile_options})
+    endif()
+  endforeach()
+endif()
+
 target_compile_options(${FMHA_FWD_INSTANCES}
   PRIVATE ${FMHA_FWD_PRIVATE_COMPILE_OPTIONS}
   INTERFACE ${FMHA_FWD_INTERFACE_COMPILE_OPTIONS})
