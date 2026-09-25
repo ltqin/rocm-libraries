@@ -967,8 +967,9 @@ struct QrTdmLdsArenaLayout
                   (kK1Offset - kK0Offset) % KPadding::kIntervalBytes == 0);
     static_assert(!kDoubleBuffer || !VPadding::kEnabled ||
                   (kV1Offset - kV0Offset) % VPadding::kIntervalBytes == 0);
-    static_assert(kArenaBytes <= 128 * 1024);
-    static_assert(integer_least_multiple(kArenaBytes, 64 * 1024) * 2 <= 320 * 1024);
+    // gfx1250 per-CU LDS is 320 KB. Occupancy=2 needs arena <= 160 KB (2*160=320);
+    // occupancy=1 allows the full 320 KB. Using the occupancy=1 budget for now.
+    static_assert(kArenaBytes <= 320 * 1024);
 };
 
 template <typename TensorTag, typename Problem, bool LoadOnce>

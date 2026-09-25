@@ -1463,6 +1463,7 @@ class KernelComponentFactoryGfx12(CompatibilityRuleFactory):
 GFX125_QR_TDM_BM0_CROSSOVER_MAX_SEQLEN_Q = {
     (32, 32): 128, (64, 64): 128, (96, 96): 128,
     (128, 128): 128, (160, 160): 128, (192, 128): 128,
+    (256, 256): 128,
 }
 
 
@@ -1523,7 +1524,8 @@ class KernelComponentFactoryGfx125(CompatibilityRuleFactory):
                               FmhaFwdTileSize(128,  64,  32, 160,  32,  160,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1)],
                 (192, 128) : [FmhaFwdTileSize( 64,  64,  32, 128,  32,  192,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1, _gfx125_qr_tdm_crossover_constraint((192, 128))),
                               FmhaFwdTileSize(128,  64,  32, 128,  32,  192,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1)],
-                (256, 256) : [FmhaFwdTileSize( 64,  64,  32, 256,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1)],
+                (256, 256) : [FmhaFwdTileSize( 64,  64,  32, 256,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1, _gfx125_qr_tdm_crossover_constraint((256, 256))),
+                              FmhaFwdTileSize(128,  64,  32, 256,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 32,  16, 16, 32,  -1)],
             })  # fmt: skip
         elif dtype in cls._DT_FP8_FP8BF16:
             return {
