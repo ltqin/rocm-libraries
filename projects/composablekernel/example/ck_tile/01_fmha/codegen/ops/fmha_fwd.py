@@ -565,13 +565,6 @@ class FmhaFwdPipeline:
         else:
             n += "_ntrload"
         if self.tag == "qr_tdm":
-            if (
-                self.F_progressive_ds_load_k == "t"
-                and self.F_use_double_kv_lds_buffer != "t"
-            ):
-                raise ValueError(
-                    "QR-TDM progressive K LDS loading requires K/V LDS prefetch (double buffering)"
-                )
             if self.F_use_double_kv_lds_buffer == "t":
                 n += "_kvldsprefetch"
             else:
@@ -1640,10 +1633,10 @@ class KernelComponentFactoryGfx125(CompatibilityRuleFactory):
                 # and already fills 128 KiB, so there is no headroom left for
                 # the bank-conflict padding that pitch needs. Measured at
                 # b=1 h=16 s=8192 dense on gfx1250: 202 TFlops double-buffered
-                # versus 496 single-buffered. Progressive K reload requires
-                # double buffering, so it goes with it.
+                # versus 496 single-buffered. Progressive K reload stays on:
+                # the single-buffer path also stages whole K tiles now.
                 tdm_double_kv = "f" if (hdim, hdim_v) == (256, 256) else "t"
-                tdm_prog_k = tdm_double_kv
+                tdm_prog_k = "t"
                 tdm_masks = list(get_mask_map(mask_impl))
                 if mask_impl == "simplified":
                     # Avoid carrying general-window mask state through the
