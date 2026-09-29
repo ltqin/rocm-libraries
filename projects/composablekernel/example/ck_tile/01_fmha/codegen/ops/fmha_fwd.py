@@ -1635,6 +1635,15 @@ class KernelComponentFactoryGfx125(CompatibilityRuleFactory):
                 (192, 128),
                 (256, 256),
             }:
+                # D256 keeps single K/V LDS buffers. Its double-buffer arena
+                # holds two full 64x256 K tiles, i.e. a 512-byte row pitch,
+                # and already fills 128 KiB, so there is no headroom left for
+                # the bank-conflict padding that pitch needs. Measured at
+                # b=1 h=16 s=8192 dense on gfx1250: 202 TFlops double-buffered
+                # versus 496 single-buffered. Progressive K reload requires
+                # double buffering, so it goes with it.
+                tdm_double_kv = "f" if (hdim, hdim_v) == (256, 256) else "t"
+                tdm_prog_k = tdm_double_kv
                 tdm_masks = list(get_mask_map(mask_impl))
                 if mask_impl == "simplified":
                     # Avoid carrying general-window mask state through the
@@ -1656,10 +1665,10 @@ class KernelComponentFactoryGfx125(CompatibilityRuleFactory):
                         mask_constraint = CppConstraint(
                             "a.window_size_left < 0 && a.window_size_right == 0"
                         )
-                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "f", "f", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer="t", F_progressive_ds_load_k="t"))  # fmt: skip
-                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "t", "t", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer="t", F_progressive_ds_load_k="t"))  # fmt: skip
-                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "t", "t", "f", "f", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer="t", F_progressive_ds_load_k="t"))  # fmt: skip
-                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "t", "t", "t", "t", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer="t", F_progressive_ds_load_k="t"))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "f", "f", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer=tdm_double_kv, F_progressive_ds_load_k=tdm_prog_k))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "f", "f", "t", "t", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer=tdm_double_kv, F_progressive_ds_load_k=tdm_prog_k))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "t", "t", "f", "f", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer=tdm_double_kv, F_progressive_ds_load_k=tdm_prog_k))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_tdm", "row", "t", "t", "t", "t", logits, bias, lse, "f", qscale, mask, "f", "f", sink, F_constraint=mask_constraint, F_use_double_kv_lds_buffer=tdm_double_kv, F_progressive_ds_load_k=tdm_prog_k))  # fmt: skip
 
             # qr: generic pipeline fallback for trait combos not covered by
             # qr_tdm (e.g., bias, dropout, skip, d!=128).
