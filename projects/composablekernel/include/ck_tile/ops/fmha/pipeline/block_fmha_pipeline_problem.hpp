@@ -53,6 +53,52 @@ CK_TILE_HOST_DEVICE static constexpr auto GetDramTileAccessMaxVectorSize()
     return GetMaxVectorSize<DataType, ElemPerThread>();
 }
 
+// Not every Traits type defines these two flags (only paged-KV-aware traits such
+// as TileFmhaFwdPagedKVTraits do). BlockFmhaPipelineProblem is shared by pipelines
+// that pair with kernels which unconditionally read Problem::kDoFp8StaticQuant /
+// Problem::kIsPagedKV (e.g. FmhaFwdPagedKVKernel), so we forward them from Traits
+// when present and default to false otherwise, instead of requiring every Traits
+// type in the codebase to define fields most of them have no use for.
+template <typename T, typename = void>
+struct traits_has_do_fp8_static_quant : std::false_type
+{
+};
+template <typename T>
+struct traits_has_do_fp8_static_quant<T, std::void_t<decltype(T::kDoFp8StaticQuant)>>
+    : std::true_type
+{
+};
+
+template <typename T, typename = void>
+struct traits_has_is_paged_kv : std::false_type
+{
+};
+template <typename T>
+struct traits_has_is_paged_kv<T, std::void_t<decltype(T::kIsPagedKV)>> : std::true_type
+{
+};
+
+// The ternary operator requires both branches to name a valid expression even
+// when the condition is a compile-time constant, so defaulting a possibly-absent
+// Traits member needs an if-constexpr function rather than `cond ? T::x : false`.
+template <typename T>
+CK_TILE_HOST_DEVICE static constexpr bool GetDoFp8StaticQuantOrDefault()
+{
+    if constexpr(traits_has_do_fp8_static_quant<T>::value)
+        return T::kDoFp8StaticQuant;
+    else
+        return false;
+}
+
+template <typename T>
+CK_TILE_HOST_DEVICE static constexpr bool GetIsPagedKVOrDefault()
+{
+    if constexpr(traits_has_is_paged_kv<T>::value)
+        return T::kIsPagedKV;
+    else
+        return false;
+}
+
 } // namespace detail
 
 template <typename QDataType_,
@@ -123,6 +169,12 @@ struct BlockFmhaPipelineProblem
     static constexpr auto QScaleEnum        = Traits::QScaleEnum;
     static constexpr index_t kBlockPerCu    = Traits::kBlockPerCu;
     static constexpr bool kHasSink          = Traits::kHasSink;
+
+    // See the comment on detail::traits_has_do_fp8_static_quant above: these
+    // default to false for Traits types (e.g. plain TileFmhaTraits) that do not
+    // define them.
+    static constexpr bool kDoFp8StaticQuant = detail::GetDoFp8StaticQuantOrDefault<Traits>();
+    static constexpr bool kIsPagedKV        = detail::GetIsPagedKVOrDefault<Traits>();
 };
 
 template <typename QDataType_,

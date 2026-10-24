@@ -6,6 +6,7 @@
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/common.hpp"
 #include "ck_tile/ops/fmha/block/block_attention_bias_enum.hpp"
+#include "ck_tile/ops/fmha/block/tdm_page_tracker.hpp"
 #include "ck_tile/ops/fmha/block/variants.hpp"
 
 #include <string>
@@ -20,6 +21,48 @@
 // O[seqlen_q, hdim_v] = P[seqlen_q, seqlen_k] @ V^T[hdim_v, seqlen_k]
 
 namespace ck_tile {
+
+namespace detail {
+
+// Nested in its own sub-namespace (rather than directly in ck_tile::detail)
+// because fmha_fwd_kernel.hpp (the dense kernel) is frequently included in
+// the same translation unit as this file (both are pulled in by
+// ops/fmha.hpp) and already defines equally-named, equally-purposed traits
+// directly in ck_tile::detail -- colliding with those would be an ODR
+// violation, not just a style clash. The two copies are intentionally
+// independent: this one's "not detected" fallback is plain false, since
+// (unlike the dense kernel) this file never had a pre-opt-in-marker pipeline
+// to special-case by name.
+namespace pagedkv_kernel {
+
+template <typename T>
+using has_tdm_affine_dram_path = decltype(T::kUsesTdmAffineDramPath);
+
+template <typename T>
+using has_fixed_segmented_lds_arena = decltype(T::kUsesFixedSegmentedLdsArena);
+
+// qr_pagedkv_tdm_sched is the only pipeline usable from this kernel that sets
+// these flags; everything else (the navigator-based paged pipelines this
+// kernel was originally written for) falls through to false.
+template <typename T>
+static inline constexpr bool uses_tdm_affine_dram_path_v = []() {
+    if constexpr(is_detected<has_tdm_affine_dram_path, T>::value)
+        return static_cast<bool>(T::kUsesTdmAffineDramPath);
+    else
+        return false;
+}();
+
+template <typename T>
+static inline constexpr bool uses_fixed_segmented_lds_arena_v = []() {
+    if constexpr(is_detected<has_fixed_segmented_lds_arena, T>::value)
+        return static_cast<bool>(T::kUsesFixedSegmentedLdsArena);
+    else
+        return false;
+}();
+
+} // namespace pagedkv_kernel
+
+} // namespace detail
 
 // TODO: This class is a variant of the existing FmhaFwdSplitKVKernel pipeline.
 //       Refactoring to extract shared logic is recommended as future work.
@@ -56,6 +99,10 @@ struct FmhaFwdPagedKVKernel
     static constexpr bool kSkipMinSeqlenQ   = FmhaPipeline::Problem::kSkipMinSeqlenQ;
     static constexpr bool kIsPagedKV        = FmhaPipeline::Problem::kIsPagedKV;
     static constexpr bool kHasSink          = FmhaPipeline::kHasSink;
+    static constexpr bool kUsesTdmAffineDramPath =
+        detail::pagedkv_kernel::uses_tdm_affine_dram_path_v<FmhaPipeline>;
+    static constexpr bool kUsesFixedSegmentedLdsArena =
+        detail::pagedkv_kernel::uses_fixed_segmented_lds_arena_v<FmhaPipeline>;
 
     using AttentionVariant = ck_tile::remove_cvref_t<typename FmhaPipeline::AttentionVariant>;
     using FmhaMask         = ck_tile::remove_cvref_t<typename FmhaPipeline::FmhaMask>;
@@ -897,7 +944,16 @@ struct FmhaFwdPagedKVKernel
 
     CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSize()
     {
-        return ck_tile::max(FmhaPipeline::GetSmemSize(), EpiloguePipeline::GetSmemSize());
+        if constexpr(kUsesFixedSegmentedLdsArena)
+        {
+            using Policy = typename FmhaPipeline::Policy;
+            static_assert(FmhaPipeline::GetSmemSize() == Policy::GetLdsArenaSize());
+            return ck_tile::max(Policy::GetLdsArenaSize(), EpiloguePipeline::GetSmemSize());
+        }
+        else
+        {
+            return ck_tile::max(FmhaPipeline::GetSmemSize(), EpiloguePipeline::GetSmemSize());
+        }
     }
 
     CK_TILE_DEVICE void operator()(Kargs kargs) const
@@ -1335,7 +1391,113 @@ struct FmhaFwdPagedKVKernel
         BlockIndices block_indices{i_batch, i_nhead, i_nhead / kargs.nhead_ratio_qk};
 
         auto o_acc_tile = [&]() {
-            if constexpr(kDoFp8StaticQuant)
+            if constexpr(kUsesTdmAffineDramPath)
+            {
+                static_assert(kIsPagedKV,
+                              "qr_pagedkv_tdm_sched is only reachable with paged kv kargs");
+
+                // TDM needs affine DRAM strides and the logical (GLOBAL, not
+                // page-local) seqlen bounds -- the pipeline's own TdmPageTracker
+                // folds paging into the base pointer instead of rewriting the
+                // window origin (see tdm_page_tracker.hpp). So K/V here are
+                // plain untransposed naive views over the GLOBAL coordinate
+                // space, not page_block_size-bounded navigator windows. Mirrors
+                // fmha_fwd_kernel.hpp's make_k_dram/make_v_dram affine-path
+                // construction (the dense sibling of this pipeline).
+                const index_t kv_global_len = kv_l2p_offset + kargs.seqlen_k;
+
+                const auto k_dram_tdm = make_naive_tensor_view<address_space_enum::global>(
+                    static_cast<const KDataType*>(nullptr),
+                    make_tuple(kv_global_len, kargs.hdim_q),
+                    make_tuple(kargs.stride_k, 1),
+                    number<FmhaPipeline::kAlignmentK>{},
+                    number<1>{});
+
+                // V stays row-major (seqlen_k, hdim_v), untransposed -- the
+                // caller contract documented on the pipeline's run() requires
+                // window lengths (kN0, kN1), not the (kN1, kK1) the dense
+                // (non-tdm_sched) kernel path uses a few branches below. That
+                // (kN1, kK1) construction is a known pre-existing bug which
+                // happens to be harmless there only because that path never
+                // reads the window lengths; do not copy it here.
+                const auto v_dram_tdm = make_naive_tensor_view<address_space_enum::global>(
+                    static_cast<const VDataType*>(nullptr),
+                    make_tuple(kv_global_len, kargs.hdim_v),
+                    make_tuple(kargs.stride_v, 1),
+                    number<FmhaPipeline::kAlignmentV>{},
+                    number<1>{});
+
+                auto k_dram_window_tdm = make_tile_window(
+                    k_dram_tdm,
+                    make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kK0>{}),
+                    {0, 0});
+                auto v_dram_window_tdm = make_tile_window(
+                    v_dram_tdm,
+                    make_tuple(number<FmhaPipeline::kN0>{}, number<FmhaPipeline::kN1>{}),
+                    {0, 0});
+
+                const index_t i_kv_nhead = i_nhead / kargs.nhead_ratio_qk;
+                const long_index_t k_fixed_offset =
+                    static_cast<long_index_t>(i_kv_nhead) * kargs.nhead_stride_k;
+                const long_index_t v_fixed_offset =
+                    static_cast<long_index_t>(i_kv_nhead) * kargs.nhead_stride_v;
+
+                const int32_t* block_indices_tdm =
+                    kargs.block_table_ptr +
+                    static_cast<long_index_t>(i_batch) * kargs.batch_stride_block_table;
+                const index_t num_pages_tdm =
+                    integer_divide_ceil(kv_global_len, kargs.page_block_size);
+
+                // Constructed with global_seq_start = 0: the kernel cannot see
+                // kv_load_start (the mask computes it inside the pipeline), so
+                // the pipeline's prologue seek(kv_load_start) is what actually
+                // positions these trackers. Do not try to compute it here.
+                auto k_page_tracker = TdmPageTracker<KDataType, FmhaPipeline::kN0>(
+                    reinterpret_cast<const KDataType*>(kargs.k_ptr),
+                    kargs.batch_stride_k,
+                    k_fixed_offset,
+                    block_indices_tdm,
+                    kargs.page_block_size,
+                    kargs.stride_k,
+                    num_pages_tdm,
+                    0);
+                auto v_page_tracker = TdmPageTracker<VDataType, FmhaPipeline::kN0>(
+                    reinterpret_cast<const VDataType*>(kargs.v_ptr),
+                    kargs.batch_stride_v,
+                    v_fixed_offset,
+                    block_indices_tdm,
+                    kargs.page_block_size,
+                    kargs.stride_v,
+                    num_pages_tdm,
+                    0);
+
+                using Policy = typename FmhaPipeline::Policy;
+                static_assert(FmhaPipeline::GetSmemSize() == Policy::GetLdsArenaSize());
+                // smem_ptr above is already sized to Policy::GetLdsArenaSize()
+                // for this path (see GetSmemSize()); reuse it as the fixed
+                // segmented arena instead of declaring a second __shared__
+                // buffer. Four independent __shared__ arrays (one per
+                // smem_ptrk0/k1/v0/v1) would work too, but would double-count
+                // shared memory against this already-sized allocation and
+                // diverge from the layout fmha_fwd_kernel.hpp's identically
+                // flagged (kUsesFixedSegmentedLdsArena) dense sibling uses.
+                return FmhaPipeline{}(q_dram_window,
+                                      k_dram_window_tdm,
+                                      v_dram_window_tdm,
+                                      k_page_tracker,
+                                      v_page_tracker,
+                                      bias_dram_window,
+                                      lse_dram_window,
+                                      mask,
+                                      position_encoding,
+                                      kargs.scale_s,
+                                      sink_value,
+                                      smem_ptr + Policy::GetLdsOffsetK0(),
+                                      smem_ptr + Policy::GetLdsOffsetK1(),
+                                      smem_ptr + Policy::GetLdsOffsetV0(),
+                                      smem_ptr + Policy::GetLdsOffsetV1());
+            }
+            else if constexpr(kDoFp8StaticQuant)
             {
                 return FmhaPipeline{}(q_dram_window,
                                       identity{}, // q_element_func

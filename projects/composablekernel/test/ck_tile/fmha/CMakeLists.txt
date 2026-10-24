@@ -225,6 +225,7 @@ if(SUPPORTED_GPU_TARGETS MATCHES "gfx125")
 
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_paged
         test_qr_tdm_sched_paged.cpp)
+    target_compile_options(test_ck_tile_fmha_qr_tdm_sched_paged PRIVATE -Wno-float-equal)
 
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_softmax
         test_qr_tdm_sched_softmax.cpp)
