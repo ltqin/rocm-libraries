@@ -124,10 +124,38 @@ std::vector<float> Decode(const std::vector<Data>& input)
 
 std::vector<std::int32_t> make_shuffled_block_table(int num_pages)
 {
+    if(num_pages < 2)
+        throw std::invalid_argument(
+            "make_shuffled_block_table requires num_pages >= 2: no non-identity "
+            "permutation exists for fewer than 2 pages, and an identity table "
+            "would make every paged-vs-dense comparison in this file vacuous");
+
     std::vector<std::int32_t> table(static_cast<std::size_t>(num_pages));
     std::iota(table.begin(), table.end(), 0);
+
+    auto is_identity = [&]() {
+        for(std::size_t p = 0; p < table.size(); ++p)
+            if(table[p] != static_cast<std::int32_t>(p))
+                return false;
+        return true;
+    };
+
+    // A fixed-seed shuffle can land on the identity permutation for small n
+    // (confirmed at n == 2, where {0, 1} and {1, 0} are equally likely). Keep
+    // drawing from the same generator (still fully deterministic from the
+    // fixed seed) until the result moves something; fall back to a rotate by
+    // 1, which is non-identity for every n >= 2, if that still fails to move
+    // anything within a handful of attempts (defensive; not expected to
+    // trigger in practice).
     std::mt19937 gen{0xC0FFEE};
-    std::shuffle(table.begin(), table.end(), gen);
+    int attempt = 0;
+    do
+    {
+        std::shuffle(table.begin(), table.end(), gen);
+    } while(is_identity() && ++attempt < 8);
+    if(is_identity())
+        std::rotate(table.begin(), table.begin() + 1, table.end());
+
     return table;
 }
 
@@ -143,6 +171,25 @@ struct FwdResult
     std::vector<float> out;
     std::vector<float> lse;
 };
+
+// Guards against a comparison test passing vacuously because both kernels
+// wrote nothing (e.g. an unlaunched kernel, an all-zero-initialized output
+// buffer never actually written to): every ASSERT_EQ(dense.out[i],
+// paged.out[i]) in this file would pass on all-zero buffers just as readily
+// as on a genuine match.
+void AssertNotAllZero(const std::vector<float>& values, const char* what)
+{
+    const bool any_nonzero =
+        std::any_of(values.begin(), values.end(), [](float v) { return v != 0.0f; });
+    ASSERT_TRUE(any_nonzero) << what << " is all zero; comparison would be vacuous";
+}
+
+void AssertAllFinite(const std::vector<float>& values, const char* what)
+{
+    const bool all_finite =
+        std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v); });
+    ASSERT_TRUE(all_finite) << what << " contains a non-finite value";
+}
 
 using Epilogue =
     ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<float, Data, true, true>>;
@@ -803,11 +850,20 @@ FwdResult run_paged_tdm_sched_with_lse(
 
 TEST(QrTdmSchedPagedHarness, ShuffledBlockTableIsNotIdentity)
 {
-    const auto table = make_shuffled_block_table(16);
-    bool identity    = true;
-    for(std::size_t i = 0; i < table.size(); ++i)
-        identity &= (table[i] == static_cast<std::int32_t>(i));
-    EXPECT_FALSE(identity) << "shuffled block table must not be the identity permutation";
+    // Covers every page count actually requested by the run_paged_* tests in
+    // this file (4, 6, 8, 12, 16), plus the two smallest sizes (2, 3) where a
+    // fixed-seed single shuffle is most likely to land on the identity by
+    // chance (confirmed at n == 2 before make_shuffled_block_table was fixed
+    // to guard against it).
+    for(const int num_pages : {2, 3, 4, 6, 8, 12, 16})
+    {
+        SCOPED_TRACE(num_pages);
+        const auto table = make_shuffled_block_table(num_pages);
+        bool identity    = true;
+        for(std::size_t i = 0; i < table.size(); ++i)
+            identity &= (table[i] == static_cast<std::int32_t>(i));
+        EXPECT_FALSE(identity) << "shuffled block table must not be the identity permutation";
+    }
 }
 
 TEST(QrTdmSchedPaged, MatchesDenseForIdenticalLogicalContent)
@@ -824,6 +880,7 @@ TEST(QrTdmSchedPaged, MatchesDenseForIdenticalLogicalContent)
         const auto dense = run_dense_tdm_sched(batch, nhead, seqlen_q, seqlen_k, hdim);
         const auto paged = run_paged_tdm_sched(
             batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, /*shuffle=*/true);
+        AssertNotAllZero(dense.out, "dense.out");
         ASSERT_EQ(dense.out.size(), paged.out.size());
         for(std::size_t i = 0; i < dense.out.size(); ++i)
             ASSERT_EQ(dense.out[i], paged.out[i]) << "mismatch at element " << i;
@@ -847,6 +904,7 @@ TEST(QrTdmSchedPaged, GroupModeMatchesDenseForIdenticalLogicalContent)
         const auto dense = run_dense_tdm_sched_group(seqlens_q, seqlens_k, hdim);
         const auto paged = run_paged_tdm_sched_group(
             seqlens_q, seqlens_k, hdim, page_block_size, /*shuffle=*/true);
+        AssertNotAllZero(dense.out, "dense.out");
         ASSERT_EQ(dense.out.size(), paged.out.size());
         for(std::size_t i = 0; i < dense.out.size(); ++i)
             ASSERT_EQ(dense.out[i], paged.out[i]) << "mismatch at element " << i;
@@ -867,9 +925,12 @@ TEST(QrTdmSchedPaged, LseMatchesDenseForIdenticalLogicalContent)
         const auto dense = run_dense_tdm_sched_with_lse(batch, nhead, seqlen_q, seqlen_k, hdim);
         const auto paged = run_paged_tdm_sched_with_lse(
             batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, /*shuffle=*/true);
+        AssertNotAllZero(dense.out, "dense.out");
         ASSERT_EQ(dense.out.size(), paged.out.size());
         for(std::size_t i = 0; i < dense.out.size(); ++i)
             ASSERT_EQ(dense.out[i], paged.out[i]) << "mismatch at element " << i;
+        AssertAllFinite(dense.lse, "dense.lse");
+        AssertNotAllZero(dense.lse, "dense.lse");
         ASSERT_EQ(dense.lse.size(), paged.lse.size());
         for(std::size_t i = 0; i < dense.lse.size(); ++i)
             ASSERT_EQ(dense.lse[i], paged.lse[i]) << "lse mismatch at element " << i;
