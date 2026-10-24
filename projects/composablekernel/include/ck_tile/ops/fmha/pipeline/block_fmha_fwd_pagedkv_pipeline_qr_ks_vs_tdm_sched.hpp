@@ -49,8 +49,9 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
     using SplitSoftmax          = FmhaTdmSchedSplitSoftmaxFor<Policy::Geometry::kQkStages>;
     using Schedule              = typename Policy::Schedule;
     using Mode                  = FmhaTdmSchedMode<Problem, Policy>;
-    static_assert(Mode::kIsLegal,
-                  "qr_tdm_sched schedule geometry or output-rescale placement is incompatible");
+    static_assert(
+        Mode::kIsLegal,
+        "qr_pagedkv_tdm_sched schedule geometry or output-rescale placement is incompatible");
 
     using BlockFmhaShape             = remove_cvref_t<typename Problem::BlockFmhaShape>;
     using VLayout                    = remove_cvref_t<typename BlockFmhaShape::VLayout>;
@@ -83,15 +84,16 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
     static constexpr bool kEnableVirtualSink = EnableVirtualSink_;
     static constexpr auto QScaleEnum         = Problem::QScaleEnum;
 
-    static_assert(CK_TILE_FMHA_FWD_FAST_EXP2,
-                  "qr_tdm_sched: every softmax site calls exp2, so log2(e) must be folded into "
-                  "scale_s");
+    static_assert(
+        CK_TILE_FMHA_FWD_FAST_EXP2,
+        "qr_pagedkv_tdm_sched: every softmax site calls exp2, so log2(e) must be folded into "
+        "scale_s");
     static_assert(BiasEnum == BlockAttentionBiasEnum::NO_BIAS,
-                  "qr_tdm_sched does not implement attention bias");
-    static_assert(!kHasLogitsSoftCap, "qr_tdm_sched does not implement logits soft cap");
-    static_assert(!kHasDropout, "qr_tdm_sched does not support dropout");
+                  "qr_pagedkv_tdm_sched does not implement attention bias");
+    static_assert(!kHasLogitsSoftCap, "qr_pagedkv_tdm_sched does not implement logits soft cap");
+    static_assert(!kHasDropout, "qr_pagedkv_tdm_sched does not support dropout");
     static_assert(QScaleEnum == BlockAttentionQuantScaleEnum::NO_SCALE,
-                  "qr_tdm_sched does not implement quantized attention yet");
+                  "qr_pagedkv_tdm_sched does not implement quantized attention yet");
 
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)
     // ... together with tensor distribution. tensor dist should able to overwrite this
@@ -106,7 +108,7 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
         kPadSeqLenK ? 1 : Policy::template GetAlignmentRandVal<Problem>();
 
     static_assert(Policy::template IsSupportedProblem<Problem>(),
-                  "qr_tdm_sched requires an exact supported FP16/BF16 geometry");
+                  "qr_pagedkv_tdm_sched requires an exact supported FP16/BF16 geometry");
 
     // IsSupportedProblem above pins Geometry == FmhaTdmSchedGeometryFor<Problem>.
     using Geometry = typename Policy::Geometry;
@@ -215,6 +217,13 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                           kK0 == KDramBlockWindowTmp{}.get_window_lengths()[I1] &&
                           // V is untransposed row-major here: dim0 is seqlen_k
                           // (kN0 tokens per tile), dim1 is hdim_v (kN1).
+                          // Callers MUST build V's window with lengths (kN0, kN1).
+                          // The dense kernel builds it as (kN1, kK1) instead; that is
+                          // a known pre-existing bug, harmless there only because the
+                          // dense path never reads these window lengths (box dims come
+                          // from the tile distribution, bounds from tdm_real_lengths).
+                          // Do not copy that shape here: this path's page-tracking
+                          // logic does read these lengths, so they are load-bearing.
                           kN0 == VDramBlockWindowTmp{}.get_window_lengths()[I0] &&
                           kN1 == VDramBlockWindowTmp{}.get_window_lengths()[I1] &&
                           kM0 == BiasDramBlockWindowTmp{}.get_window_lengths()[I0] &&
