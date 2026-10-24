@@ -174,6 +174,13 @@ if(SUPPORTED_GPU_TARGETS MATCHES "gfx125")
         endif()
     endfunction()
 
+    # Pure host test: page-table address arithmetic, no GPU needed.
+    add_gtest_executable(test_ck_tile_fmha_tdm_page_tracker test_tdm_page_tracker.cpp)
+    if(TARGET test_ck_tile_fmha_tdm_page_tracker)
+        target_include_directories(test_ck_tile_fmha_tdm_page_tracker
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
+
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_config
         test_qr_tdm_sched_config.cpp)
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_schedule
