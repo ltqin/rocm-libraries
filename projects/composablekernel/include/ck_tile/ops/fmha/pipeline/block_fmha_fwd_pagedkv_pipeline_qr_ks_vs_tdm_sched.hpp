@@ -18,9 +18,9 @@ namespace ck_tile {
 
 // Paged-KV variant of the hand-scheduled gfx125 TDM pipeline for native 16-bit
 // D64/V64 and D128/D192 x V128. Copied from BlockFmhaPipelineQRKSVSTdmSched and
-// threaded with two page trackers (K and V) that are not yet wired up: this
-// skeleton's behaviour is identical to the dense pipeline, giving a clean
-// regression baseline before the trackers start affecting addressing.
+// threaded with two page trackers (K and V) that fold paging into the DRAM
+// window base pointer. K runs two kN0 tiles ahead of the tile being computed
+// and V runs one, so the trackers advance independently.
 // Separate template instantiations keep finite virtual-sink normalization out of
 // the generated no-sink kernel's register allocation.
 template <typename Problem_,
@@ -198,11 +198,6 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
         void* __restrict__ smem_ptrv1,
         float sink_v) const
     {
-        // Not wired up yet: this skeleton still behaves exactly like the dense
-        // pipeline. Wiring the trackers into K/V addressing is the next task.
-        ignore = k_page_tracker;
-        ignore = v_page_tracker;
-
         static_assert(
             std::is_same_v<QDataType, remove_cvref_t<typename QDramBlockWindowTmp::DataType>> &&
                 std::is_same_v<KDataType, remove_cvref_t<typename KDramBlockWindowTmp::DataType>> &&
@@ -458,6 +453,12 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                              {0, 0},
                              Policy::template MakeVRegTileDistribution<Problem>());
 
+        // Paging is folded into the base pointer; the window origin stays
+        // global so masking and tail predication keep working unchanged.
+        const auto sync_page_ptr = [](auto& dram_window, const auto& tracker) {
+            dram_window.set_bottom_tensor_view_data_ptr(tracker.base_ptr());
+        };
+
         const index_t num_total_loop =
             integer_divide_ceil(physical_seqlen_k_end - physical_seqlen_k_start, kN0) +
             num_sink_loop;
@@ -471,15 +472,30 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
         static_assert(1 <= k1_loops);
         block_sync_lds<0>();
         // Fixed TDM prologue: current K/V and the first look-ahead K buffer.
+        // kv_load_start is where the K/V windows actually begin (nonzero for
+        // sliding window, and for the non-sink masked case). The trackers are
+        // constructed at 0 by the kernel, so position them before the first
+        // TDM issue.
+        k_page_tracker.seek(kv_load_start);
+        v_page_tracker.seek(kv_load_start);
+
+        sync_page_ptr(k_dram_window, k_page_tracker);
+        sync_page_ptr(v_dram_window, v_page_tracker);
         load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
         load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
+
         move_tile_window(k_dram_window, {kN0, 0});
+        k_page_tracker.advance();
         // K1 is consumed at iteration 1. A one-tile prefix must jump before K1 loads.
         if constexpr(kHasSink)
         {
             if(num_sink_loop == 1 && num_total_loop > 1)
+            {
                 move_tile_window(k_dram_window, {physical_seqlen_k_start - sink_seq_end, 0});
+                k_page_tracker.seek(physical_seqlen_k_start);
+            }
         }
+        sync_page_ptr(k_dram_window, k_page_tracker);
         k_lds_write_window.set_bottom_tensor_view_data_ptr(
             static_cast<KDataType* __restrict__>(smem_ptrk1));
         load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
@@ -620,10 +636,15 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                 if constexpr(kHasSink)
                 {
                     if(i_total_loops == num_sink_loop - 1 && i_total_loops + 1 < num_total_loop)
+                    {
                         move_tile_window(v_dram_window,
                                          {physical_seqlen_k_start - sink_seq_end, 0});
+                        v_page_tracker.seek(physical_seqlen_k_start);
+                    }
                 }
                 move_tile_window(v_dram_window, {kN0, 0});
+                v_page_tracker.advance();
+                sync_page_ptr(v_dram_window, v_page_tracker);
                 v_lds_write_window.set_bottom_tensor_view_data_ptr(v_lds_write_ptr);
                 if constexpr(kUseCountdownLoop && kN0 == 128 && kN1 == 128 &&
                              std::is_same_v<VDataType, bf16_t>)
@@ -881,10 +902,15 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                 if constexpr(kHasSink)
                 {
                     if(i_total_loops == num_sink_loop - 2 && i_total_loops + 2 < num_total_loop)
+                    {
                         move_tile_window(k_dram_window,
                                          {physical_seqlen_k_start - sink_seq_end, 0});
+                        k_page_tracker.seek(physical_seqlen_k_start);
+                    }
                 }
                 move_tile_window(k_dram_window, {kN0, 0});
+                k_page_tracker.advance();
+                sync_page_ptr(k_dram_window, k_page_tracker);
                 k_lds_write_window.set_bottom_tensor_view_data_ptr(k_lds_write_ptr);
                 load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
             };
