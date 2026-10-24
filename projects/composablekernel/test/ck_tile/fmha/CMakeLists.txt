@@ -179,6 +179,14 @@ if(SUPPORTED_GPU_TARGETS MATCHES "gfx125")
     if(TARGET test_ck_tile_fmha_tdm_page_tracker)
         target_include_directories(test_ck_tile_fmha_tdm_page_tracker
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(test_ck_tile_fmha_tdm_page_tracker PROPERTIES
+            LABELS "${TEST_NAME};CK_TILE_FMHA_TESTS")
+        list(APPEND FMHA_QR_TDM_SCHED_TEST_TARGETS test_ck_tile_fmha_tdm_page_tracker)
+        # script/dependency-parser/smart_build_ci.sh force-builds the ninja
+        # target `${TEST_NAME}` and runs `ctest -R ${TEST_NAME}` with an
+        # unanchored regex that also selects this test; without the edge
+        # below the binary is never built and ctest reports Not Run.
+        add_dependencies(${TEST_NAME} test_ck_tile_fmha_tdm_page_tracker)
     endif()
 
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_config
