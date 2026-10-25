@@ -1104,6 +1104,64 @@ TEST(QrTdmSchedPaged, MatchesDenseForIdenticalLogicalContent)
     }
 }
 
+// Masking reads the window origin as a global seqlen_k coordinate. The paged
+// path must not disturb that, so these should pass with no pipeline changes.
+TEST(QrTdmSchedPaged, CausalMaskMatchesDense)
+{
+    constexpr int batch = 2, nhead = 4, seqlen_q = 512, seqlen_k = 1024, hdim = 128;
+
+    for(int page_block_size : {128, 256})
+    {
+        auto dense = run_dense_tdm_sched(batch, nhead, seqlen_q, seqlen_k, hdim, MaskKind::Causal);
+        auto paged = run_paged_tdm_sched(batch,
+                                         nhead,
+                                         seqlen_q,
+                                         seqlen_k,
+                                         hdim,
+                                         page_block_size,
+                                         /*shuffle=*/true,
+                                         MaskKind::Causal);
+
+        AssertNotAllZero(dense.out, "dense.out");
+        ASSERT_EQ(dense.out.size(), paged.out.size());
+        for(size_t i = 0; i < dense.out.size(); ++i)
+            ASSERT_EQ(dense.out[i], paged.out[i])
+                << "page_block_size=" << page_block_size << " elem=" << i;
+    }
+}
+
+TEST(QrTdmSchedPaged, SlidingWindowMaskMatchesDense)
+{
+    constexpr int batch = 2, nhead = 4, seqlen_q = 512, seqlen_k = 2048, hdim = 128;
+
+    // A window shorter than a page exercises the case where kv_load_start lands
+    // mid-page and the first tracker seek is not page-aligned.
+    for(int window : {128, 384})
+    {
+        for(int page_block_size : {128, 256})
+        {
+            auto dense = run_dense_tdm_sched(
+                batch, nhead, seqlen_q, seqlen_k, hdim, MaskKind::SlidingWindow, window);
+            auto paged = run_paged_tdm_sched(batch,
+                                             nhead,
+                                             seqlen_q,
+                                             seqlen_k,
+                                             hdim,
+                                             page_block_size,
+                                             /*shuffle=*/true,
+                                             MaskKind::SlidingWindow,
+                                             window);
+
+            AssertNotAllZero(dense.out, "dense.out");
+            ASSERT_EQ(dense.out.size(), paged.out.size());
+            for(size_t i = 0; i < dense.out.size(); ++i)
+                ASSERT_EQ(dense.out[i], paged.out[i])
+                    << "window=" << window << " page_block_size=" << page_block_size
+                    << " elem=" << i;
+        }
+    }
+}
+
 // Additive rigor beyond the brief: exercise the group-mode and LSE-output
 // harness paths too (the brief's Step 5/6 tests only cover batch mode without
 // LSE), so run_*_group/run_*_with_lse are not left as untested dead code.
