@@ -31,6 +31,9 @@ from codegen.ops.fmha_fwd import (  # noqa: E402
     get_fwd_blobs,
     write_fwd_api,
 )
+from codegen.ops.fmha_pagedkv_prefill import (  # noqa: E402
+    get_fwd_blobs as get_pagedkv_fwd_blobs,
+)
 
 _SUPPORTED_FEATURE_FILTER = (
     "fmha_fwd_d*_bf16_*_nlogits*_nbias*_nmask*_nlse*_ndropout*_nskip*_nqscale*"
@@ -1567,6 +1570,42 @@ class TestGfx125V128Codegen(unittest.TestCase):
                     i in (0, 1, 2, 3, 5, 12, 13, 14),
                 )
                 self.assertNotIn("-wwm-regalloc=fast", line)
+
+
+class TestGfx125PagedKVTdmSchedGateCodegen(unittest.TestCase):
+    """Baseline tripwire for the paged-KV counterpart of qr_tdm_sched.
+
+    fmha_fwd_pagedkv_tdm_sched_applicable(a.page_block_size, bn0) (see
+    tdm_sched_gate in fmha_pagedkv_prefill.py) is the only place that enforces
+    page_block_size % kN0 == 0 for the generated qr_pagedkv_tdm_sched
+    dispatch branches. This asserts, by literal substring count only (no
+    re-derivation of the gating predicate), that every rendered
+    QRKSVS_TDM_SCHED branch carries exactly one such gate call -- same style
+    as test_cmake_family_esm2_exact_scope above, which tripwires the ESM
+    compile flag by literal filename string instead of re-deriving the cmake
+    predicate.
+    """
+
+    def test_every_tdm_sched_branch_has_applicable_gate(self):
+        api_pool, kernels = get_pagedkv_fwd_blobs(
+            targets=["gfx1250"],
+            kernel_filter="",
+            receipt=0,
+            optdim_list=[-1],
+            mask_impl="simplified",
+        )
+        sched_kernels = [
+            kernel
+            for kernel in kernels
+            if kernel.F_pipeline.tag == "qr_pagedkv_tdm_sched"
+        ]
+        self.assertTrue(sched_kernels)
+
+        api = api_pool.api
+        branch_count = api.count("ck_tile::BlockFmhaPipelineEnum::QRKSVS_TDM_SCHED")
+        gate_count = api.count("fmha_fwd_pagedkv_tdm_sched_applicable(")
+        self.assertEqual(branch_count, len(sched_kernels))
+        self.assertEqual(gate_count, branch_count)
 
 
 @unittest.skipUnless(_HOST_CXX, "a C++17 host compiler is required")
