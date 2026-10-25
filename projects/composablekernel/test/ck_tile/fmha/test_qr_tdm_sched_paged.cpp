@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -993,10 +994,20 @@ FwdResult run_paged_tdm_sched_group_gappy(const std::vector<int>& seqlens_q,
 
     const std::size_t page_elems_k = static_cast<std::size_t>(page_block_size) * kHeadDim;
     const std::size_t page_elems_v = static_cast<std::size_t>(page_block_size) * hdim_v;
-    std::vector<Data> k_phys(static_cast<std::size_t>(total_pages) * page_elems_k,
-                             ck_tile::type_convert<Data>(0.0f));
-    std::vector<Data> v_phys(static_cast<std::size_t>(total_pages) * page_elems_v,
-                             ck_tile::type_convert<Data>(0.0f));
+    // Sentinel, not zero: a zero fill cannot distinguish "the TDM descriptor
+    // correctly clamped this row to zero" from "the harness happened to put
+    // zero there". If the K/V view is oversized (reading past seqlen_k in the
+    // logical coordinate space), the masked-out score for that column is still
+    // forced to -inf independent of K content (see set_tile_if in
+    // block_fmha_fwd_pagedkv_pipeline_qr_ks_vs_tdm_sched.hpp), so the softmax
+    // weight P is exactly 0 there regardless of what K held. A finite sentinel
+    // in V would therefore still multiply out to 0 * finite == 0 and the bug
+    // would stay invisible. NaN breaks that: 0 * NaN == NaN in IEEE-754, so an
+    // over-read into one of these rows poisons the whole output row instead of
+    // silently matching. Fill both K and V with it for symmetry.
+    const Data sentinel = ck_tile::type_convert<Data>(std::numeric_limits<float>::quiet_NaN());
+    std::vector<Data> k_phys(static_cast<std::size_t>(total_pages) * page_elems_k, sentinel);
+    std::vector<Data> v_phys(static_cast<std::size_t>(total_pages) * page_elems_v, sentinel);
 
     for(int b = 0; b < batch; ++b)
     {
@@ -1013,7 +1024,7 @@ FwdResult run_paged_tdm_sched_group_gappy(const std::vector<int>& seqlens_q,
             {
                 const int phys_row = lp * page_block_size + row;
                 if(phys_row < l2p_offsets[b] || phys_row >= l2p_offsets[b] + seqlens_k[b])
-                    continue; // gap row (or trailing pad): never read, left zero
+                    continue; // gap row (or trailing pad): never read, left as NaN sentinel
                 const int s = phys_row - l2p_offsets[b];
                 std::copy(k_local.begin() + static_cast<std::size_t>(s) * kHeadDim,
                           k_local.begin() + static_cast<std::size_t>(s + 1) * kHeadDim,
