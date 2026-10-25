@@ -189,6 +189,18 @@ if(SUPPORTED_GPU_TARGETS MATCHES "gfx125")
         add_dependencies(${TEST_NAME} test_ck_tile_fmha_tdm_page_tracker)
     endif()
 
+    # Pure host test: fmha_fwd_pagedkv_tdm_sched_applicable is a plain bool function, no GPU
+    # needed. ${PROJECT_SOURCE_DIR} (for the "example/ck_tile/01_fmha/fmha_fwd.hpp" include)
+    # is already on the include path globally, see test/CMakeLists.txt.
+    add_gtest_executable(test_ck_tile_fmha_qr_tdm_sched_paged_gate
+        test_qr_tdm_sched_paged_gate.cpp)
+    if(TARGET test_ck_tile_fmha_qr_tdm_sched_paged_gate)
+        set_tests_properties(test_ck_tile_fmha_qr_tdm_sched_paged_gate PROPERTIES
+            LABELS "${TEST_NAME};CK_TILE_FMHA_TESTS")
+        list(APPEND FMHA_QR_TDM_SCHED_TEST_TARGETS test_ck_tile_fmha_qr_tdm_sched_paged_gate)
+        add_dependencies(${TEST_NAME} test_ck_tile_fmha_qr_tdm_sched_paged_gate)
+    endif()
+
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_config
         test_qr_tdm_sched_config.cpp)
     add_qr_tdm_sched_gtest(test_ck_tile_fmha_qr_tdm_sched_schedule

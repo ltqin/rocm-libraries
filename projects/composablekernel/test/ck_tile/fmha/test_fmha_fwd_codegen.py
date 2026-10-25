@@ -1517,6 +1517,7 @@ class TestGfx125V128Codegen(unittest.TestCase):
         helper = (_FMHA_EXAMPLE_DIR / "cmake") / "fmha_fwd_source_flags.cmake"
         d128 = "fmha_fwd_d128_bf16_batch_b128_qr_tdm_sched_vr_nmask_nlse_gfx125.cpp"
         d192 = "fmha_fwd_d192_bf16_batch_b128_qr_tdm_sched_vr_nmask_nlse_gfx125.cpp"
+        pk128 = "fmha_fwd_pagedkv_d128_bf16_batch_b128_qr_pagedkv_tdm_sched_vr_nmask_nlse_gfx125.cpp"
         sources = [
             d128,
             d128.replace("batch", "group"),
@@ -1533,6 +1534,12 @@ class TestGfx125V128Codegen(unittest.TestCase):
             # All supported scheduled head dimensions use expert scheduling mode.
             d128.replace("d128", "d64"),
             d128.replace("d128", "d64").replace("bf16", "fp16"),
+            # Paged-KV counterpart: qr_pagedkv_tdm_sched currently only ships
+            # hdim=128.
+            pk128,
+            # Near-miss: the generic (non-tdm_sched) paged pipeline must not
+            # pick up the scheduling flag.
+            pk128.replace("qr_pagedkv_tdm_sched", "qr_pagedkv"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "flags.cmake"
@@ -1557,7 +1564,7 @@ class TestGfx125V128Codegen(unittest.TestCase):
                 self.assertTrue(line.startswith(f"{i}:"))
                 self.assertEqual(
                     "-amdgpu-expert-scheduling-mode" in line,
-                    i in (0, 1, 2, 3, 5, 12, 13),
+                    i in (0, 1, 2, 3, 5, 12, 13, 14),
                 )
                 self.assertNotIn("-wwm-regalloc=fast", line)
 

@@ -584,6 +584,16 @@ class KernelComponentFactoryBase:
                 # see the "order of List matters" note above. Unsupported
                 # geometries are rejected later in get_fwd_blobs via
                 # KernelComponentFactoryGfx125._QR_PAGEDKV_TDM_SCHED_TILES.
+                #
+                # Mirror the generic qr_pagedkv pipeline's two-variant pattern
+                # (F_skpad "f" then "t") below: with paged KV, args.seqlen_k_ptr
+                # is always non-null (fmha_fwd_runner.hpp sets it whenever
+                # use_kvcache is true), so the F_skpad == "f" skcheck
+                # (seqlen_k_ptr == nullptr && ...) can never pass in batch mode,
+                # and group mode requires F_spad == F_skpad == "t" anyway (see
+                # the mode == "group" filter in get_fwd_blobs below). Without
+                # the F_skpad == "t" variant, no generated instance is ever
+                # dispatched to.
                 if (
                     dtype in ("fp16", "bf16")
                     and bias == "no"
@@ -591,6 +601,7 @@ class KernelComponentFactoryBase:
                     and squant == "f"
                 ):
                     pipelines.append(FmhaFwdPipeline("qr_pagedkv_tdm_sched", "row", "t", "f", "f", "f", logits, bias, "f", "t", squant, mask, "f", sink))  # fmt: skip
+                    pipelines.append(FmhaFwdPipeline("qr_pagedkv_tdm_sched", "row", "t", "t", "f", "f", logits, bias, "f", "t", squant, mask, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr_pagedkv", "row", "t", "f", "f", "f", logits, bias, "f", pagedkv, squant, mask, skip, sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr_pagedkv", "row", "t", "t", "f", "f", logits, bias, "f", pagedkv, squant, mask, skip, sink))  # fmt: skip
         elif dtype in ["fp8", "bf8"]:
