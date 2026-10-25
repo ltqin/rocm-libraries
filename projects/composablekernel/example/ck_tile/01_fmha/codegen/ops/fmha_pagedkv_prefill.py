@@ -35,7 +35,8 @@ from codegen.ops.fmha_fwd import (
 
 
 FMHA_FWD_PAGEDKV_PIPELINE_MAP = {
-    "qr_pagedkv": "ck_tile::BlockFmhaFwdPagedKVPipelineQRKSVS"
+    "qr_pagedkv": "ck_tile::BlockFmhaFwdPagedKVPipelineQRKSVS",
+    "qr_pagedkv_tdm_sched": "ck_tile::BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched",
 }
 
 FMHA_FWD_KERNEL_BODY = """
@@ -131,7 +132,7 @@ float fmha_fwd_pagedkv(fmha_fwd_pagedkv_traits& t, fmha_fwd_pagedkv_args& a, con
 """
 
 FMHA_FWD_API_INNER_DISPATCH = """{F_if}((t.is_group_mode == {F_mode}) && (t.is_v_rowmajor == {F_vlayout}) && (t.has_logits_soft_cap == {F_logits}) && ({F_mask_check}) && (t.bias_type == {F_bias_check}) && (t.has_lse == {F_lse})  && (t.use_pagedkv == {F_pagedkv}) && (t.do_fp8_static_quant == {F_squant}) && (t.skip_min_seqlen_q == {F_skip}) && (t.has_sink == {F_sink}) &&
-        ({F_scheck}) && ({F_skcheck}) && ({F_dcheck}) && ({F_dvcheck})) {{
+        ({F_scheck}) && ({F_skcheck}) && ({F_dcheck}) && ({F_dvcheck}){F_tdm_sched_gate}) {{
     using trait_ = fmha_fwd_pagedkv_traits_<{F_hdim}, {F_dtype}, {F_mode}, {F_bm0}, {F_bn0}, {F_bk0}, {F_bn1}, {F_bk1}, {F_bk0max}, {F_vlayout}, {F_pipeline_enum}, {F_logits}, {F_mask}, {F_bias}, {F_lse}, {F_pagedkv}, {F_squant}, {F_spad}, {F_skpad}, {F_dpad}, {F_dvpad}, {F_skip},{F_sink}, {F_occupancy}>;
     return fmha_fwd_pagedkv_<trait_, {F_arch.tag}>(s, a);
 }}
@@ -186,7 +187,7 @@ class FmhaFwdApiTrait:
                 return "true"  # always support
             else:
                 return "true"
-        elif self.pipeline_tag in ["qr_pagedkv", "qs"]:
+        elif self.pipeline_tag in ["qr_pagedkv", "qr_pagedkv_tdm_sched", "qs"]:
             if self.spad == "t":
                 return f"true /*a.seqlen_q % {self.bm0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -203,7 +204,7 @@ class FmhaFwdApiTrait:
                 return f"a.seqlen_k == 0 || a.seqlen_k % {self.bn0} != 0"
             else:
                 return f"a.seqlen_k != 0 && a.seqlen_k % {self.bn0} == 0"
-        elif self.pipeline_tag in ["qr_pagedkv", "qs"]:
+        elif self.pipeline_tag in ["qr_pagedkv", "qr_pagedkv_tdm_sched", "qs"]:
             if self.skpad == "t":
                 return f"true /*a.seqlen_k_ptr != nullptr || a.seqlen_k % {self.bn0} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
             else:
@@ -219,7 +220,7 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_q % {vec} == 0"
             else:
                 assert False
-        elif self.pipeline_tag in ["qr_pagedkv", "qs"]:
+        elif self.pipeline_tag in ["qr_pagedkv", "qr_pagedkv_tdm_sched", "qs"]:
             bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
             if self.dpad == "t":
                 return f"true /*a.hdim_q % {bk0submax} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
@@ -236,7 +237,7 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_v % {vec} == 0"
             else:
                 assert False
-        elif self.pipeline_tag in ["qr_pagedkv", "qs"]:
+        elif self.pipeline_tag in ["qr_pagedkv", "qr_pagedkv_tdm_sched", "qs"]:
             bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
             if self.dvpad == "t":
                 return f"true /*a.hdim_v % {bk0submax} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
@@ -244,6 +245,17 @@ class FmhaFwdApiTrait:
                 return f"a.hdim_v % {bk0submax} == 0"
         else:
             assert False
+
+    @property
+    def tdm_sched_gate(self) -> str:
+        # qr_pagedkv_tdm_sched folds paging into the base pointer, which is only
+        # valid when a kN0 tile never straddles two pages. Add a runtime check
+        # so dispatch falls back to the next (non-tdm_sched) matching trait
+        # when it does not hold; see fmha_fwd_pagedkv_tdm_sched_applicable in
+        # fmha_fwd.hpp.
+        if self.pipeline_tag == "qr_pagedkv_tdm_sched":
+            return f" && fmha_fwd_pagedkv_tdm_sched_applicable(a.page_block_size, {self.bn0})"
+        return ""
 
 
 @dataclass
@@ -380,6 +392,7 @@ class FmhaFwdApiPool:
                             F_skcheck=trait.skcheck,
                             F_dcheck=trait.dcheck,
                             F_dvcheck=trait.dvcheck,
+                            F_tdm_sched_gate=trait.tdm_sched_gate,
                             F_spad=BOOL_MAP[trait.spad],
                             F_skpad=BOOL_MAP[trait.skpad],
                             F_dpad=BOOL_MAP[trait.dpad],
@@ -563,6 +576,21 @@ class KernelComponentFactoryBase:
                 ["f"],
                 ["t", "f"],
             ):
+                # qr_pagedkv_tdm_sched is a gfx125-only scheduled-TDM variant of
+                # qr_pagedkv: fp16/bf16, row-major V, no bias / no logits soft cap
+                # / no dropout / no quantization. Its runtime predicate overlaps
+                # the generic qr_pagedkv trait below for the same combo, so it
+                # must be registered (and therefore dispatch-checked) first --
+                # see the "order of List matters" note above. Unsupported
+                # geometries are rejected later in get_fwd_blobs via
+                # KernelComponentFactoryGfx125._QR_PAGEDKV_TDM_SCHED_TILES.
+                if (
+                    dtype in ("fp16", "bf16")
+                    and bias == "no"
+                    and logits == "f"
+                    and squant == "f"
+                ):
+                    pipelines.append(FmhaFwdPipeline("qr_pagedkv_tdm_sched", "row", "t", "f", "f", "f", logits, bias, "f", "t", squant, mask, "f", sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr_pagedkv", "row", "t", "f", "f", "f", logits, bias, "f", pagedkv, squant, mask, skip, sink))  # fmt: skip
                 pipelines.append(FmhaFwdPipeline("qr_pagedkv", "row", "t", "t", "f", "f", logits, bias, "f", pagedkv, squant, mask, skip, sink))  # fmt: skip
         elif dtype in ["fp8", "bf8"]:
@@ -648,6 +676,14 @@ class KernelComponentFactoryGfx12(KernelComponentFactoryBase):
 class KernelComponentFactoryGfx125(KernelComponentFactoryBase):
     arch = ArchTrait("gfx125")
 
+    # Paged qr_tdm_sched: first release covers (hdim=128, hdim_v=128) only.
+    # Field order: bm0, bn0, bk0, bn1, bk1, bk0blocklength, ...
+    _QR_PAGEDKV_TDM_SCHED_TILES = {
+        (128, 128): (
+            FmhaFwdTileSize(128, 128, 32, 128, 32, 128, 4, 1, 1, 4, 1, 1, 16, 16, 32, 16, 16, 32, 1),
+        ),
+    }  # fmt: skip
+
     @staticmethod
     def get_hdim_tile_size_dict(dtype: str) -> Optional[dict]:
         if dtype in ["fp16", "bf16"]:
@@ -700,6 +736,20 @@ def get_fwd_blobs(
             tile = d[hdim_str]
             hdim = int(hdim_str)
             for pipeline in factory.get_pipelines(dtype, hdim, mask_impl):
+                kernel_tile = tile
+                if pipeline.tag == "qr_pagedkv_tdm_sched":
+                    # Compatibility rule: qr_pagedkv_tdm_sched only ships the
+                    # geometries listed in _QR_PAGEDKV_TDM_SCHED_TILES, using
+                    # that table's own tile (not the generic per-hdim tile
+                    # above). Any (hdim, hdim_v) missing from the table is
+                    # rejected here; the generic qr_pagedkv pipeline still
+                    # covers it.
+                    sched_tiles = getattr(
+                        factory, "_QR_PAGEDKV_TDM_SCHED_TILES", {}
+                    ).get((hdim, tile.F_bn1))
+                    if sched_tiles is None:
+                        continue
+                    kernel_tile = sched_tiles[0]
                 # if pipeline.F_pagedkv == "f":
                 #     continue
                 if mode == "group":
@@ -722,7 +772,7 @@ def get_fwd_blobs(
                     F_hdim=hdim,
                     F_dtype=dtype,
                     F_mode=mode,
-                    F_tile=tile,
+                    F_tile=kernel_tile,
                     F_pipeline=pipeline,
                     mask_impl=mask_impl,
                 )

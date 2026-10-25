@@ -31,24 +31,23 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
     static constexpr auto I0 = number<0>{};
     static constexpr auto I1 = number<1>{};
 
-    using Problem               = remove_cvref_t<Problem_>;
-    using Policy                = remove_cvref_t<Policy_>;
-    using QDataType             = remove_cvref_t<typename Problem::QDataType>;
-    using KDataType             = remove_cvref_t<typename Problem::KDataType>;
-    using VDataType             = remove_cvref_t<typename Problem::VDataType>;
-    using SaccDataType          = remove_cvref_t<typename Problem::SaccDataType>;
-    using SMPLComputeDataType   = remove_cvref_t<typename Problem::SMPLComputeDataType>;
-    using BiasDataType          = remove_cvref_t<typename Problem::BiasDataType>;
-    using RandValOutputDataType = remove_cvref_t<typename Problem::RandValOutputDataType>;
-    using LSEDataType           = remove_cvref_t<typename Problem::LSEDataType>;
-    using PDataType             = remove_cvref_t<typename Problem::PDataType>;
-    using OaccDataType          = remove_cvref_t<typename Problem::OaccDataType>;
-    using ODataType             = remove_cvref_t<typename Problem::ODataType>;
-    using AttentionVariant      = remove_cvref_t<typename Problem::AttentionVariant>;
-    using FmhaMask              = remove_cvref_t<typename Problem::FmhaMask>;
-    using SplitSoftmax          = FmhaTdmSchedSplitSoftmaxFor<Policy::Geometry::kQkStages>;
-    using Schedule              = typename Policy::Schedule;
-    using Mode                  = FmhaTdmSchedMode<Problem, Policy>;
+    using Problem             = remove_cvref_t<Problem_>;
+    using Policy              = remove_cvref_t<Policy_>;
+    using QDataType           = remove_cvref_t<typename Problem::QDataType>;
+    using KDataType           = remove_cvref_t<typename Problem::KDataType>;
+    using VDataType           = remove_cvref_t<typename Problem::VDataType>;
+    using SaccDataType        = remove_cvref_t<typename Problem::SaccDataType>;
+    using SMPLComputeDataType = remove_cvref_t<typename Problem::SMPLComputeDataType>;
+    using BiasDataType        = remove_cvref_t<typename Problem::BiasDataType>;
+    using LSEDataType         = remove_cvref_t<typename Problem::LSEDataType>;
+    using PDataType           = remove_cvref_t<typename Problem::PDataType>;
+    using OaccDataType        = remove_cvref_t<typename Problem::OaccDataType>;
+    using ODataType           = remove_cvref_t<typename Problem::ODataType>;
+    using AttentionVariant    = remove_cvref_t<typename Problem::AttentionVariant>;
+    using FmhaMask            = remove_cvref_t<typename Problem::FmhaMask>;
+    using SplitSoftmax        = FmhaTdmSchedSplitSoftmaxFor<Policy::Geometry::kQkStages>;
+    using Schedule            = typename Policy::Schedule;
+    using Mode                = FmhaTdmSchedMode<Problem, Policy>;
     static_assert(
         Mode::kIsLegal,
         "qr_pagedkv_tdm_sched schedule geometry or output-rescale placement is incompatible");
@@ -70,19 +69,21 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
     static constexpr index_t kSubQKHeaddim = BlockFmhaShape::kSubQKHeaddim;
     static constexpr index_t kNWarp        = BlockFmhaShape::Gemm0BlockWarps::at(I1);
 
-    static constexpr bool kIsGroupMode       = Problem::kIsGroupMode;
-    static constexpr bool kPadSeqLenQ        = Problem::kPadSeqLenQ;
-    static constexpr bool kPadSeqLenK        = Problem::kPadSeqLenK;
-    static constexpr bool kPadHeadDimQ       = Problem::kPadHeadDimQ;
-    static constexpr bool kPadHeadDimV       = Problem::kPadHeadDimV;
-    static constexpr bool kHasLogitsSoftCap  = Problem::kHasLogitsSoftCap;
-    static constexpr bool kHasDropout        = Problem::kHasDropout;
+    static constexpr bool kIsGroupMode      = Problem::kIsGroupMode;
+    static constexpr bool kPadSeqLenQ       = Problem::kPadSeqLenQ;
+    static constexpr bool kPadSeqLenK       = Problem::kPadSeqLenK;
+    static constexpr bool kPadHeadDimQ      = Problem::kPadHeadDimQ;
+    static constexpr bool kPadHeadDimV      = Problem::kPadHeadDimV;
+    static constexpr bool kHasLogitsSoftCap = Problem::kHasLogitsSoftCap;
+    // BlockFmhaFwdPagedKVPipelineProblem does not model dropout at all (unlike the
+    // dense BlockFmhaPipelineProblem this pipeline was copied from), so there is no
+    // Problem::kHasDropout to read; this pipeline never supports it either way.
+    static constexpr bool kHasDropout        = false;
     static constexpr auto BiasEnum           = Problem::BiasEnum;
     static constexpr bool kStoreLSE          = Problem::kStoreLSE;
     static constexpr bool kHasUnevenSplits   = true;
     static constexpr bool kHasSink           = Problem::kHasSink;
     static constexpr bool kEnableVirtualSink = EnableVirtualSink_;
-    static constexpr auto QScaleEnum         = Problem::QScaleEnum;
 
     static_assert(
         CK_TILE_FMHA_FWD_FAST_EXP2,
@@ -92,7 +93,10 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                   "qr_pagedkv_tdm_sched does not implement attention bias");
     static_assert(!kHasLogitsSoftCap, "qr_pagedkv_tdm_sched does not implement logits soft cap");
     static_assert(!kHasDropout, "qr_pagedkv_tdm_sched does not support dropout");
-    static_assert(QScaleEnum == BlockAttentionQuantScaleEnum::NO_SCALE,
+    // BlockFmhaFwdPagedKVPipelineProblem exposes quantization as the bool
+    // kDoFp8StaticQuant (not the BlockAttentionQuantScaleEnum QScaleEnum used by
+    // the dense Problem type), so check that directly instead.
+    static_assert(!Problem::kDoFp8StaticQuant,
                   "qr_pagedkv_tdm_sched does not implement quantized attention yet");
 
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)

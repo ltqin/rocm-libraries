@@ -1788,6 +1788,15 @@ ck_tile::index_t fmha_fwd_block_scale_size_kv(const std::string& data_type,
                                               ck_tile::index_t hdim_q,
                                               ck_tile::index_t hdim_v);
 
+// qr_tdm_sched folds paging into the base pointer, which is only valid when a
+// kN0 tile never straddles two pages. Anything else falls back to the generic
+// paged pipeline.
+inline bool fmha_fwd_pagedkv_tdm_sched_applicable(ck_tile::index_t page_block_size,
+                                                  ck_tile::index_t kN0)
+{
+    return 0 < page_block_size && (page_block_size % kN0) == 0;
+}
+
 struct fmha_fwd_pagedkv_traits
 {
     int hdim_q;
