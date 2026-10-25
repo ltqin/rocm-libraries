@@ -900,11 +900,15 @@ FwdResult run_paged_tdm_sched_group(const std::vector<int>& seqlens_q,
 // cross-batch prefix sum like the non-gappy convention -- and seqlen_k_ptr[b]
 // carries the real per-batch token count. Each batch's real K/V content is
 // placed starting at physical row l2p_offsets[b] within its own page set; the
-// rows before that (the "gap") are left zero and are provably never read,
-// because the TDM affine K/V view is sized to exactly kv_l2p_offset+seqlen_k
-// rows and the tracker's reverse offset folds l2p_offsets[b] back in so a
-// GLOBAL (gap-unaware) window origin in [0, seqlen_k) lands on physical rows
-// [l2p_offsets[b], l2p_offsets[b]+seqlen_k) -- see tdm_page_tracker.hpp.
+// rows before that (the "gap") carry a NaN sentinel and are provably never
+// read. The TDM affine K/V view is sized by the LOGICAL seqlen_k alone (the
+// l2p shift never widens the descriptor); it is the tracker's reverse offset,
+// folded into the base pointer, that maps a GLOBAL (gap-unaware) window
+// origin in [0, seqlen_k) onto physical rows
+// [l2p_offsets[b], l2p_offsets[b]+seqlen_k) -- see tdm_page_tracker.hpp. A
+// descriptor that instead over-reads into the gap (or the next page) would
+// pull the NaN sentinel through P*V instead of silently agreeing with a zero
+// fill, which is why the gap rows are NaN and not zero.
 //
 // l2p_offsets[b] must be a multiple of kN0 (128, this file's fixed TileRows):
 // the tracker's tile-advance countdown assumes the first token inside a page
