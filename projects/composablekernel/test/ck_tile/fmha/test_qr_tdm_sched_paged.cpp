@@ -1067,11 +1067,15 @@ FwdResult run_paged_tdm_sched_with_lse(
 
 TEST(QrTdmSchedPagedHarness, ShuffledBlockTableIsNotIdentity)
 {
-    // Covers every page count actually requested by the run_paged_* tests in
-    // this file (4, 6, 8, 12, 16), plus the two smallest sizes (2, 3) where a
-    // fixed-seed single shuffle is most likely to land on the identity by
-    // chance (confirmed at n == 2 before make_shuffled_block_table was fixed
-    // to guard against it).
+    // A representative sample of page counts, not an exhaustive list of every
+    // value the run_paged_* tests in this file request (that set keeps changing
+    // as tests are added/resized, e.g. SlidingWindowMaskMatchesDense alone can
+    // request 32). The guarantee this is actually checking --
+    // make_shuffled_block_table producing a non-identity permutation -- holds
+    // for any n >= 2, so a few representative sizes are sufficient; the small
+    // ones (2, 3) are kept because a fixed-seed single shuffle is most likely to
+    // land on the identity by chance there (confirmed at n == 2 before
+    // make_shuffled_block_table was fixed to guard against it).
     for(const int num_pages : {2, 3, 4, 6, 8, 12, 16})
     {
         SCOPED_TRACE(num_pages);
@@ -1108,7 +1112,14 @@ TEST(QrTdmSchedPaged, MatchesDenseForIdenticalLogicalContent)
 // path must not disturb that, so these should pass with no pipeline changes.
 TEST(QrTdmSchedPaged, CausalMaskMatchesDense)
 {
-    constexpr int batch = 2, nhead = 4, seqlen_q = 512, seqlen_k = 1024, hdim = 128;
+    // seqlen_q == seqlen_k so the last query tile's causal range reaches all the
+    // way to x_total under TOP_LEFT alignment (GetTileRangeAlongX: x_end = min(i_y
+    // + YTile - 1 + x, x_total), and at i_y = seqlen_q - YTile this hits x_total
+    // exactly when seqlen_q == seqlen_k). That forces every page to actually be
+    // read, not just the first half -- otherwise seqlen_k's upper pages would be
+    // populated but never touched by the kernel, making the paged-vs-dense
+    // comparison weaker than it looks.
+    constexpr int batch = 2, nhead = 4, seqlen_q = 1024, seqlen_k = 1024, hdim = 128;
 
     for(int page_block_size : {128, 256})
     {
@@ -1132,7 +1143,13 @@ TEST(QrTdmSchedPaged, CausalMaskMatchesDense)
 
 TEST(QrTdmSchedPaged, SlidingWindowMaskMatchesDense)
 {
-    constexpr int batch = 2, nhead = 4, seqlen_q = 512, seqlen_k = 2048, hdim = 128;
+    // seqlen_q == seqlen_k for the same reason as CausalMaskMatchesDense: with
+    // window_right == 0 (both window values below), x_start/x_end are contiguous
+    // across consecutive query tiles regardless of window size, so the union of
+    // tiles read reaches x_total only once the last query tile's range does --
+    // which requires seqlen_q == seqlen_k. Otherwise every page past seqlen_q
+    // would be populated but never read by either kernel.
+    constexpr int batch = 2, nhead = 4, seqlen_q = 2048, seqlen_k = 2048, hdim = 128;
 
     // A window shorter than a page exercises the case where kv_load_start lands
     // mid-page and the first tracker seek is not page-aligned.
