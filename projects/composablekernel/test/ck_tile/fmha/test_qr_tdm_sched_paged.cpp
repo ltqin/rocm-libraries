@@ -195,70 +195,106 @@ using Epilogue =
     ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<float, Data, true, true>>;
 
 template <bool Group, bool Mask, bool Lse>
-using ProblemFor =
+using BaseModelFor =
     typename ck_tile::test::Model<kHeadDim, Group, Mask, Lse, Data, kHeadDim, kHeadDimV>::Problem;
 
-template <bool Group, bool Mask, bool Lse>
-using PolicyFor = ck_tile::test::Policy<ProblemFor<Group, Mask, Lse>>;
+// ck_tile::test::Model has no Sink parameter of its own (every call site in
+// this file predates sink support) and always builds its Traits with
+// kHasSink=false. Reuse every other field off BaseModelFor via inheritance
+// and override only kHasSink, so the dense problem's own Traits (not just
+// the paged specialization below) actually compiles in the kHasSink==true
+// branches instead of silently leaving them dead code, which is exactly the
+// gap Task 6 found for masking one level removed.
+template <bool Group, bool Mask, bool Sink, bool Lse>
+struct TraitsFor : BaseModelFor<Group, Mask, Lse>::Traits
+{
+    static constexpr bool kHasSink = Sink;
+};
 
-template <bool Group, bool Mask, bool Lse>
-using DensePipelineFor = ck_tile::BlockFmhaPipelineQRKSVSTdmSched<ProblemFor<Group, Mask, Lse>,
-                                                                  PolicyFor<Group, Mask, Lse>>;
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using ProblemFor = ck_tile::BlockFmhaPipelineProblem<
+    typename BaseModelFor<Group, Mask, Lse>::QDataType,
+    typename BaseModelFor<Group, Mask, Lse>::KDataType,
+    typename BaseModelFor<Group, Mask, Lse>::VDataType,
+    typename BaseModelFor<Group, Mask, Lse>::SaccDataType,
+    typename BaseModelFor<Group, Mask, Lse>::SMPLComputeDataType,
+    typename BaseModelFor<Group, Mask, Lse>::BiasDataType,
+    typename BaseModelFor<Group, Mask, Lse>::RandValOutputDataType,
+    typename BaseModelFor<Group, Mask, Lse>::LSEDataType,
+    typename BaseModelFor<Group, Mask, Lse>::PDataType,
+    typename BaseModelFor<Group, Mask, Lse>::OaccDataType,
+    typename BaseModelFor<Group, Mask, Lse>::ODataType,
+    typename BaseModelFor<Group, Mask, Lse>::BlockFmhaShape,
+    Group,
+    typename BaseModelFor<Group, Mask, Lse>::AttentionVariant,
+    typename BaseModelFor<Group, Mask, Lse>::FmhaMask,
+    BaseModelFor<Group, Mask, Lse>::kUseTrLoad,
+    TraitsFor<Group, Mask, Sink, Lse>>;
+
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using PolicyFor = ck_tile::test::Policy<ProblemFor<Group, Mask, Sink, Lse>>;
+
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using DensePipelineFor =
+    ck_tile::BlockFmhaPipelineQRKSVSTdmSched<ProblemFor<Group, Mask, Sink, Lse>,
+                                             PolicyFor<Group, Mask, Sink, Lse>>;
 
 // FmhaFwdPagedKVKernel reads FmhaPipeline::Problem::kIsPagedKV (and
 // ::kDoFp8StaticQuant) directly to pick its kargs layout (CommonPageBlockTableKargs
-// vs CacheBatchIdxKargs, etc). Model's Problem uses the plain TileFmhaTraits,
-// which does not define either flag.
+// vs CacheBatchIdxKargs, etc). ProblemFor's Traits (TraitsFor above) does not
+// define either flag.
 //
 // TileFmhaFwdPagedKVTraits (the traits type the *other*, PageBlockNavigator-based
 // paged pipelines pair with BlockFmhaFwdPagedKVPipelineProblem) does define them,
 // but it is missing kHasDropout/QScaleEnum, which the generic BlockFmhaPipelineProblem
 // our dense Problem (and this pipeline) is built on reads unconditionally -- so it
 // cannot be dropped in as a straight replacement here. Instead, derive from the
-// dense Problem's own Traits type and add just the two extra flags on top; plain
-// inheritance keeps every member BlockFmhaPipelineProblem already relies on, and
-// the derived class's own kDoFp8StaticQuant/kIsPagedKV are picked up by
-// BlockFmhaPipelineProblem's detail::traits_has_* detection.
-template <bool Group, bool Mask, bool Lse>
-struct PagedTraitsFor : ProblemFor<Group, Mask, Lse>::Traits
+// dense Problem's own Traits type (which already carries kHasSink=Sink) and add
+// just the two extra flags on top; plain inheritance keeps every member
+// BlockFmhaPipelineProblem already relies on, and the derived class's own
+// kDoFp8StaticQuant/kIsPagedKV are picked up by BlockFmhaPipelineProblem's
+// detail::traits_has_* detection.
+template <bool Group, bool Mask, bool Sink, bool Lse>
+struct PagedTraitsFor : ProblemFor<Group, Mask, Sink, Lse>::Traits
 {
     static constexpr bool kDoFp8StaticQuant = false;
     static constexpr bool kIsPagedKV        = true;
 };
 
-template <bool Group, bool Mask, bool Lse>
-using PagedProblemFor =
-    ck_tile::BlockFmhaPipelineProblem<typename ProblemFor<Group, Mask, Lse>::QDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::KDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::VDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::SaccDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::SMPLComputeDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::BiasDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::RandValOutputDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::LSEDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::PDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::OaccDataType,
-                                      typename ProblemFor<Group, Mask, Lse>::ODataType,
-                                      typename ProblemFor<Group, Mask, Lse>::BlockFmhaShape,
-                                      Group,
-                                      typename ProblemFor<Group, Mask, Lse>::AttentionVariant,
-                                      typename ProblemFor<Group, Mask, Lse>::FmhaMask,
-                                      ProblemFor<Group, Mask, Lse>::kUseTrLoad,
-                                      PagedTraitsFor<Group, Mask, Lse>>;
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using PagedProblemFor = ck_tile::BlockFmhaPipelineProblem<
+    typename ProblemFor<Group, Mask, Sink, Lse>::QDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::KDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::VDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::SaccDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::SMPLComputeDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::BiasDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::RandValOutputDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::LSEDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::PDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::OaccDataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::ODataType,
+    typename ProblemFor<Group, Mask, Sink, Lse>::BlockFmhaShape,
+    Group,
+    typename ProblemFor<Group, Mask, Sink, Lse>::AttentionVariant,
+    typename ProblemFor<Group, Mask, Sink, Lse>::FmhaMask,
+    ProblemFor<Group, Mask, Sink, Lse>::kUseTrLoad,
+    PagedTraitsFor<Group, Mask, Sink, Lse>>;
 
-template <bool Group, bool Mask, bool Lse>
-using PagedPolicyFor = ck_tile::test::Policy<PagedProblemFor<Group, Mask, Lse>>;
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using PagedPolicyFor = ck_tile::test::Policy<PagedProblemFor<Group, Mask, Sink, Lse>>;
 
-template <bool Group, bool Mask, bool Lse>
+template <bool Group, bool Mask, bool Sink, bool Lse>
 using PagedPipelineFor =
-    ck_tile::BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched<PagedProblemFor<Group, Mask, Lse>,
-                                                       PagedPolicyFor<Group, Mask, Lse>>;
+    ck_tile::BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched<PagedProblemFor<Group, Mask, Sink, Lse>,
+                                                       PagedPolicyFor<Group, Mask, Sink, Lse>>;
 
-template <bool Group, bool Mask, bool Lse>
-using DenseKernelFor = ck_tile::FmhaFwdKernel<DensePipelineFor<Group, Mask, Lse>, Epilogue>;
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using DenseKernelFor = ck_tile::FmhaFwdKernel<DensePipelineFor<Group, Mask, Sink, Lse>, Epilogue>;
 
-template <bool Group, bool Mask, bool Lse>
-using PagedKernelFor = ck_tile::FmhaFwdPagedKVKernel<PagedPipelineFor<Group, Mask, Lse>, Epilogue>;
+template <bool Group, bool Mask, bool Sink, bool Lse>
+using PagedKernelFor =
+    ck_tile::FmhaFwdPagedKVKernel<PagedPipelineFor<Group, Mask, Sink, Lse>, Epilogue>;
 
 template <typename Kernel>
 void LaunchDirect(const typename Kernel::Kargs& kargs,
@@ -273,9 +309,10 @@ void LaunchDirect(const typename Kernel::Kargs& kargs,
 }
 
 // Batch-mode (fixed seqlen across the batch) dense/paged launcher, templated
-// on whether it should run the paged kernel, whether a mask is active, and
-// whether LSE is written out.
-template <bool IsPaged, bool Mask, bool Lse>
+// on whether it should run the paged kernel, whether a mask is active,
+// whether the compile-time sink branches are present, and whether LSE is
+// written out.
+template <bool IsPaged, bool Mask, bool Sink, bool Lse>
 FwdResult LaunchBatch(int batch,
                       int nhead,
                       int seqlen_q,
@@ -452,7 +489,7 @@ FwdResult LaunchBatch(int batch,
         args.mask_type         = mask_type;
         args.min_seqlen_q      = 0;
 
-        using Kernel        = PagedKernelFor<false, Mask, Lse>;
+        using Kernel        = PagedKernelFor<false, Mask, Sink, Lse>;
         auto [kargs, grids] = fmha_fwd_pagedkv_create_kargs_and_grids<Kernel>(args);
         LaunchDirect<Kernel>(kargs, stream, grids);
     }
@@ -505,7 +542,7 @@ FwdResult LaunchBatch(int batch,
         args.sink_size         = sink_size;
         args.mask_type         = mask_type;
 
-        using Kernel        = DenseKernelFor<false, Mask, Lse>;
+        using Kernel        = DenseKernelFor<false, Mask, Sink, Lse>;
         auto [kargs, grids] = fmha_fwd_create_kargs_and_grids<Kernel>(args);
         LaunchDirect<Kernel>(kargs, stream, grids);
     }
@@ -716,7 +753,7 @@ FwdResult LaunchGroup(const std::vector<int>& seqlens_q,
         args.mask_type         = mask_type;
         args.min_seqlen_q      = 0;
 
-        using Kernel        = PagedKernelFor<true, false, false>;
+        using Kernel        = PagedKernelFor<true, false, false, false>;
         auto [kargs, grids] = fmha_fwd_pagedkv_create_kargs_and_grids<Kernel>(args);
         LaunchDirect<Kernel>(kargs, stream, grids);
     }
@@ -772,7 +809,7 @@ FwdResult LaunchGroup(const std::vector<int>& seqlens_q,
         args.sink_size         = 0;
         args.mask_type         = mask_type;
 
-        using Kernel        = DenseKernelFor<true, false, false>;
+        using Kernel        = DenseKernelFor<true, false, false, false>;
         auto [kargs, grids] = fmha_fwd_create_kargs_and_grids<Kernel>(args);
         LaunchDirect<Kernel>(kargs, stream, grids);
     }
@@ -795,9 +832,12 @@ FwdResult run_dense_tdm_sched(int batch,
                               int sink      = 0)
 {
     if(mask == MaskKind::None)
-        return LaunchBatch<false, false, false>(
+        return LaunchBatch<false, false, false, false>(
             batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, mask, window, sink);
-    return LaunchBatch<false, true, false>(
+    if(sink > 0)
+        return LaunchBatch<false, true, true, false>(
+            batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, mask, window, sink);
+    return LaunchBatch<false, true, false, false>(
         batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, mask, window, sink);
 }
 
@@ -813,9 +853,12 @@ FwdResult run_paged_tdm_sched(int batch,
                               int sink      = 0)
 {
     if(mask == MaskKind::None)
-        return LaunchBatch<true, false, false>(
+        return LaunchBatch<true, false, false, false>(
             batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, shuffle, mask, window, sink);
-    return LaunchBatch<true, true, false>(
+    if(sink > 0)
+        return LaunchBatch<true, true, true, false>(
+            batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, shuffle, mask, window, sink);
+    return LaunchBatch<true, true, false, false>(
         batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, shuffle, mask, window, sink);
 }
 
@@ -1040,7 +1083,7 @@ FwdResult run_paged_tdm_sched_group_gappy(const std::vector<int>& seqlens_q,
     args.mask_type         = mask_type;
     args.min_seqlen_q      = 0;
 
-    using Kernel        = PagedKernelFor<true, false, false>;
+    using Kernel        = PagedKernelFor<true, false, false, false>;
     auto [kargs, grids] = fmha_fwd_pagedkv_create_kargs_and_grids<Kernel>(args);
     LaunchDirect<Kernel>(kargs, stream, grids);
 
@@ -1054,14 +1097,14 @@ FwdResult run_paged_tdm_sched_group_gappy(const std::vector<int>& seqlens_q,
 
 FwdResult run_dense_tdm_sched_with_lse(int batch, int nhead, int seqlen_q, int seqlen_k, int hdim)
 {
-    return LaunchBatch<false, false, true>(
+    return LaunchBatch<false, false, false, true>(
         batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, MaskKind::None, 0, 0);
 }
 
 FwdResult run_paged_tdm_sched_with_lse(
     int batch, int nhead, int seqlen_q, int seqlen_k, int hdim, int page_block_size, bool shuffle)
 {
-    return LaunchBatch<true, false, true>(
+    return LaunchBatch<true, false, false, true>(
         batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, shuffle, MaskKind::None, 0, 0);
 }
 
@@ -1175,6 +1218,52 @@ TEST(QrTdmSchedPaged, SlidingWindowMaskMatchesDense)
                 ASSERT_EQ(dense.out[i], paged.out[i])
                     << "window=" << window << " page_block_size=" << page_block_size
                     << " elem=" << i;
+        }
+    }
+}
+
+// Sink is the only path that jumps the window an arbitrary distance, crossing
+// several pages at once. K and V jump on different iterations (K two tiles
+// ahead, V one), so both seek sites must be correct independently.
+TEST(QrTdmSchedPaged, AttentionSinkMatchesDense)
+{
+    // seqlen_q == seqlen_k on purpose. Under MASK_FROM_TOP_LEFT a query tile
+    // reads K only up to x_end = min(i_y + kM0, seqlen_k), so with a smaller
+    // seqlen_q the mask caps the K range well below seqlen_k and most pages are
+    // never read -- which would defeat the point of testing a paged walk. Task 6
+    // hit exactly that and had to be corrected.
+    constexpr int batch = 2, nhead = 4, seqlen_q = 2048, seqlen_k = 2048, hdim = 128;
+
+    // sink=128 gives num_sink_loop==1 (prologue jump site);
+    // sink=384 gives num_sink_loop==3 (main-loop jump site).
+    for(int sink : {128, 384})
+    {
+        for(int page_block_size : {128, 256})
+        {
+            auto dense = run_dense_tdm_sched(batch,
+                                             nhead,
+                                             seqlen_q,
+                                             seqlen_k,
+                                             hdim,
+                                             MaskKind::SlidingWindow,
+                                             /*window=*/512,
+                                             sink);
+            auto paged = run_paged_tdm_sched(batch,
+                                             nhead,
+                                             seqlen_q,
+                                             seqlen_k,
+                                             hdim,
+                                             page_block_size,
+                                             /*shuffle=*/true,
+                                             MaskKind::SlidingWindow,
+                                             /*window=*/512,
+                                             sink);
+
+            AssertNotAllZero(dense.out, "dense.out");
+            ASSERT_EQ(dense.out.size(), paged.out.size());
+            for(size_t i = 0; i < dense.out.size(); ++i)
+                ASSERT_EQ(dense.out[i], paged.out[i])
+                    << "sink=" << sink << " page_block_size=" << page_block_size << " elem=" << i;
         }
     }
 }

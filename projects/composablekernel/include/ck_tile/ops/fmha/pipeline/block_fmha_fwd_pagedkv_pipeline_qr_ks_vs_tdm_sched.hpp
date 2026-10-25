@@ -633,6 +633,12 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                 // Reuse the V LDS buffer only after the preceding reads have completed.
                 block_sync_lds<k_lds_insts>();
                 // V is prefetched one iteration before its consumer.
+                // The unconditional advance must land first: the sink jump is an
+                // absolute seek() that overrides it, so it must be applied last,
+                // mirroring the prologue's ordering. Doing it the other way around
+                // leaves the window exactly kN0 behind the tracker.
+                move_tile_window(v_dram_window, {kN0, 0});
+                v_page_tracker.advance();
                 if constexpr(kHasSink)
                 {
                     if(i_total_loops == num_sink_loop - 1 && i_total_loops + 1 < num_total_loop)
@@ -642,8 +648,6 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                         v_page_tracker.seek(physical_seqlen_k_start);
                     }
                 }
-                move_tile_window(v_dram_window, {kN0, 0});
-                v_page_tracker.advance();
                 sync_page_ptr(v_dram_window, v_page_tracker);
                 v_lds_write_window.set_bottom_tensor_view_data_ptr(v_lds_write_ptr);
                 if constexpr(kUseCountdownLoop && kN0 == 128 && kN1 == 128 &&
@@ -899,6 +903,12 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                 // Fixed boundary: the next K TDM transfer follows softmax.
                 block_sync_lds<v_lds_insts>();
                 // The K transfer here feeds iteration i+2, beyond the already prefetched K1.
+                // The unconditional advance must land first: the sink jump is an
+                // absolute seek() that overrides it, so it must be applied last,
+                // mirroring the prologue's ordering. Doing it the other way around
+                // leaves the window exactly kN0 behind the tracker.
+                move_tile_window(k_dram_window, {kN0, 0});
+                k_page_tracker.advance();
                 if constexpr(kHasSink)
                 {
                     if(i_total_loops == num_sink_loop - 2 && i_total_loops + 2 < num_total_loop)
@@ -908,8 +918,6 @@ struct BlockFmhaFwdPagedKVPipelineQRKSVSTdmSched
                         k_page_tracker.seek(physical_seqlen_k_start);
                     }
                 }
-                move_tile_window(k_dram_window, {kN0, 0});
-                k_page_tracker.advance();
                 sync_page_ptr(k_dram_window, k_page_tracker);
                 k_lds_write_window.set_bottom_tensor_view_data_ptr(k_lds_write_ptr);
                 load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
