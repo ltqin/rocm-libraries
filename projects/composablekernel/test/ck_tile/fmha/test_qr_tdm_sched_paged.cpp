@@ -831,6 +831,14 @@ FwdResult run_dense_tdm_sched(int batch,
                               int window    = 0,
                               int sink      = 0)
 {
+    // LaunchBatch only wires sink_size into kargs under if constexpr(Mask), so
+    // sink > 0 with mask == MaskKind::None would be silently dropped: the call
+    // would compile, run, and test nothing. Fail loudly instead, so the next
+    // caller gets an immediate error rather than a green but vacuous test.
+    if(sink > 0 && mask == MaskKind::None)
+        throw std::invalid_argument(
+            "run_dense_tdm_sched: sink > 0 requires a mask (sink_size is only "
+            "assigned under if constexpr(Mask) in LaunchBatch)");
     if(mask == MaskKind::None)
         return LaunchBatch<false, false, false, false>(
             batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, mask, window, sink);
@@ -852,6 +860,11 @@ FwdResult run_paged_tdm_sched(int batch,
                               int window    = 0,
                               int sink      = 0)
 {
+    // See run_dense_tdm_sched above: same vacuity trap, same guard.
+    if(sink > 0 && mask == MaskKind::None)
+        throw std::invalid_argument(
+            "run_paged_tdm_sched: sink > 0 requires a mask (sink_size is only "
+            "assigned under if constexpr(Mask) in LaunchBatch)");
     if(mask == MaskKind::None)
         return LaunchBatch<true, false, false, false>(
             batch, nhead, seqlen_q, seqlen_k, hdim, page_block_size, shuffle, mask, window, sink);
@@ -1235,8 +1248,11 @@ TEST(QrTdmSchedPaged, AttentionSinkMatchesDense)
     constexpr int batch = 2, nhead = 4, seqlen_q = 2048, seqlen_k = 2048, hdim = 128;
 
     // sink=128 gives num_sink_loop==1 (prologue jump site);
-    // sink=384 gives num_sink_loop==3 (main-loop jump site).
-    for(int sink : {128, 384})
+    // sink=256 gives num_sink_loop==2, the only case where K's main-loop jump
+    // fires on the very first main-loop iteration
+    // (i_total_loops == num_sink_loop - 2 == 0);
+    // sink=384 gives num_sink_loop==3 (main-loop jump site, later iteration).
+    for(int sink : {128, 256, 384})
     {
         for(int page_block_size : {128, 256})
         {
@@ -1381,6 +1397,50 @@ TEST(QrTdmSchedPaged, LseMatchesDenseForIdenticalLogicalContent)
         ASSERT_EQ(dense.lse.size(), paged.lse.size());
         for(std::size_t i = 0; i < dense.lse.size(); ++i)
             ASSERT_EQ(dense.lse[i], paged.lse[i]) << "lse mismatch at element " << i;
+    }
+}
+
+// LseMatchesDenseForIdenticalLogicalContent above only exercises the no-mask
+// path (run_dense_tdm_sched_with_lse/run_paged_tdm_sched_with_lse take no mask
+// argument). Masking changes which logits enter the softmax normalization --
+// masked-out entries are excluded from the LSE sum -- so that test cannot
+// prove paging leaves LSE untouched once a mask is active. Call LaunchBatch
+// directly (Mask=true, Lse=true) to close that gap instead of duplicating the
+// brief's identical-content LSE test under a new name with different shape
+// numbers, which would add no new coverage.
+TEST(QrTdmSchedPaged, LseMatchesDenseUnderCausalMask)
+{
+    // seqlen_q == seqlen_k for the same reason as CausalMaskMatchesDense: the
+    // last query tile's causal range must reach x_total under TOP_LEFT
+    // alignment so every page is actually read, not just the first half.
+    constexpr int batch = 2, nhead = 4, seqlen_q = 1024, seqlen_k = 1024, hdim = 128;
+
+    for(int page_block_size : {128, 256})
+    {
+        SCOPED_TRACE(page_block_size);
+        auto dense = LaunchBatch<false, true, false, true>(
+            batch, nhead, seqlen_q, seqlen_k, hdim, 0, false, MaskKind::Causal, 0, 0);
+        auto paged = LaunchBatch<true, true, false, true>(batch,
+                                                          nhead,
+                                                          seqlen_q,
+                                                          seqlen_k,
+                                                          hdim,
+                                                          page_block_size,
+                                                          /*shuffle=*/true,
+                                                          MaskKind::Causal,
+                                                          0,
+                                                          0);
+
+        AssertNotAllZero(dense.out, "dense.out");
+        ASSERT_EQ(dense.out.size(), paged.out.size());
+        for(size_t i = 0; i < dense.out.size(); ++i)
+            ASSERT_EQ(dense.out[i], paged.out[i]) << "out elem " << i;
+
+        AssertAllFinite(dense.lse, "dense.lse");
+        AssertNotAllZero(dense.lse, "dense.lse");
+        ASSERT_EQ(dense.lse.size(), paged.lse.size());
+        for(size_t i = 0; i < dense.lse.size(); ++i)
+            ASSERT_EQ(dense.lse[i], paged.lse[i]) << "lse elem " << i;
     }
 }
 
