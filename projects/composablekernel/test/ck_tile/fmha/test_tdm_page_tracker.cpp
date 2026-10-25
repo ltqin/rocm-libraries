@@ -41,7 +41,8 @@ const Elem* expected_addr(const Elem* pool,
 Tracker make_tracker(const Elem* pool,
                      const std::vector<std::int32_t>& table,
                      long_index_t fixed_offset,
-                     index_t global_seq_start)
+                     index_t global_seq_start,
+                     index_t l2p_offset = 0)
 {
     return Tracker{pool,
                    kBlockStride,
@@ -50,7 +51,8 @@ Tracker make_tracker(const Elem* pool,
                    kPageBlockSize,
                    kStrideKv,
                    kNumPages,
-                   global_seq_start};
+                   global_seq_start,
+                   l2p_offset};
 }
 
 TEST(TdmPageTracker, IdentityTableMatchesDenseAddressing)
@@ -169,6 +171,37 @@ TEST(TdmPageTracker, AdvancingPastLastPageDoesNotReadTableOutOfBounds)
         tracker.advance();
         EXPECT_LE(tracker.current_page(), kNumPages - 1);
         EXPECT_EQ(tracker.base_ptr(), last_valid_base) << "after " << (i + 1) << " advances";
+    }
+}
+
+TEST(TdmPageTracker, L2pOffsetShiftsPageSelection)
+{
+    const Elem* pool = reinterpret_cast<const Elem*>(0x100000000ULL);
+    std::vector<std::int32_t> table(kNumPages);
+    for(index_t p = 0; p < kNumPages; ++p)
+        table[p] = kNumPages - 1 - p;
+
+    // Sequence starts 1.5 pages into the pool.
+    const index_t l2p = kPageBlockSize + kTileRows;
+
+    Tracker tracker{pool,
+                    kBlockStride,
+                    0,
+                    table.data(),
+                    kPageBlockSize,
+                    kStrideKv,
+                    kNumPages,
+                    /*global_seq_start=*/0,
+                    l2p};
+
+    EXPECT_EQ(tracker.current_page(), 1);
+
+    for(index_t i = 0; i < 6; ++i)
+    {
+        const index_t global_seq = i * kTileRows;
+        const Elem* got = tracker.base_ptr() + static_cast<long_index_t>(global_seq) * kStrideKv;
+        EXPECT_EQ(got, expected_addr(pool, table, l2p + global_seq, 0)) << "tile " << i;
+        tracker.advance();
     }
 }
 

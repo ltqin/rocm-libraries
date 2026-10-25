@@ -1460,7 +1460,8 @@ struct FmhaFwdPagedKVKernel
                     kargs.page_block_size,
                     kargs.stride_k,
                     num_pages_tdm,
-                    0);
+                    0,
+                    kv_l2p_offset);
                 auto v_page_tracker = TdmPageTracker<VDataType, FmhaPipeline::kN0>(
                     reinterpret_cast<const VDataType*>(kargs.v_ptr),
                     kargs.batch_stride_v,
@@ -1469,7 +1470,8 @@ struct FmhaFwdPagedKVKernel
                     kargs.page_block_size,
                     kargs.stride_v,
                     num_pages_tdm,
-                    0);
+                    0,
+                    kv_l2p_offset);
 
                 using Policy = typename FmhaPipeline::Policy;
                 static_assert(FmhaPipeline::GetSmemSize() == Policy::GetLdsArenaSize());

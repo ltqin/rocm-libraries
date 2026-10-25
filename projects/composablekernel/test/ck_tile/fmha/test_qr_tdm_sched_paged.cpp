@@ -835,6 +835,223 @@ FwdResult run_paged_tdm_sched_group(const std::vector<int>& seqlens_q,
     return LaunchGroup<true>(seqlens_q, seqlens_k, hdim, page_block_size, shuffle);
 }
 
+// Gappy group-mode paged launcher: the only path that drives kv_l2p_offset
+// nonzero (see the kv_l2p_offset computation in fmha_fwd_pagedkv_kernel.hpp,
+// gated on kargs.is_gappy). Under is_gappy, seqstart_k_ptr[b] is repurposed
+// (per the fmha_fwd_pagedkv_args contract in fmha_fwd.hpp) to hold each
+// batch's own physical start offset into ITS OWN page pool -- not a running
+// cross-batch prefix sum like the non-gappy convention -- and seqlen_k_ptr[b]
+// carries the real per-batch token count. Each batch's real K/V content is
+// placed starting at physical row l2p_offsets[b] within its own page set; the
+// rows before that (the "gap") are left zero and are provably never read,
+// because the TDM affine K/V view is sized to exactly kv_l2p_offset+seqlen_k
+// rows and the tracker's reverse offset folds l2p_offsets[b] back in so a
+// GLOBAL (gap-unaware) window origin in [0, seqlen_k) lands on physical rows
+// [l2p_offsets[b], l2p_offsets[b]+seqlen_k) -- see tdm_page_tracker.hpp.
+//
+// l2p_offsets[b] must be a multiple of kN0 (128, this file's fixed TileRows):
+// the tracker's tile-advance countdown assumes the first token inside a page
+// is tile aligned, same requirement as page_block_size being a TileRows
+// multiple.
+FwdResult run_paged_tdm_sched_group_gappy(const std::vector<int>& seqlens_q,
+                                          const std::vector<int>& seqlens_k,
+                                          const std::vector<int>& l2p_offsets,
+                                          int hdim,
+                                          int page_block_size,
+                                          bool shuffle)
+{
+    if(hdim != kHeadDim)
+        throw std::invalid_argument("harness only supports hdim=128 (fixed tile geometry)");
+    if(seqlens_q.size() != seqlens_k.size() || seqlens_q.size() != l2p_offsets.size())
+        throw std::invalid_argument("seqlens_q/seqlens_k/l2p_offsets size mismatch");
+
+    const int batch      = static_cast<int>(seqlens_q.size());
+    constexpr int nhead  = 1;
+    constexpr int hdim_v = kHeadDimV;
+    constexpr int kN0    = 128; // TileRows for the K/V page tracker, this file's fixed geometry
+
+    for(int b = 0; b < batch; ++b)
+    {
+        if(l2p_offsets[b] < 0 || l2p_offsets[b] % kN0 != 0)
+            throw std::invalid_argument("l2p_offsets[b] must be a non-negative multiple of kN0");
+    }
+
+    std::vector<int> seqstart_q(static_cast<std::size_t>(batch) + 1, 0);
+    for(int b = 0; b < batch; ++b)
+        seqstart_q[b + 1] = seqstart_q[b] + seqlens_q[b];
+    const int total_q      = seqstart_q[batch];
+    const int max_seqlen_q = *std::max_element(seqlens_q.begin(), seqlens_q.end());
+
+    // Q (and O) stay packed in the ordinary running-prefix-sum convention --
+    // gappy only changes how K/V address into the page pool.
+    std::vector<Data> q(static_cast<std::size_t>(total_q) * kHeadDim);
+    for(int b = 0; b < batch; ++b)
+    {
+        const auto q_local = make_input(1, 1, seqlens_q[b], kHeadDim, b * 3 + 0);
+        std::copy(q_local.begin(),
+                  q_local.end(),
+                  q.begin() + static_cast<std::size_t>(seqstart_q[b]) * kHeadDim);
+    }
+    std::vector<Data> o(static_cast<std::size_t>(total_q) * hdim_v,
+                        ck_tile::type_convert<Data>(0.0f));
+
+    const float scale_s = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+
+    Buffer<Data> qb(q.size()), ob(o.size());
+    qb.Upload(q);
+    ob.Upload(o);
+    std::vector<std::int32_t> seqstart_q32(seqstart_q.begin(), seqstart_q.end());
+    Buffer<std::int32_t> seqstart_q_buf(seqstart_q32.size());
+    seqstart_q_buf.Upload(seqstart_q32);
+
+    std::vector<std::int32_t> l2p_offset32(l2p_offsets.begin(), l2p_offsets.end());
+    std::vector<std::int32_t> seqlen_k32(seqlens_k.begin(), seqlens_k.end());
+    Buffer<std::int32_t> seqstart_k_buf(l2p_offset32.size()), seqlen_k_buf(seqlen_k32.size());
+    seqstart_k_buf.Upload(l2p_offset32);
+    seqlen_k_buf.Upload(seqlen_k32);
+
+    std::vector<int> pages_per_batch(static_cast<std::size_t>(batch));
+    for(int b = 0; b < batch; ++b)
+        pages_per_batch[b] =
+            (l2p_offsets[b] + seqlens_k[b] + page_block_size - 1) / page_block_size;
+    const int max_pages_per_batch =
+        *std::max_element(pages_per_batch.begin(), pages_per_batch.end());
+    std::vector<int> page_row_start(static_cast<std::size_t>(batch) + 1, 0);
+    for(int b = 0; b < batch; ++b)
+        page_row_start[b + 1] = page_row_start[b] + pages_per_batch[b];
+    const int total_pages = page_row_start[batch];
+
+    const std::vector<std::int32_t> flat_table = [&] {
+        if(shuffle)
+            return make_shuffled_block_table(total_pages);
+        std::vector<std::int32_t> identity(static_cast<std::size_t>(total_pages));
+        std::iota(identity.begin(), identity.end(), 0);
+        return identity;
+    }();
+
+    std::vector<std::int32_t> block_table(static_cast<std::size_t>(batch) * max_pages_per_batch, 0);
+    for(int b = 0; b < batch; ++b)
+        for(int lp = 0; lp < pages_per_batch[b]; ++lp)
+            block_table[static_cast<std::size_t>(b) * max_pages_per_batch + lp] =
+                flat_table[static_cast<std::size_t>(page_row_start[b]) + lp];
+
+    const std::size_t page_elems_k = static_cast<std::size_t>(page_block_size) * kHeadDim;
+    const std::size_t page_elems_v = static_cast<std::size_t>(page_block_size) * hdim_v;
+    std::vector<Data> k_phys(static_cast<std::size_t>(total_pages) * page_elems_k,
+                             ck_tile::type_convert<Data>(0.0f));
+    std::vector<Data> v_phys(static_cast<std::size_t>(total_pages) * page_elems_v,
+                             ck_tile::type_convert<Data>(0.0f));
+
+    for(int b = 0; b < batch; ++b)
+    {
+        // Same deterministic generator and phase indices as LaunchGroup/the
+        // dense reference, so logical K/V content is bit-identical -- only
+        // its placement in the (gappy) page pool differs.
+        const auto k_local = make_input(1, 1, seqlens_k[b], kHeadDim, b * 3 + 1);
+        const auto v_local = make_input(1, 1, seqlens_k[b], hdim_v, b * 3 + 2);
+        for(int lp = 0; lp < pages_per_batch[b]; ++lp)
+        {
+            const std::int32_t physical =
+                block_table[static_cast<std::size_t>(b) * max_pages_per_batch + lp];
+            for(int row = 0; row < page_block_size; ++row)
+            {
+                const int phys_row = lp * page_block_size + row;
+                if(phys_row < l2p_offsets[b] || phys_row >= l2p_offsets[b] + seqlens_k[b])
+                    continue; // gap row (or trailing pad): never read, left zero
+                const int s = phys_row - l2p_offsets[b];
+                std::copy(k_local.begin() + static_cast<std::size_t>(s) * kHeadDim,
+                          k_local.begin() + static_cast<std::size_t>(s + 1) * kHeadDim,
+                          k_phys.begin() + static_cast<std::size_t>(physical) * page_elems_k +
+                              static_cast<std::size_t>(row) * kHeadDim);
+                std::copy(v_local.begin() + static_cast<std::size_t>(s) * hdim_v,
+                          v_local.begin() + static_cast<std::size_t>(s + 1) * hdim_v,
+                          v_phys.begin() + static_cast<std::size_t>(physical) * page_elems_v +
+                              static_cast<std::size_t>(row) * hdim_v);
+            }
+        }
+    }
+
+    Buffer<Data> kb(k_phys.size()), vb(v_phys.size());
+    kb.Upload(k_phys);
+    vb.Upload(v_phys);
+    Buffer<std::int32_t> table_buf(block_table.size());
+    table_buf.Upload(block_table);
+
+    const ck_tile::index_t mask_type =
+        static_cast<ck_tile::index_t>(ck_tile::GenericAttentionMaskEnum::MASK_FROM_TOP_LEFT);
+    const ck_tile::stream_config stream{nullptr, false, 0, 0, 1};
+
+    fmha_fwd_pagedkv_args args{};
+    args.q_ptr    = qb.ptr;
+    args.k_ptr    = kb.ptr;
+    args.v_ptr    = vb.ptr;
+    args.bias_ptr = nullptr;
+    args.lse_ptr  = nullptr;
+    args.o_ptr    = ob.ptr;
+
+    args.block_table_ptr          = table_buf.ptr;
+    args.batch_stride_block_table = max_pages_per_batch;
+    args.page_block_size          = page_block_size;
+    args.is_gappy                 = true; // seqstart_k_ptr[b] is now a per-batch l2p_offset
+    args.cache_batch_idx          = nullptr;
+
+    args.seqstart_q_ptr = seqstart_q_buf.ptr;
+    args.seqstart_k_ptr = seqstart_k_buf.ptr; // per-batch l2p_offset, NOT a prefix sum
+    args.seqlen_k_ptr   = seqlen_k_buf.ptr;   // real per-batch key length
+    args.sink_ptr       = nullptr;
+
+    args.seqlen_q     = max_seqlen_q;
+    args.seqlen_k     = 0; // unused: is_gappy routes seqlen_k through seqlen_k_ptr
+    args.batch        = batch;
+    args.max_seqlen_q = max_seqlen_q;
+    args.hdim_q       = kHeadDim;
+    args.hdim_v       = hdim_v;
+    args.nhead_q      = nhead;
+    args.nhead_k      = nhead;
+
+    args.scale_s         = scale_s;
+    args.scale_p         = 1.0f;
+    args.scale_o         = 1.0f;
+    args.logits_soft_cap = 0.0f;
+
+    args.stride_q    = kHeadDim;
+    args.stride_k    = kHeadDim;
+    args.stride_v    = hdim_v;
+    args.stride_bias = 0;
+    args.stride_o    = hdim_v;
+
+    args.nhead_stride_q    = static_cast<ck_tile::index_t>(total_q) * kHeadDim;
+    args.nhead_stride_k    = static_cast<ck_tile::index_t>(page_block_size) * kHeadDim;
+    args.nhead_stride_v    = static_cast<ck_tile::index_t>(page_block_size) * hdim_v;
+    args.nhead_stride_bias = 0;
+    args.nhead_stride_lse  = 0;
+    args.nhead_stride_o    = static_cast<ck_tile::index_t>(total_q) * hdim_v;
+
+    args.batch_stride_q    = 0; // unused in group mode (addressed via seqstart_q_ptr)
+    args.batch_stride_k    = static_cast<ck_tile::index_t>(nhead) * args.nhead_stride_k;
+    args.batch_stride_v    = static_cast<ck_tile::index_t>(nhead) * args.nhead_stride_v;
+    args.batch_stride_bias = 0;
+    args.batch_stride_lse  = 0;
+    args.batch_stride_o    = 0;
+
+    args.window_size_left  = -1;
+    args.window_size_right = -1;
+    args.sink_size         = 0;
+    args.mask_type         = mask_type;
+    args.min_seqlen_q      = 0;
+
+    using Kernel        = PagedKernelFor<true, false, false>;
+    auto [kargs, grids] = fmha_fwd_pagedkv_create_kargs_and_grids<Kernel>(args);
+    LaunchDirect<Kernel>(kargs, stream, grids);
+
+    std::vector<Data> o_result(o.size());
+    ob.Download(o_result);
+
+    FwdResult result;
+    result.out = Decode(o_result);
+    return result;
+}
+
 FwdResult run_dense_tdm_sched_with_lse(int batch, int nhead, int seqlen_q, int seqlen_k, int hdim)
 {
     return LaunchBatch<false, false, true>(
@@ -908,6 +1125,72 @@ TEST(QrTdmSchedPaged, GroupModeMatchesDenseForIdenticalLogicalContent)
         ASSERT_EQ(dense.out.size(), paged.out.size());
         for(std::size_t i = 0; i < dense.out.size(); ++i)
             ASSERT_EQ(dense.out[i], paged.out[i]) << "mismatch at element " << i;
+    }
+}
+
+// Group mode: variable seqlen per batch via seqstart_k_ptr. This mirrors the
+// task brief's Step 1 test, with one deviation: the brief's seqlens_k =
+// {128, 1024, 256, 768} includes 128, which is not divisible by
+// page_block_size=256, and this harness (deliberately, see LaunchGroup)
+// throws on that precondition rather than silently mis-sizing pages. Bumped
+// the first entry to 256 so every length is divisible by both page sizes
+// exercised below; the rest is unchanged from the brief.
+TEST(QrTdmSchedPaged, GroupModeMatchesDense)
+{
+    const std::vector<int> seqlens_q = {64, 300, 128, 512};
+    const std::vector<int> seqlens_k = {256, 1024, 256, 768};
+
+    for(int page_block_size : {128, 256})
+    {
+        SCOPED_TRACE(page_block_size);
+        auto dense = run_dense_tdm_sched_group(seqlens_q, seqlens_k, /*hdim=*/128);
+        auto paged = run_paged_tdm_sched_group(
+            seqlens_q, seqlens_k, /*hdim=*/128, page_block_size, /*shuffle=*/true);
+
+        AssertNotAllZero(dense.out, "dense.out");
+        ASSERT_EQ(dense.out.size(), paged.out.size());
+        for(size_t i = 0; i < dense.out.size(); ++i)
+            ASSERT_EQ(dense.out[i], paged.out[i])
+                << "page_block_size=" << page_block_size << " elem=" << i;
+    }
+}
+
+// Group mode, gappy variant: this is the only path in the whole suite that
+// drives kv_l2p_offset to a nonzero value (GroupModeMatchesDense above and
+// GroupModeMatchesDenseForIdenticalLogicalContent both hard-code
+// is_gappy=false, so kv_l2p_offset stays 0 for them and Task 5's new
+// seek()/refresh() shift is never actually exercised by either). Here
+// seqstart_k_ptr carries a nonzero per-batch l2p_offset -- the sequence
+// starts partway (0, 128, or 384 tokens) into its own page pool -- and
+// seqlen_k_ptr carries the real per-batch length. See
+// run_paged_tdm_sched_group_gappy for how the physical layout is built and
+// why the "gap" rows before the offset are provably never read.
+//
+// If kv_l2p_offset were silently dropped back to 0 (the pre-Task-5 bug this
+// test exists to catch), the tracker would read starting at physical row 0
+// of each batch's page pool instead of l2p_offsets[b], landing on the
+// zero-filled gap rows for the batches with a nonzero offset and producing
+// output that does not match dense -- so this test fails loudly rather than
+// vacuously passing on an untested zero offset.
+TEST(QrTdmSchedPaged, GroupModeGappyMatchesDenseWithNonzeroL2pOffset)
+{
+    const std::vector<int> seqlens_q   = {64, 128, 96};
+    const std::vector<int> seqlens_k   = {200, 384, 150};
+    const std::vector<int> l2p_offsets = {0, 128, 384}; // multiples of kN0=128; not all zero
+    constexpr int hdim                 = 128;
+
+    for(int page_block_size : {128, 256})
+    {
+        SCOPED_TRACE(page_block_size);
+        auto dense = run_dense_tdm_sched_group(seqlens_q, seqlens_k, hdim);
+        auto paged = run_paged_tdm_sched_group_gappy(
+            seqlens_q, seqlens_k, l2p_offsets, hdim, page_block_size, /*shuffle=*/true);
+
+        AssertNotAllZero(dense.out, "dense.out");
+        ASSERT_EQ(dense.out.size(), paged.out.size());
+        for(size_t i = 0; i < dense.out.size(); ++i)
+            ASSERT_EQ(dense.out[i], paged.out[i])
+                << "page_block_size=" << page_block_size << " elem=" << i;
     }
 }
 

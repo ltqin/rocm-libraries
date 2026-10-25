@@ -22,6 +22,14 @@ namespace ck_tile {
 // valid when a tile never straddles two pages, i.e. page_block_size is a
 // multiple of TileRows; the host dispatch enforces that.
 //
+// Group mode (gappy KV cache) can start a sequence partway into its own page
+// pool: l2p_offset shifts the logical-to-physical mapping so the page index
+// and the reverse offset are both taken on (l2p_offset + global_seq) instead
+// of on global_seq alone. Batch mode passes l2p_offset = 0, which reduces the
+// formula above back to exactly the previous behavior. l2p_offset must be a
+// multiple of TileRows so the first token position inside a page stays tile
+// aligned (the tile-advance countdown below assumes that).
+//
 // Page advance is a countdown, so the steady-state cost is one decrement plus a
 // predicted-not-taken branch. The division only happens in seek(), which the
 // sink path uses at most once per kernel.
@@ -38,7 +46,8 @@ struct TdmPageTracker
                                                  index_t page_block_size,
                                                  index_t stride_kv,
                                                  index_t num_pages,
-                                                 index_t global_seq_start)
+                                                 index_t global_seq_start,
+                                                 index_t l2p_offset)
         : physical_blocks_{physical_blocks},
           block_stride_{block_stride},
           fixed_offset_{fixed_offset},
@@ -46,6 +55,7 @@ struct TdmPageTracker
           page_block_size_{page_block_size},
           stride_kv_{stride_kv},
           num_pages_{num_pages},
+          l2p_offset_{l2p_offset},
           tiles_per_page_{page_block_size / TileRows},
           cur_page_{0},
           tiles_left_{0},
@@ -85,7 +95,11 @@ struct TdmPageTracker
         if(global_seq < 0)
             global_seq = 0;
 
-        index_t page = global_seq / page_block_size_;
+        // Logical-to-physical: in group mode the sequence starts partway into
+        // the page pool, so the page index is taken on the shifted coordinate.
+        const index_t phys_seq = l2p_offset_ + global_seq;
+
+        index_t page = phys_seq / page_block_size_;
         if(page >= num_pages_)
             page = num_pages_ - 1;
         if(page < 0)
@@ -94,7 +108,7 @@ struct TdmPageTracker
         cur_page_ = page;
         refresh();
 
-        const index_t tok_in_page = global_seq - page * page_block_size_;
+        const index_t tok_in_page = phys_seq - page * page_block_size_;
         tiles_left_               = tiles_per_page_ - tok_in_page / TileRows;
         if(tiles_left_ <= 0)
             tiles_left_ = tiles_per_page_;
@@ -106,10 +120,14 @@ struct TdmPageTracker
         const long_index_t phys = static_cast<long_index_t>(block_indices_[cur_page_]);
         // All of this is 64-bit: the reverse term can push the result far below
         // physical_blocks_, and only adding the global offset brings it back.
-        cached_base_ = physical_blocks_ + phys * block_stride_ + fixed_offset_ -
-                       static_cast<long_index_t>(cur_page_) *
-                           static_cast<long_index_t>(page_block_size_) *
-                           static_cast<long_index_t>(stride_kv_);
+        // The l2p_offset_ shift is folded back in here so that indexing this
+        // base pointer with a GLOBAL (l2p-unaware) window origin still lands on
+        // the correct physical token.
+        cached_base_ =
+            physical_blocks_ + phys * block_stride_ + fixed_offset_ -
+            (static_cast<long_index_t>(cur_page_) * static_cast<long_index_t>(page_block_size_) -
+             static_cast<long_index_t>(l2p_offset_)) *
+                static_cast<long_index_t>(stride_kv_);
     }
 
     const DataType* physical_blocks_;
@@ -119,6 +137,7 @@ struct TdmPageTracker
     index_t page_block_size_;
     index_t stride_kv_;
     index_t num_pages_;
+    index_t l2p_offset_;
     index_t tiles_per_page_;
     index_t cur_page_;
     index_t tiles_left_;
