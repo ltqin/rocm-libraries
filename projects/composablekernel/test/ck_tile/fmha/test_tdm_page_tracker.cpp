@@ -27,14 +27,19 @@ constexpr long_index_t kBlockStride = static_cast<long_index_t>(kPageBlockSize) 
 using Tracker = ck_tile::TdmPageTracker<Elem, kTileRows>;
 
 // Reference: where should a global token index land?
+// block_stride defaults to kBlockStride (the single-kv-head packing every
+// other test in this file uses); pass a distinct value to exercise layouts
+// where block_stride is not page_block_size * stride_kv (see
+// BlockStrideDiffersFromPageBlockSizeTimesStrideKv below).
 const Elem* expected_addr(const Elem* pool,
                           const std::vector<std::int32_t>& table,
                           index_t global_seq,
-                          long_index_t fixed_offset)
+                          long_index_t fixed_offset,
+                          long_index_t block_stride = kBlockStride)
 {
     const index_t page = global_seq / kPageBlockSize;
     const index_t tok  = global_seq % kPageBlockSize;
-    return pool + static_cast<long_index_t>(table[page]) * kBlockStride + fixed_offset +
+    return pool + static_cast<long_index_t>(table[page]) * block_stride + fixed_offset +
            static_cast<long_index_t>(tok) * kStrideKv;
 }
 
@@ -214,7 +219,54 @@ TEST(TdmPageTracker, SeekPastLastPageSaturates)
 
     auto tracker = make_tracker(pool, table, 0, 0);
     tracker.seek(kNumPages * kPageBlockSize + 999);
-    EXPECT_LE(tracker.current_page(), kNumPages - 1);
+    // EXPECT_LE also passes if current_page() clamped to 0 (or anything below
+    // the last page) instead of saturating at kNumPages - 1; that would still
+    // be a clamp-to-zero-style bug, just one this assertion could not catch.
+    EXPECT_EQ(tracker.current_page(), kNumPages - 1);
+}
+
+// nhead > 1 shape: block_stride is NOT page_block_size * stride_kv -- for a
+// [page, kv_head, token, dim] physical layout, advancing one page also has to
+// skip over the other kv heads' slices of that page, so
+// block_stride == num_kv_heads * page_block_size * stride_kv. Every other
+// test in this file uses make_tracker(), which hardcodes
+// kBlockStride == kPageBlockSize * kStrideKv (see the constant above); none
+// of them would catch a refresh() regression that recomputed the reverse
+// offset from page_block_size and stride_kv instead of using the
+// caller-supplied block_stride, since for them the two expressions are
+// numerically identical. This test is the one that distinguishes them.
+TEST(TdmPageTracker, BlockStrideDiffersFromPageBlockSizeTimesStrideKv)
+{
+    const Elem* pool              = reinterpret_cast<const Elem*>(0x100000000ULL);
+    constexpr index_t kNumKvHeads = 3;
+    constexpr long_index_t kDistinctBlockStride =
+        static_cast<long_index_t>(kNumKvHeads) * kPageBlockSize * kStrideKv;
+    static_assert(kDistinctBlockStride != kBlockStride,
+                  "this test requires a block_stride distinct from page_block_size * stride_kv");
+
+    std::vector<std::int32_t> table(kNumPages);
+    for(index_t p = 0; p < kNumPages; ++p)
+        table[p] = kNumPages - 1 - p;
+
+    Tracker tracker{pool,
+                    kDistinctBlockStride,
+                    0,
+                    table.data(),
+                    kPageBlockSize,
+                    kStrideKv,
+                    kNumPages,
+                    /*global_seq_start=*/0,
+                    /*l2p_offset=*/0};
+
+    const index_t num_tiles = kNumPages * (kPageBlockSize / kTileRows);
+    for(index_t i = 0; i < num_tiles; ++i)
+    {
+        const index_t global_seq = i * kTileRows;
+        const Elem* got = tracker.base_ptr() + static_cast<long_index_t>(global_seq) * kStrideKv;
+        EXPECT_EQ(got, expected_addr(pool, table, global_seq, 0, kDistinctBlockStride))
+            << "tile " << i;
+        tracker.advance();
+    }
 }
 
 } // namespace
