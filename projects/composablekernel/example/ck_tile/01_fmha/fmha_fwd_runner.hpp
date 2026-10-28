@@ -304,7 +304,12 @@ fwd_result fmha_fwd_run(mode_enum mode,
                         int pack_gqa,
                         const ck_tile::stream_config& stream_config,
                         std::optional<std::string> json   = std::nullopt,
-                        std::string* selected_kernel_name = nullptr)
+                        std::string* selected_kernel_name = nullptr,
+                        // Rows of gap before each batch's keys inside its paged
+                        // region. Non-zero turns on is_gappy, which makes
+                        // seqstart_k_ptr mean "local offset" and seqlen_k come
+                        // from seqlen_k_ptr. Paged + group mode only.
+                        ck_tile::index_t gappy_offset = 0)
 {
     using TypeConfig = FmhaFwdTypeConfig<DataTypeConfig>;
 
@@ -503,6 +508,12 @@ fwd_result fmha_fwd_run(mode_enum mode,
     const bool using_appendkv      = (0 < seqlen_knew || 0 < rotary_dim);
     const bool using_pagedkv       = (0 < page_block_size);
     const bool using_splitkv       = (num_splits > 1) || use_cache_batch_idx;
+    const bool using_gappy         = (0 < gappy_offset);
+    if(using_gappy && (!using_pagedkv || mode != mode_enum::group))
+    {
+        std::cerr << "gappy needs paged-kvcache and group mode" << std::endl;
+        return fwd_result::invalid_args;
+    }
     if((using_appendkv || using_pagedkv || using_splitkv) &&
        (has_group_padding || has_batch_padding))
     {
@@ -710,9 +721,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
     }
 
     const ck_tile::index_t max_num_page_blocks =
-        (0 < page_block_size
-             ? batch * std::max(1, ck_tile::integer_divide_ceil(max_seqlen_k, page_block_size))
-             : 0);
+        (0 < page_block_size ? batch * std::max(1,
+                                                 ck_tile::integer_divide_ceil(
+                                                     max_seqlen_k + gappy_offset, page_block_size))
+                             : 0);
 
     // legalize num_splits according to other options
     if(num_splits < 1)
@@ -1150,9 +1162,12 @@ fwd_result fmha_fwd_run(mode_enum mode,
     // Buffers for key/value per-sequence logical (unpadded) lengths (used in batch mode with
     // kvcache or group mode with padding enabled)
     // batch_prefill (group+kvcache) also needs per-batch seqlen_k for VLLM_BLOCK_TABLE_2D
-    const bool need_seqlen_k_buf = (mode == mode_enum::batch && use_kvcache) ||
+    const bool need_seqlen_k_buf = using_gappy || (mode == mode_enum::batch && use_kvcache) ||
                                    has_group_k_padding || (mode == mode_enum::group && use_kvcache);
     ck_tile::DeviceMem seqlen_k_buf(need_seqlen_k_buf ? seqlen_ks.size() * sizeof(int32_t) : 0);
+    // seqstart_k_ptr under is_gappy: one local offset per batch, not a prefix sum
+    const std::vector<int32_t> gappy_offsets_host(batch, static_cast<int32_t>(gappy_offset));
+    ck_tile::DeviceMem gappy_offsets_buf(using_gappy ? batch * sizeof(int32_t) : 0);
     ck_tile::DeviceMem cu_seqlen_q_buf(cuq_cum.empty() ? 0
                                                        : cuq_cum.size() * sizeof(ck_tile::index_t));
     ck_tile::DeviceMem cu_seqlen_kv_buf(
@@ -1192,6 +1207,8 @@ fwd_result fmha_fwd_run(mode_enum mode,
     cu_seqlen_kv_buf.ToDevice(cukv_cum.empty() ? nullptr : cukv_cum.data());
     seqlen_q_buf.ToDevice(has_group_q_padding ? seqlen_qs.data() : nullptr);
     seqlen_k_buf.ToDevice(need_seqlen_k_buf ? seqlen_ks.data() : nullptr);
+    if(using_gappy)
+        gappy_offsets_buf.ToDevice(gappy_offsets_host.data());
     cache_seqlen_k_buf.ToDevice(need_append_kvcache ? cache_seqlen_ks.data() : nullptr);
     rotary_cos_buf.ToDevice(rotary_cos_host.data());
     rotary_sin_buf.ToDevice(rotary_sin_host.data());
@@ -1674,7 +1691,7 @@ fwd_result fmha_fwd_run(mode_enum mode,
                     (0 < page_block_size ? block_table_buf.GetDeviceBuffer() : nullptr);
                 args.batch_stride_block_table = batch_stride_block_table;
                 args.page_block_size          = page_block_size;
-                args.is_gappy = false; // use 'false' for flash-attention integration
+                args.is_gappy = using_gappy;
 
                 args.cache_batch_idx =
                     (use_cache_batch_idx ? cache_batch_idx_buf.GetDeviceBuffer() : nullptr);
@@ -1692,11 +1709,13 @@ fwd_result fmha_fwd_run(mode_enum mode,
                 args.seqstart_q_ptr =
                     (mode == mode_enum::group ? seqstart_q_buf.GetDeviceBuffer() : nullptr);
                 args.seqstart_k_ptr =
-                    (mode == mode_enum::group ? seqstart_k_buf.GetDeviceBuffer() : nullptr);
-                args.seqlen_k_ptr =
-                    ((mode == mode_enum::batch && use_kvcache) || 0 <= k_paddings_[0]
-                         ? seqlen_k_buf.GetDeviceBuffer()
-                         : nullptr);
+                    (using_gappy ? gappy_offsets_buf.GetDeviceBuffer()
+                                 : (mode == mode_enum::group ? seqstart_k_buf.GetDeviceBuffer()
+                                                             : nullptr));
+                args.seqlen_k_ptr = (using_gappy || (mode == mode_enum::batch && use_kvcache) ||
+                                             0 <= k_paddings_[0]
+                                         ? seqlen_k_buf.GetDeviceBuffer()
+                                         : nullptr);
             }
             else if constexpr(std::is_same_v<fmha_fwd_pagedkv_args, std::decay_t<decltype(args)>>)
             {
@@ -2142,8 +2161,8 @@ fwd_result fmha_fwd_run(mode_enum mode,
             if(0 < page_block_size)
             {
                 // clang-format off
-                if(i_perm) k_host_ref.ForEach([&](auto& self, auto i) { self(i) = k_host(block_table_host(wb, i[1] / page_block_size), i[0] / nr, i[1] % page_block_size, i[2]); });
-                else       k_host_ref.ForEach([&](auto& self, auto i) { self(i) = k_host(block_table_host(wb, i[1] / page_block_size), i[1] % page_block_size, i[0] / nr, i[2]); });
+                if(i_perm) k_host_ref.ForEach([&](auto& self, auto i) { const auto kr = i[1] + gappy_offset; self(i) = k_host(block_table_host(wb, kr / page_block_size), i[0] / nr, kr % page_block_size, i[2]); });
+                else       k_host_ref.ForEach([&](auto& self, auto i) { const auto kr = i[1] + gappy_offset; self(i) = k_host(block_table_host(wb, kr / page_block_size), kr % page_block_size, i[0] / nr, i[2]); });
                 // clang-format on
             }
             else
@@ -2196,15 +2215,15 @@ fwd_result fmha_fwd_run(mode_enum mode,
                 if(is_v_rowmajor)
                 {
                     // clang-format off
-                    if(i_perm) v_host_ref.ForEach([&](auto& self, auto i) { self(i) = v_host(block_table_host(wb, i[2] / page_block_size), i[0] / nr, i[2] % page_block_size, i[1]); });
-                    else       v_host_ref.ForEach([&](auto& self, auto i) { self(i) = v_host(block_table_host(wb, i[2] / page_block_size), i[2] % page_block_size, i[0] / nr, i[1]); });
+                    if(i_perm) v_host_ref.ForEach([&](auto& self, auto i) { const auto vr = i[2] + gappy_offset; self(i) = v_host(block_table_host(wb, vr / page_block_size), i[0] / nr, vr % page_block_size, i[1]); });
+                    else       v_host_ref.ForEach([&](auto& self, auto i) { const auto vr = i[2] + gappy_offset; self(i) = v_host(block_table_host(wb, vr / page_block_size), vr % page_block_size, i[0] / nr, i[1]); });
                     // clang-format on
                 }
                 else
                 {
                     // clang-format off
-                    if(i_perm) v_host_ref.ForEach([&](auto& self, auto i) { self(i) = v_host(block_table_host(wb, i[2] / page_block_size), i[0] / nr, i[1], i[2] % page_block_size); });
-                    else       v_host_ref.ForEach([&](auto& self, auto i) { self(i) = v_host(block_table_host(wb, i[2] / page_block_size), i[1], i[0] / nr, i[2] % page_block_size); });
+                    if(i_perm) v_host_ref.ForEach([&](auto& self, auto i) { const auto vr = i[2] + gappy_offset; self(i) = v_host(block_table_host(wb, vr / page_block_size), i[0] / nr, i[1], vr % page_block_size); });
+                    else       v_host_ref.ForEach([&](auto& self, auto i) { const auto vr = i[2] + gappy_offset; self(i) = v_host(block_table_host(wb, vr / page_block_size), i[1], i[0] / nr, vr % page_block_size); });
                     // clang-format on
                 }
             }

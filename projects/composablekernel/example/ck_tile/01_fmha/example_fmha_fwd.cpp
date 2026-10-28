@@ -107,6 +107,8 @@ auto create_args(int argc, char* argv[])
                 "1",
                 "# of splits for key/value. 0 to determine actual number by heuristic")
         .insert("page_block_size", "0", "paged-kvcache block size. 0 means not use paged-kvcahe")
+        .insert("gappy", "0", "rows of gap before each batch's keys inside its paged region. "
+                              "non-zero turns on is_gappy. paged + group mode only")
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
         .insert("warmup", "5", "number of iterations before benchmark the kernel")
         .insert("repeat", "20", "number of iterations to benchmark the kernel")
@@ -153,6 +155,7 @@ auto run(const ck_tile::ArgParser& arg_parser)
     bool is_v_rowmajor               = arg_parser.get_str("vlayout") == "r";
     bool lse                         = arg_parser.get_bool("lse");
     ck_tile::index_t page_block_size = arg_parser.get_int("page_block_size");
+    ck_tile::index_t gappy_offset    = arg_parser.get_int("gappy");
     bool use_cache_batch_idx         = arg_parser.get_bool("cache_batch_idx");
     std::string bias_str             = arg_parser.get_str("bias");
     std::string qscale_str           = arg_parser.get_str("qscale");
@@ -216,7 +219,9 @@ auto run(const ck_tile::ArgParser& arg_parser)
                                         init_sink_value,
                                         pack_gqa,
                                         stream_config,
-                                        json);
+                                        json,
+                                        nullptr,
+                                        gappy_offset);
 }
 
 int main(int argc, char* argv[])
