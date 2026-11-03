@@ -169,6 +169,19 @@ CK_TILE_HOST_DEVICE constexpr auto make_qr_tdm_row_major_lds_descriptor()
         constexpr index_t PadElements         = PadBytes / ElementBytes;
         constexpr index_t NumIntervals        = LogicalBytes / IntervalBytes;
 
+        // An interval of exactly one row makes the merge/unmerge pair below an
+        // identity the compiler cannot see through: it emits the div/mod
+        // address chain regardless. Naming the layout directly keeps it affine.
+        if constexpr(ElementsPerInterval == Cols && NumIntervals == Rows)
+        {
+            return make_naive_tensor_descriptor(
+                make_tuple(number<Rows>{}, number<Cols>{}),
+                make_tuple(number<Cols + PadElements>{}, number<1>{}),
+                number<AccessElements>{},
+                number<1>{});
+        }
+        else
+        {
         constexpr auto interval_desc = make_naive_tensor_descriptor(
             make_tuple(number<NumIntervals>{}, number<ElementsPerInterval>{}),
             make_tuple(number<ElementsPerInterval + PadElements>{}, number<1>{}),
@@ -187,6 +200,7 @@ CK_TILE_HOST_DEVICE constexpr auto make_qr_tdm_row_major_lds_descriptor()
             make_tuple(make_unmerge_transform(make_tuple(number<Rows>{}, number<Cols>{}))),
             make_tuple(sequence<0>{}),
             make_tuple(sequence<0, 1>{}));
+        }
     }
 }
 
