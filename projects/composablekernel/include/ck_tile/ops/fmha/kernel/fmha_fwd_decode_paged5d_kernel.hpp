@@ -7,10 +7,13 @@
 #include "ck_tile/core/arch/amd_cluster_load.hpp"
 #include "ck_tile/core/arch/amd_tdm_descriptor.hpp"
 
-// gfx125 fp8 decode attention over the SHUFFLE 5D paged KV cache (sglang layout), cache pages of
-// page_size = 16, 64 or 128 tokens:
-//   K [num_blocks][nhead_k][hdim / 16][page_size tokens][16 B]
-//   V [num_blocks][nhead_k][page_size / 16][hdim][16 tokens]
+// gfx125 fp8 decode attention over a paged KV cache, cache pages of page_size = 16, 64 or 128
+// tokens, in one of three layouts (FmhaDecodePagedLayout):
+//   shuffle_5d (sglang / aiter vectorized_5d):
+//     K [num_blocks][nhead_k][hdim / 16][page_size tokens][16 B]
+//     V [num_blocks][nhead_k][page_size / 16][hdim][16 tokens]
+//   hnd: K and V [num_blocks][nhead_k][page_size tokens][hdim]
+//   nhd: K and V [num_blocks][page_size tokens][nhead_k][hdim]
 // One query token per sequence, hdim 128, fp8 e4m3 K/V with per-tensor descales, bf16 or fp16 Q
 // (quantized per row in the kernel) and output of the same type. The q heads of one kv head (at
 // most 16) are the 16 columns of S^T = K Q^T. Below, a page is 16 tokens; a cache page holds
@@ -22,17 +25,24 @@
 // max_seqlen_k; each (batch, kv head) spreads its own key range over it, and clusters left
 // without pages exit at once.
 //
-// K and V pages are copied to LDS with TDM gathers (rows of 16-byte vectors of one kv head): in
-// this layout the LDS bytes are WMMA operands as they are (S^T = K Q^T and O^T += V^T P^T, no
-// transposed reads).
+// K and V pages are copied to LDS by the TDM. In shuffle_5d the LDS bytes are WMMA operands as
+// they are (S^T = K Q^T and O^T += V^T P^T); in hnd / nhd a page is kept as token rows (padded
+// against bank conflicts), K rows are read as they are and V^T with transposing LDS loads.
 
 namespace ck_tile {
+
+enum class FmhaDecodePagedLayout : index_t
+{
+    shuffle_5d = 0,
+    hnd        = 1,
+    nhd        = 2,
+};
 
 struct FmhaDecodePaged5dHostArgs
 {
     const void* q_ptr;           // [batch][nhead_q][hdim] bf16, or fp16 with qo_fp16
-    const void* k_ptr;           // 5D fp8
-    const void* v_ptr;           // 5D fp8
+    const void* k_ptr;           // fp8, in layout
+    const void* v_ptr;           // fp8, in layout
     const int32_t* block_table;  // [batch][max_blocks_per_seq]
     const int32_t* seqlen_k_ptr; // [batch]
     const float* k_descale_ptr;  // one float
@@ -51,7 +61,8 @@ struct FmhaDecodePaged5dHostArgs
     index_t pages_per_split; // lengthened in the kernel if the grid would not cover a range
     index_t num_groups;      // clusters per (batch, kv head)
     float scale_s;
-    bool qo_fp16 = false; // Q and O are fp16 instead of bf16
+    bool qo_fp16                 = false; // Q and O are fp16 instead of bf16
+    FmhaDecodePagedLayout layout = FmhaDecodePagedLayout::shuffle_5d;
 };
 
 // num_splits workgroups per cluster, num_groups clusters per (batch, kv head)
@@ -131,11 +142,15 @@ CK_TILE_HOST size_t fmha_decode_paged5d_num_counters(index_t batch, index_t nhea
 
 template <bool kWaveSplit_,
           index_t kNumSplits_,
-          bool kGroups_      = false,
-          index_t kPageSize_ = 16,
-          bool kQoFp16_      = false>
+          bool kGroups_                  = false,
+          index_t kPageSize_             = 16,
+          bool kQoFp16_                  = false,
+          FmhaDecodePagedLayout kLayout_ = FmhaDecodePagedLayout::shuffle_5d>
 struct FmhaDecodePaged5dKernel
 {
+    static constexpr FmhaDecodePagedLayout kLayout = kLayout_;
+    // hnd / nhd: pages as token rows in LDS
+    static constexpr bool kRowMajor     = kLayout != FmhaDecodePagedLayout::shuffle_5d;
     static constexpr bool kQoFp16       = kQoFp16_; // Q and O are fp16 instead of bf16
     static constexpr bool kWaveSplit    = kWaveSplit_;
     static constexpr index_t kNumSplits = kNumSplits_;
@@ -155,10 +170,21 @@ struct FmhaDecodePaged5dKernel
     static constexpr index_t kSubPages = kPageSize / kPage;
     static_assert(1 <= kNumSplits && kNumSplits <= 15);
     static_assert(kPageSize == 16 || kPageSize == 64 || kPageSize == 128);
-    // LDS K of a wave-split step: four page-16 images, or with larger cache pages the 64 tokens as
-    // they lie in the cache ([hdim / 16][64 tokens][16 B]); offsets of a page and a 16-byte chunk
-    static constexpr index_t kKPageStride  = kWaveSplit && kSubPages > 1 ? 256 : kPageBytes;
-    static constexpr index_t kKChunkStride = kWaveSplit && kSubPages > 1 ? 1024 : 256;
+    // LDS bytes of a token row (hnd / nhd): hdim plus 16 bytes of padding against bank conflicts
+    static constexpr index_t kRowPitch = kHdim + 16;
+    // LDS bytes of one page
+    static constexpr index_t kPageBuf = kRowMajor ? kPage * kRowPitch : kPageBytes;
+    // shuffle_5d LDS K of a wave-split step: four page-16 images, or with larger cache pages the
+    // 64 tokens as they lie in the cache ([hdim / 16][64 tokens][16 B]). Offsets of a page, a
+    // token and a 16-byte head-dim chunk.
+    static constexpr index_t kKPageStride =
+        kRowMajor ? kPageBuf : (kWaveSplit && kSubPages > 1 ? 256 : kPageBytes);
+    static constexpr index_t kKTokStride = kRowMajor ? kRowPitch : 16;
+    static constexpr index_t kKChunkStride =
+        kRowMajor ? 16 : (kWaveSplit && kSubPages > 1 ? 1024 : 256);
+    // TDM instructions per step and wave (the waits count them): hnd / nhd copy each page of a
+    // page-16 wave-split step separately
+    static constexpr index_t kTdmPerStep = kRowMajor && kWaveSplit && kSubPages == 1 ? 8 : 2;
 
     struct Kargs
     {
@@ -236,8 +262,8 @@ struct FmhaDecodePaged5dKernel
 
     struct alignas(16) SmemCoop
     {
-        alignas(16) uint8_t k[kStages][kNumWaves][kPageBytes];
-        alignas(16) uint8_t v[kStages][kNumWaves][kPageBytes];
+        alignas(16) uint8_t k[kStages][kNumWaves][kPageBuf];
+        alignas(16) uint8_t v[kStages][kNumWaves][kPageBuf];
         alignas(16) uint8_t p[kRows][kNumWaves * kPage];
         alignas(16) float red[2][kNumWaves][kRows]; // per-wave row max / row sum
     };
@@ -248,8 +274,8 @@ struct FmhaDecodePaged5dKernel
         {
             struct
             {
-                alignas(16) uint8_t k[kStages][kNumWaves][kWavePages][kPageBytes];
-                alignas(16) uint8_t v[kStages][kNumWaves][kWavePages][kPageBytes];
+                alignas(16) uint8_t k[kStages][kNumWaves][kWavePages][kPageBuf];
+                alignas(16) uint8_t v[kStages][kNumWaves][kWavePages][kPageBuf];
             } kv;
             // the waves' O for the intra-workgroup merge; padded rows keep the column-wise
             // stores of 16 rows off one bank
@@ -324,6 +350,53 @@ struct FmhaDecodePaged5dKernel
             amd_wave_read_first_lane(g3.bitfield),
             int32x8_t{},
             0);
+    }
+    // TDM copy of kRows rows of kHdim bytes, pitch bytes apart in memory, to LDS rows of kRowPitch
+    template <index_t kTileRows>
+    CK_TILE_DEVICE static void tdm_tile(const uint8_t* base, uint8_t* lds, long_index_t pitch)
+    {
+        static_assert(kRowPitch == kHdim + 16 && kHdim == 128);
+        TDM_GROUP0 g0{static_cast<uint32_t>(reinterpret_cast<uintptr_t>(to_lds(lds))),
+                      reinterpret_cast<uintptr_t>(base),
+                      0,
+                      0};
+        TDM_GROUP1 g1;
+        g1.data_size = 3; // 8-byte units
+        g1.tensorDim0(kHdim / 8);
+        g1.tensorDim1(kTileRows);
+        g1.tensorDim0Stride(static_cast<uint64_t>(pitch) / 8);
+        g1.tile_dim0    = kHdim / 8;
+        g1.tile_dim1    = kTileRows;
+        g1.pad_enable   = 1;
+        g1.pad_interval = 4; // every 2^(4+1) dwords = 128 bytes
+        g1.pad_amount   = 3; // 4 dwords = 16 bytes
+        __builtin_amdgcn_tensor_load_to_lds(
+            bit_cast<uint32x4_t>(amd_wave_read_first_lane(g0.bitfield)),
+            amd_wave_read_first_lane(g1.bitfield),
+            int32x4_t{},
+            int32x4_t{},
+            int32x8_t{},
+            0);
+    }
+    // V^T operand of head-dim rows d0 + (lane % 16) from token rows in LDS: load q gives the
+    // 8 tokens row(q, j), j = 0..7, of this lane's row. ds_load_tr8_b64 transposes, per half
+    // wave, the 8-byte loads of its 16 lanes: output lane i < 8 gets byte i of the loads of
+    // lanes {0-3, 8-11}, lane i >= 8 byte i - 8 of lanes {4-7, 12-15}.
+    template <typename RowAddr>
+    CK_TILE_DEVICE static v8i v_tr8(index_t lane16, RowAddr row_addr)
+    {
+        using v2i          = int32_t __attribute__((ext_vector_type(2)));
+        const index_t j    = (lane16 & 3) + ((lane16 >> 3) << 2); // token of this lane's load
+        const index_t dcol = ((lane16 >> 2) & 1) * 8;
+        v8i r{};
+        for(index_t q = 0; q < 4; ++q)
+        {
+            const v2i x =
+                __builtin_amdgcn_ds_load_tr8_b64_v2i32(to_lds(ptr_as<v2i>(row_addr(q, j) + dcol)));
+            r[2 * q]     = x.x;
+            r[2 * q + 1] = x.y;
+        }
+        return r;
     }
     // pairwise: shorter dependency chains than a running max or sum
     template <index_t N>
@@ -456,7 +529,36 @@ struct FmhaDecodePaged5dKernel
         // is zeroed once it lands)
         const auto issue = [&](index_t t) {
             const index_t last = pend - 1 - pg0;
-            if constexpr(kSubPages == 1)
+            if constexpr(kRowMajor)
+            {
+                // a 16-token page (or, wave split with larger cache pages, the wave's four pages of
+                // one cache page) as token rows: global offset of its first row and the row pitch
+                const long_index_t pitch =
+                    kLayout == FmhaDecodePagedLayout::hnd ? kHdim : a.nhead_k * long_index_t{kHdim};
+                const auto first_row = [&](index_t idx) {
+                    const long_index_t blk = block_of(idx);
+                    const index_t tok      = (pg0 + idx) % kSubPages * kPage;
+                    return kLayout == FmhaDecodePagedLayout::hnd
+                               ? ((blk * a.nhead_k + g) * kPageSize + tok) * kHdim
+                               : ((blk * kPageSize + tok) * a.nhead_k + g) * kHdim;
+                };
+                if constexpr(kWaveSplit && kSubPages > 1)
+                {
+                    const long_index_t off = first_row(min(page_idx(t, 0), last / 4 * 4));
+                    tdm_tile<4 * kPage>(a.k + off, kbuf(t % kStages, 0), pitch);
+                    tdm_tile<4 * kPage>(a.v + off, vbuf(t % kStages, 0), pitch);
+                }
+                else
+                {
+                    for(index_t q = 0; q < kWavePages; ++q)
+                    {
+                        const long_index_t off = first_row(min(page_idx(t, q), last));
+                        tdm_tile<kPage>(a.k + off, kbuf(t % kStages, q), pitch);
+                        tdm_tile<kPage>(a.v + off, vbuf(t % kStages, q), pitch);
+                    }
+                }
+            }
+            else if constexpr(kSubPages == 1)
             {
                 int32_t rows[kWavePages];
                 for(index_t q = 0; q < kWavePages; ++q)
@@ -534,11 +636,10 @@ struct FmhaDecodePaged5dKernel
 
         // step t's copies of this wave are in LDS; zero the V bytes of tokens past the context
         const auto land = [&](index_t t) {
-            // two gathers per step
             if(issued > t + 2)
-                __builtin_amdgcn_s_wait_tensorcnt(4);
+                __builtin_amdgcn_s_wait_tensorcnt(2 * kTdmPerStep);
             else if(issued > t + 1)
-                __builtin_amdgcn_s_wait_tensorcnt(2);
+                __builtin_amdgcn_s_wait_tensorcnt(kTdmPerStep);
             else
                 __builtin_amdgcn_s_wait_tensorcnt(0);
             for(index_t q = 0; q < kWavePages; ++q)
@@ -547,7 +648,19 @@ struct FmhaDecodePaged5dKernel
                 const index_t valid = __builtin_amdgcn_readfirstlane(
                     pg < pend ? min(max(ctx - pg * kPage, 0), kPage) : 0);
                 uint8_t* vd8 = vbuf(t % kStages, q);
-                if(valid == 0)
+                if constexpr(kRowMajor)
+                {
+                    // token rows valid..15: 16 rows x 8 chunks of 16 bytes over the wave
+                    if(valid < kPage)
+                        for(index_t i = 0; i < 4; ++i)
+                        {
+                            const index_t c = i * 32 + l;
+                            if(c / 8 >= valid)
+                                *ptr_as<v4i>(vd8 + c / 8 * kRowPitch + c % 8 * 16) =
+                                    v4i{0, 0, 0, 0};
+                        }
+                }
+                else if(valid == 0)
                     for(index_t i = 0; i < 4; ++i)
                         *ptr_as<v4i>(vd8 + (i * 32 + l) * 16) = v4i{0, 0, 0, 0};
                 else if(valid < kPage)
@@ -583,7 +696,7 @@ struct FmhaDecodePaged5dKernel
                                  index_t tok_h,
                                  float(&sv)[8],
                                  auto masked) {
-            const uint8_t* kb = kbuf(st, kq) + kt * 16;
+            const uint8_t* kb = kbuf(st, kq) + kt * kKTokStride;
             v16i kf{};
             for(index_t i = 0; i < 4; ++i)
             {
@@ -670,10 +783,22 @@ struct FmhaDecodePaged5dKernel
                 const v8i pf{pk[0], pk[1], pk[2], pk[3], pk[4], pk[5], pk[6], pk[7]};
                 for(index_t db = 0; db < 8; ++db)
                 {
-                    const index_t off = (db * 16 + n) * 16;
-                    const v4i x       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h][off]);
-                    const v4i y       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h + 1][off]);
-                    const v8i vf{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
+                    v8i vf;
+                    if constexpr(kRowMajor)
+                    {
+                        // operand byte 8q + j: token 32h + 8q + j, as on P^T
+                        vf = v_tr8(n, [&](index_t q, index_t j) {
+                            return vbuf(st, 2 * h + q / 2) + ((q % 2) * 8 + j) * kRowPitch +
+                                   db * 16;
+                        });
+                    }
+                    else
+                    {
+                        const index_t off = (db * 16 + n) * 16;
+                        const v4i x       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h][off]);
+                        const v4i y       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h + 1][off]);
+                        vf                = v8i{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
+                    }
                     acc[db] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
                         vf, pf, 0, acc[db], false, false);
                 }
@@ -746,10 +871,21 @@ struct FmhaDecodePaged5dKernel
                 const v8i pf{px[0], px[1], px[2], px[3], py[0], py[1], py[2], py[3]};
                 for(index_t bk = 0; bk < 2; ++bk)
                 {
-                    const index_t dd = (bk * kNumWaves + w) * 16 + n;
-                    const v4i x      = *ptr_as<v4i>(&sm.v[st][h][dd * 16]);
-                    const v4i y      = *ptr_as<v4i>(&sm.v[st][h + 2][dd * 16]);
-                    const v8i vf{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
+                    const index_t d0 = (bk * kNumWaves + w) * 16;
+                    v8i vf;
+                    if constexpr(kRowMajor)
+                    {
+                        // operand byte 8q + j: token (q % 2) * 8 + j of page h + 2 * (q / 2)
+                        vf = v_tr8(n, [&](index_t q, index_t j) {
+                            return &sm.v[st][h + 2 * (q / 2)][((q % 2) * 8 + j) * kRowPitch + d0];
+                        });
+                    }
+                    else
+                    {
+                        const v4i x = *ptr_as<v4i>(&sm.v[st][h][(d0 + n) * 16]);
+                        const v4i y = *ptr_as<v4i>(&sm.v[st][h + 2][(d0 + n) * 16]);
+                        vf          = v8i{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
+                    }
                     acc[bk] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
                         vf, pf, 0, acc[bk] * alpha, false, false);
                 }
