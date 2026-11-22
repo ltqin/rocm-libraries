@@ -916,6 +916,11 @@ struct FmhaDecodePaged5dKernel
                 __builtin_amdgcn_s_wait_tensorcnt(kTdmPerStep);
             else
                 __builtin_amdgcn_s_wait_tensorcnt(0);
+            // the step's pages are consecutive: if the last lies in the split and the context,
+            // every token is valid (the common case, one scalar test instead of one per page)
+            const index_t pg_end = pg0 + page_idx(t, kWavePages - 1) + 1;
+            if(pg_end <= pend && pg_end * kPage <= ctx)
+                return;
             for(index_t q = 0; q < kWavePages; ++q)
             {
                 const index_t pg    = pg0 + page_idx(t, q);
