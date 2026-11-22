@@ -382,19 +382,19 @@ struct FmhaDecodePaged5dKernel
 
     struct alignas(16) SmemWaveSplit
     {
-        union
+        // per wave, so that a wave's O for the intra-workgroup merge reuses only its own stages
+        union alignas(16) PerWave
         {
             struct
             {
-                alignas(16) uint8_t k[kStages][kNumWaves][kWavePages][kPageBuf];
-                alignas(16) uint8_t v[kStages][kNumWaves][kWavePages][kPageBuf];
+                alignas(16) uint8_t k[kStages][kWavePages][kPageBuf];
+                alignas(16) uint8_t v[kStages][kWavePages][kPageBuf];
                 // per-token K and V scales of the stages' pages
-                alignas(16) float sc[2][kStages][kNumWaves][kWavePages][kPage];
+                alignas(16) float sc[2][kStages][kWavePages][kPage];
             } kv;
-            // the waves' O for the intra-workgroup merge; padded rows keep the column-wise
-            // stores of 16 rows off one bank
-            alignas(16) float o[kNumWaves][kRows][kHdim + 4];
-        };
+            // padded rows keep the column-wise stores of 16 rows off one bank
+            alignas(16) float o[kRows][kHdim + 4];
+        } wave[kNumWaves];
         alignas(16) float ml[2][kNumWaves][kRows];
     };
 
@@ -738,7 +738,7 @@ struct FmhaDecodePaged5dKernel
         // LDS page buffers of wave w
         const auto kbuf = [&](index_t st, index_t q) -> uint8_t* {
             if constexpr(kWaveSplit)
-                return &sm.kv.k[st][w][0][0] + q * kKPageStride;
+                return &sm.wave[w].kv.k[st][0][0] + q * kKPageStride;
             else
             {
                 ignore = q;
@@ -747,7 +747,7 @@ struct FmhaDecodePaged5dKernel
         };
         const auto vbuf = [&](index_t st, index_t q) -> uint8_t* {
             if constexpr(kWaveSplit)
-                return &sm.kv.v[st][w][q][0];
+                return &sm.wave[w].kv.v[st][q][0];
             else
             {
                 ignore = q;
@@ -757,7 +757,7 @@ struct FmhaDecodePaged5dKernel
         // per-token scales (kv 0: K, 1: V) of wave w's q-th page of stage st
         const auto scbuf = [&](index_t kv, index_t st, index_t q) -> float* {
             if constexpr(kWaveSplit)
-                return &sm.kv.sc[kv][st][w][q][0];
+                return &sm.wave[w].kv.sc[kv][st][q][0];
             else
             {
                 ignore = q;
@@ -1152,8 +1152,8 @@ struct FmhaDecodePaged5dKernel
                     else
                     {
                         const index_t off = (db * 16 + n) * 16;
-                        const v4i x       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h][off]);
-                        const v4i y       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h + 1][off]);
+                        const v4i x       = *ptr_as<v4i>(&sm.wave[w].kv.v[st][2 * h][off]);
+                        const v4i y       = *ptr_as<v4i>(&sm.wave[w].kv.v[st][2 * h + 1][off]);
                         vf                = v8i{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
                     }
 #pragma unroll
@@ -1329,7 +1329,9 @@ struct FmhaDecodePaged5dKernel
             float m_row, l_row;
             if constexpr(kWaveSplit)
             {
-                // merge the waves; lane (n, h) holds O[row n][d = db*16 + h*8 + r]
+                // merge the waves; lane (n, h) holds O[row n][d = db*16 + h*8 + r]. Each wave
+                // stores its O relative to its own max (in its own stages, which it is done
+                // with), so one barrier suffices; the reader weights the waves.
                 if(i > 0)
                     __syncthreads(); // the previous tile's merge reads are done
                 if(h == 0)
@@ -1337,16 +1339,11 @@ struct FmhaDecodePaged5dKernel
                     sm.ml[0][w][n] = m_run[i];
                     sm.ml[1][w][n] = l_run[i];
                 }
-                __syncthreads(); // also: every wave is done with the stages the merge buffer reuses
-                float M = -numeric<float>::infinity();
-                for(index_t k = 0; k < kNumWaves; ++k)
-                    M = fmaxf(M, sm.ml[0][k][n]);
-                const float f = exp2(m_run[i] - (is_neg_inf(M) ? 0.f : M)) *
-                                (kPerTokenScale ? __builtin_amdgcn_ldexpf(1.f, e_run) : 1.f);
+                const float f = kPerTokenScale ? __builtin_amdgcn_ldexpf(1.f, e_run) : 1.f;
                 for(index_t db = 0; db < kAcc; ++db)
                 {
-                    const v8f x = acc[i][db] * f;
-                    float4* dst = ptr_as<float4>(&sm.o[w][n][db * 16 + h * 8]);
+                    const v8f x = kPerTokenScale ? acc[i][db] * f : acc[i][db];
+                    float4* dst = ptr_as<float4>(&sm.wave[w].o[n][db * 16 + h * 8]);
                     dst[0]      = make_float4(x[0], x[1], x[2], x[3]);
                     dst[1]      = make_float4(x[4], x[5], x[6], x[7]);
                 }
@@ -1357,19 +1354,23 @@ struct FmhaDecodePaged5dKernel
                 for(index_t k = 0; k < kNumWaves; ++k)
                     m_row = fmaxf(m_row, sm.ml[0][k][row]);
                 const float mu = is_neg_inf(m_row) ? 0.f : m_row;
-                l_row          = 0.f;
+                float wk[kNumWaves];
+                l_row = 0.f;
                 for(index_t k = 0; k < kNumWaves; ++k)
-                    l_row += sm.ml[1][k][row] * exp2(sm.ml[0][k][row] - mu);
+                {
+                    wk[k] = exp2(sm.ml[0][k][row] - mu);
+                    l_row += sm.ml[1][k][row] * wk[k];
+                }
                 for(index_t e = 0; e < kHdim / 8; ++e)
                     o[e] = 0.f;
                 for(index_t k = 0; k < kNumWaves; ++k)
                     for(index_t e4 = 0; e4 < kHdim / 32; ++e4)
                     {
-                        const float4 x = *ptr_as<float4>(&sm.o[k][row][d0 + 4 * e4]);
-                        o[4 * e4] += x.x;
-                        o[4 * e4 + 1] += x.y;
-                        o[4 * e4 + 2] += x.z;
-                        o[4 * e4 + 3] += x.w;
+                        const float4 x = *ptr_as<float4>(&sm.wave[k].o[row][d0 + 4 * e4]);
+                        o[4 * e4]      = fmaf(wk[k], x.x, o[4 * e4]);
+                        o[4 * e4 + 1]  = fmaf(wk[k], x.y, o[4 * e4 + 1]);
+                        o[4 * e4 + 2]  = fmaf(wk[k], x.z, o[4 * e4 + 2]);
+                        o[4 * e4 + 3]  = fmaf(wk[k], x.w, o[4 * e4 + 3]);
                     }
             }
             else
