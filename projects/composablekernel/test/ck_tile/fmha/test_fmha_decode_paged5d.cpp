@@ -98,6 +98,17 @@ std::vector<Param> params()
     add("fp16_p64_bound_full_b8",
         {8, 16, 1, {8192}, 0, 0, 0, "auto", 131072, 64, true},
         "wave+groups");
+    // every case again over hnd and nhd caches (token rows in LDS, transposing V reads)
+    const size_t n5d = p.size();
+    for(const auto& [prefix, layout] : {std::pair{"hnd_", fmha_decode_paged5d::Layout::hnd},
+                                        std::pair{"nhd_", fmha_decode_paged5d::Layout::nhd}})
+        for(size_t i = 0; i < n5d; ++i)
+        {
+            Param q       = p[i];
+            q.name        = prefix + q.name;
+            q.c.kv_layout = layout;
+            p.push_back(q);
+        }
     return p;
 }
 

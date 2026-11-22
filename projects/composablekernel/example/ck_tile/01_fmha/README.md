@@ -465,12 +465,14 @@ architectures.
 
 Pass `-kname=1` to print which instance was dispatched.
 
-## fp8 decode over the 5D paged KV cache (gfx125)
+## fp8 decode over a paged KV cache (gfx125)
 
 `tile_example_fmha_decode_paged5d` runs `FmhaDecodePaged5dKernel`
-(`ck_tile/ops/fmha/kernel/fmha_fwd_decode_paged5d_kernel.hpp`): one query token per sequence over
-sglang's SHUFFLE 5D paged cache, K `[num_blocks][nhead_k][d / 16][page_size][16 B]` and
-V `[num_blocks][nhead_k][page_size / 16][d][16]`, page_size 16, 64 or 128, d 128, fp8 e4m3 K/V
+(`ck_tile/ops/fmha/kernel/fmha_fwd_decode_paged5d_kernel.hpp`): one query token per sequence over a
+paged cache in one of three layouts (`-kv_layout`): `5d`, sglang's SHUFFLE layout, K
+`[num_blocks][nhead_k][d / 16][page_size][16 B]` and V `[num_blocks][nhead_k][page_size / 16][d][16]`;
+`hnd`, K and V `[num_blocks][nhead_k][page_size][d]`; `nhd`, K and V
+`[num_blocks][page_size][nhead_k][d]`. page_size 16, 64 or 128, d 128, fp8 e4m3 K/V
 with per-tensor descales, bf16 or fp16 Q and output (`-prec`), at most 16 query heads per kv head,
 an optional sliding window. It needs no codegen.
 

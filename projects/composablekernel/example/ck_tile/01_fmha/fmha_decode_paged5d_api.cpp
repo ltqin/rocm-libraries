@@ -26,8 +26,9 @@ size_t ck_fmha_decode_paged5d_num_counters(int batch, int nhead_k)
     return ck_tile::fmha_decode_paged5d_num_counters(batch, nhead_k);
 }
 
-// q, o: [batch][nhead_q][128] bf16, or fp16 with qo_fp16 != 0; k, v: SHUFFLE 5D fp8 e4m3 caches of
-// page_size (16, 64 or 128) tokens per page; block_table: int32 rows of block_table_stride entries;
+// q, o: [batch][nhead_q][128] bf16, or fp16 with qo_fp16 != 0; k, v: fp8 e4m3 caches of page_size
+// (16, 64 or 128) tokens per page in kv_layout (ck_tile::FmhaDecodePagedLayout: 0 shuffle_5d,
+// 1 hnd, 2 nhd); block_table: int32 rows of block_table_stride entries;
 // seqlen_k: int32 [batch], each <= max_seqlen_k; k/v descale: one float each. Returns a hipError_t.
 int ck_fmha_decode_paged5d(const void* q,
                            const void* k,
@@ -46,36 +47,39 @@ int ck_fmha_decode_paged5d(const void* q,
                            int max_seqlen_k,
                            int window,
                            int page_size,
+                           int kv_layout,
                            int qo_fp16,
                            float scale_s,
                            hipStream_t stream)
 {
     if(batch <= 0 || nhead_k <= 0 || nhead_q % nhead_k != 0 || nhead_q / nhead_k > 16)
         return hipErrorInvalidValue;
-    if(workspace == nullptr || counters == nullptr)
+    if(workspace == nullptr || counters == nullptr || kv_layout < 0 || kv_layout > 2)
         return hipErrorInvalidValue;
     const auto c =
         ck_tile::fmha_decode_paged5d_config(batch, nhead_k, max_seqlen_k, window, page_size);
-    const ck_tile::FmhaDecodePaged5dHostArgs args{q,
-                                                  k,
-                                                  v,
-                                                  block_table,
-                                                  seqlen_k,
-                                                  k_descale,
-                                                  v_descale,
-                                                  o,
-                                                  workspace,
-                                                  counters,
-                                                  batch,
-                                                  nhead_q,
-                                                  nhead_k,
-                                                  block_table_stride,
-                                                  page_size,
-                                                  window,
-                                                  c.pages_per_split,
-                                                  c.num_groups,
-                                                  scale_s,
-                                                  qo_fp16 != 0};
+    const ck_tile::FmhaDecodePaged5dHostArgs args{
+        q,
+        k,
+        v,
+        block_table,
+        seqlen_k,
+        k_descale,
+        v_descale,
+        o,
+        workspace,
+        counters,
+        batch,
+        nhead_q,
+        nhead_k,
+        block_table_stride,
+        page_size,
+        window,
+        c.pages_per_split,
+        c.num_groups,
+        scale_s,
+        qo_fp16 != 0,
+        static_cast<ck_tile::FmhaDecodePagedLayout>(kv_layout)};
     return fmha_decode_paged5d::launch(args, c, stream);
 }
 }

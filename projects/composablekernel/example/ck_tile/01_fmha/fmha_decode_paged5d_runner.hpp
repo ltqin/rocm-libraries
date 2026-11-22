@@ -91,6 +91,24 @@ hipError_t launch_page(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                : dispatch<false, false, kPageSize, kQoFp16, kLayout>(h, c.num_splits, stream, seq);
 }
 
+// launch_page is instantiated in the translation units of fmha_decode_paged5d_instances.cmake
+#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout) \
+    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout>(   \
+        const ck_tile::FmhaDecodePaged5dHostArgs&,                       \
+        const ck_tile::FmhaDecodePaged5dConfig&,                         \
+        hipStream_t);
+#define FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(layout)                     \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, false, layout)  \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, true, layout)   \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, false, layout)  \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, true, layout)   \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, false, layout) \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, true, layout)
+FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(shuffle_5d)
+FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(hnd)
+FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(nhd)
+#undef FMHA_DECODE_PAGED5D_EXTERN_LAYOUT
+
 template <bool kQoFp16, Layout kLayout>
 hipError_t launch_type(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                        const ck_tile::FmhaDecodePaged5dConfig& c,
