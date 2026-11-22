@@ -153,11 +153,12 @@ if(SUPPORTED_GPU_TARGETS MATCHES "gfx125")
         LABELS "${TEST_NAME};CK_TILE_FMHA_TESTS")
 
     include(${PROJECT_SOURCE_DIR}/example/ck_tile/01_fmha/cmake/fmha_decode_paged5d_instances.cmake)
-    fmha_decode_paged5d_instance_sources(FMHA_DECODE_PAGED5D_INSTANCE_SOURCES)
-    add_gtest_executable(test_ck_tile_fmha_decode_paged5d test_fmha_decode_paged5d.cpp
-        ${FMHA_DECODE_PAGED5D_INSTANCE_SOURCES})
     set(FMHA_DECODE_PAGED5D_GPU_TARGETS ${SUPPORTED_GPU_TARGETS})
     list(FILTER FMHA_DECODE_PAGED5D_GPU_TARGETS INCLUDE REGEX "^gfx125")
+    fmha_decode_paged5d_instances("${FMHA_DECODE_PAGED5D_GPU_TARGETS}"
+        ${PROJECT_SOURCE_DIR}/example/ck_tile/01_fmha)
+    add_gtest_executable(test_ck_tile_fmha_decode_paged5d test_fmha_decode_paged5d.cpp
+        $<TARGET_OBJECTS:fmha_decode_paged5d_instances>)
     set_property(TARGET test_ck_tile_fmha_decode_paged5d PROPERTY HIP_ARCHITECTURES
         ${FMHA_DECODE_PAGED5D_GPU_TARGETS})
     target_include_directories(test_ck_tile_fmha_decode_paged5d

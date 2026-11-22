@@ -4,10 +4,11 @@
 """PyTorch wrapper of the gfx125 CK fp8 decode kernel over a paged KV cache.
 
 pa_decode takes the arguments of aiter's FlyDSL pa_decode for the case it covers: one query
-token, bf16 or fp16 Q/O, head dim 128, fp8 e4m3 K/V with per-tensor scales, pages of 16, 64 or
-128 tokens, at most 16 query heads per kv head. K/V caches in one of the layouts of
-KV_LAYOUTS (shuffle_5d: sglang / aiter vectorized_5d, hnd, nhd). Load libck_fmha_decode_paged5d.so (target
-ck_fmha_decode_paged5d) from CK_FMHA_DECODE_PAGED5D_LIB or the library search path.
+token, bf16 or fp16 Q/O, head dim 64, 128 or 256, fp8 e4m3 K/V with per-tensor scales, pages
+of 16, 64 or 128 tokens, at most 16 query heads per kv head, K/V caches in one of the layouts
+of KV_LAYOUTS (shuffle_5d: sglang / aiter vectorized_5d, hnd, nhd). Load
+libck_fmha_decode_paged5d.so (target ck_fmha_decode_paged5d) from CK_FMHA_DECODE_PAGED5D_LIB
+or the library search path.
 """
 
 import ctypes
@@ -15,7 +16,7 @@ import os
 
 import torch
 
-HDIM = 128
+HDIMS = (64, 128, 256)
 PAGE_SIZES = (16, 64, 128)
 # ck_tile::FmhaDecodePagedLayout
 KV_LAYOUTS = {"shuffle_5d": 0, "hnd": 1, "nhd": 2}
@@ -32,7 +33,7 @@ def _load():
             os.environ.get("CK_FMHA_DECODE_PAGED5D_LIB", "libck_fmha_decode_paged5d.so")
         )
         lib.ck_fmha_decode_paged5d_workspace_bytes.restype = ctypes.c_size_t
-        lib.ck_fmha_decode_paged5d_workspace_bytes.argtypes = [ctypes.c_int] * 5
+        lib.ck_fmha_decode_paged5d_workspace_bytes.argtypes = [ctypes.c_int] * 6
         lib.ck_fmha_decode_paged5d_num_counters.restype = ctypes.c_size_t
         lib.ck_fmha_decode_paged5d_num_counters.argtypes = [ctypes.c_int] * 2
         lib.ck_fmha_decode_paged5d.restype = ctypes.c_int
@@ -40,7 +41,7 @@ def _load():
             [ctypes.c_void_p] * 4
             + [ctypes.c_int]
             + [ctypes.c_void_p] * 6
-            + [ctypes.c_int] * 8
+            + [ctypes.c_int] * 9
             + [ctypes.c_float, ctypes.c_void_p]
         )
         _lib = lib
@@ -87,8 +88,8 @@ def _scale_ptr(scale, device):
 
 
 def pa_decode(
-    output,  # [num_seqs, num_query_heads, 128], the type of query
-    query,  # [num_seqs, num_query_heads, 128] bf16 or fp16
+    output,  # [num_seqs, num_query_heads, head_dim], the type of query
+    query,  # [num_seqs, num_query_heads, head_dim] bf16 or fp16, head_dim 64, 128 or 256
     key_cache,  # fp8 e4m3, see kv_layout
     value_cache,  # fp8 e4m3, see kv_layout
     context_lengths,  # [num_seqs] int32
@@ -106,9 +107,9 @@ def pa_decode(
 ):
     """Decode attention of one query token per sequence.
 
-    kv_layout: "shuffle_5d" (K [blocks, kv_heads, 8, page, 16], V [blocks, kv_heads, page // 16,
-    128, 16]), "hnd" (K and V [blocks, kv_heads, page, 128]), "nhd" (K and V [blocks, page,
-    kv_heads, 128]) or "auto": shuffle_5d for 5D caches, nhd for 4D ones (as aiter's pa_decode).
+    kv_layout: "shuffle_5d" (K [blocks, kv_heads, head_dim // 16, page, 16], V [blocks, kv_heads,
+    page // 16, head_dim, 16]), "hnd" (K and V [blocks, kv_heads, page, head_dim]), "nhd" (K and V
+    [blocks, page, kv_heads, head_dim]) or "auto": shuffle_5d for 5D caches, nhd for 4D ones (as aiter's pa_decode).
 
     The launch configuration depends on the batch, the kv heads, sliding_window and
     max_context_length (default: block_tables.shape[1] * page_size), not on context_lengths, so the
@@ -127,8 +128,8 @@ def pa_decode(
     if kv_layout == "shuffle_5d":
         num_blocks, nhead_k = key_cache.shape[:2]
         page = key_cache.shape[3] if key_cache.dim() == 5 else 0
-        k_shape = (num_blocks, nhead_k, HDIM // 16, page, 16)
-        v_shape = (num_blocks, nhead_k, page // 16, HDIM, 16)
+        k_shape = (num_blocks, nhead_k, hdim // 16, page, 16)
+        v_shape = (num_blocks, nhead_k, page // 16, hdim, 16)
     else:
         if key_cache.dim() != 4:
             raise ValueError(f"{kv_layout} caches must be 4D")
@@ -136,9 +137,11 @@ def pa_decode(
         nhead_k, page = key_cache.shape[1:3]
         if kv_layout == "nhd":
             page, nhead_k = nhead_k, page
-        k_shape = v_shape = tuple(key_cache.shape[:3]) + (HDIM,)
-    if hdim != HDIM or output.shape != query.shape:
-        raise ValueError("query and output must be [num_seqs, num_query_heads, 128]")
+        k_shape = v_shape = tuple(key_cache.shape[:3]) + (hdim,)
+    if hdim not in HDIMS or output.shape != query.shape:
+        raise ValueError(
+            "query and output must be [num_seqs, num_query_heads, 64, 128 or 256]"
+        )
     if (
         query.dtype not in (torch.bfloat16, torch.float16)
         or output.dtype != query.dtype
@@ -179,7 +182,7 @@ def pa_decode(
     device = query.device
     stream = torch.cuda.current_stream(device).cuda_stream
     nbytes = lib.ck_fmha_decode_paged5d_workspace_bytes(
-        batch, nhead_k, max_context_length, sliding_window, page
+        batch, nhead_k, max_context_length, sliding_window, page, hdim
     )
     ws = _buffer("workspace", nbytes, device)
     counters = _buffer(
@@ -203,6 +206,7 @@ def pa_decode(
         max_context_length,
         sliding_window,
         page,
+        hdim,
         KV_LAYOUTS[kv_layout],
         1 if query.dtype == torch.float16 else 0,
         float(softmax_scale),

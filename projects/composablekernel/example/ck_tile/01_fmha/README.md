@@ -472,7 +472,7 @@ Pass `-kname=1` to print which instance was dispatched.
 paged cache in one of three layouts (`-kv_layout`): `5d`, sglang's SHUFFLE layout, K
 `[num_blocks][nhead_k][d / 16][page_size][16 B]` and V `[num_blocks][nhead_k][page_size / 16][d][16]`;
 `hnd`, K and V `[num_blocks][nhead_k][page_size][d]`; `nhd`, K and V
-`[num_blocks][page_size][nhead_k][d]`. page_size 16, 64 or 128, d 128, fp8 e4m3 K/V
+`[num_blocks][page_size][nhead_k][d]`. page_size 16, 64 or 128, d 64, 128 or 256 (`-d`), fp8 e4m3 K/V
 with per-tensor descales, bf16 or fp16 Q and output (`-prec`), at most 16 query heads per kv head,
 an optional sliding window. It needs no codegen.
 

@@ -370,16 +370,16 @@ set(FMHA_DECODE_PAGED5D_TARGETS ${INST_TARGETS})
 list(FILTER FMHA_DECODE_PAGED5D_TARGETS INCLUDE REGEX "^gfx125")
 if(FMHA_DECODE_PAGED5D_TARGETS)
   include(${CMAKE_CURRENT_LIST_DIR}/cmake/fmha_decode_paged5d_instances.cmake)
-  fmha_decode_paged5d_instance_sources(FMHA_DECODE_PAGED5D_INSTANCE_SOURCES)
+  fmha_decode_paged5d_instances("${FMHA_DECODE_PAGED5D_TARGETS}" ${CMAKE_CURRENT_LIST_DIR})
   set(EXAMPLE_FMHA_DECODE_PAGED5D "tile_example_fmha_decode_paged5d")
   add_executable(${EXAMPLE_FMHA_DECODE_PAGED5D} EXCLUDE_FROM_ALL example_fmha_decode_paged5d.cpp
-    ${FMHA_DECODE_PAGED5D_INSTANCE_SOURCES})
+    $<TARGET_OBJECTS:fmha_decode_paged5d_instances>)
   target_include_directories(${EXAMPLE_FMHA_DECODE_PAGED5D} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
   set_property(TARGET ${EXAMPLE_FMHA_DECODE_PAGED5D} PROPERTY HIP_ARCHITECTURES
     ${FMHA_DECODE_PAGED5D_TARGETS})
   # C API loaded by fmha_decode_paged5d.py
   add_library(ck_fmha_decode_paged5d SHARED EXCLUDE_FROM_ALL fmha_decode_paged5d_api.cpp
-    ${FMHA_DECODE_PAGED5D_INSTANCE_SOURCES})
+    $<TARGET_OBJECTS:fmha_decode_paged5d_instances>)
   target_include_directories(ck_fmha_decode_paged5d PRIVATE ${CMAKE_CURRENT_LIST_DIR})
   set_property(TARGET ck_fmha_decode_paged5d PROPERTY HIP_ARCHITECTURES
     ${FMHA_DECODE_PAGED5D_TARGETS})

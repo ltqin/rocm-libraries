@@ -23,7 +23,6 @@
 namespace fmha_decode_paged5d {
 
 using ck_tile::index_t;
-constexpr index_t kHdim = 128;
 constexpr index_t kPage = 16;
 
 using Layout = ck_tile::FmhaDecodePagedLayout;
@@ -33,11 +32,17 @@ template <bool kWaveSplit,
           bool kGroups,
           index_t kPageSize,
           bool kQoFp16,
-          Layout kLayout>
+          Layout kLayout,
+          index_t kHdim>
 hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t stream)
 {
-    using K = ck_tile::
-        FmhaDecodePaged5dKernel<kWaveSplit, kNumSplits, kGroups, kPageSize, kQoFp16, kLayout>;
+    using K    = ck_tile::FmhaDecodePaged5dKernel<kWaveSplit,
+                                                  kNumSplits,
+                                                  kGroups,
+                                                  kPageSize,
+                                                  kQoFp16,
+                                                  kLayout,
+                                                  kHdim>;
     auto kargs = K::MakeKargs(h);
     hipLaunchConfig_t cfg{};
     cfg.gridDim  = K::GridSize(h.batch, h.nhead_k, h.num_groups);
@@ -59,6 +64,7 @@ template <bool kWaveSplit,
           index_t kPageSize,
           bool kQoFp16,
           Layout kLayout,
+          index_t kHdim,
           index_t... Ns>
 hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                     index_t splits,
@@ -68,57 +74,82 @@ hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
     hipError_t e       = hipErrorInvalidValue;
     const auto try_one = [&](auto ns) {
         if(splits == decltype(ns)::value)
-            e = launch_one<kWaveSplit, decltype(ns)::value, kGroups, kPageSize, kQoFp16, kLayout>(
-                h, stream);
+            e = launch_one<kWaveSplit,
+                           decltype(ns)::value,
+                           kGroups,
+                           kPageSize,
+                           kQoFp16,
+                           kLayout,
+                           kHdim>(h, stream);
     };
     (try_one(ck_tile::number<Ns + 1>{}), ...);
     return e;
 }
 
-template <index_t kPageSize, bool kQoFp16, Layout kLayout>
+template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim>
 hipError_t launch_page(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                        const ck_tile::FmhaDecodePaged5dConfig& c,
                        hipStream_t stream)
 {
     const auto seq = std::make_integer_sequence<index_t, 15>{};
     if(c.num_groups > 1)
-        return c.wave_split
-                   ? dispatch<true, true, kPageSize, kQoFp16, kLayout>(h, c.num_splits, stream, seq)
-                   : dispatch<false, true, kPageSize, kQoFp16, kLayout>(
-                         h, c.num_splits, stream, seq);
-    return c.wave_split
-               ? dispatch<true, false, kPageSize, kQoFp16, kLayout>(h, c.num_splits, stream, seq)
-               : dispatch<false, false, kPageSize, kQoFp16, kLayout>(h, c.num_splits, stream, seq);
+        return c.wave_split ? dispatch<true, true, kPageSize, kQoFp16, kLayout, kHdim>(
+                                  h, c.num_splits, stream, seq)
+                            : dispatch<false, true, kPageSize, kQoFp16, kLayout, kHdim>(
+                                  h, c.num_splits, stream, seq);
+    return c.wave_split ? dispatch<true, false, kPageSize, kQoFp16, kLayout, kHdim>(
+                              h, c.num_splits, stream, seq)
+                        : dispatch<false, false, kPageSize, kQoFp16, kLayout, kHdim>(
+                              h, c.num_splits, stream, seq);
 }
 
 // launch_page is instantiated in the translation units of fmha_decode_paged5d_instances.cmake
-#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout) \
-    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout>(   \
-        const ck_tile::FmhaDecodePaged5dHostArgs&,                       \
-        const ck_tile::FmhaDecodePaged5dConfig&,                         \
+#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout, hdim) \
+    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout, hdim>(   \
+        const ck_tile::FmhaDecodePaged5dHostArgs&,                             \
+        const ck_tile::FmhaDecodePaged5dConfig&,                               \
         hipStream_t);
-#define FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(layout)                     \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, false, layout)  \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, true, layout)   \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, false, layout)  \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, true, layout)   \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, false, layout) \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, true, layout)
+#define FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, hdim)                       \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, false, layout, hdim)  \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, true, layout, hdim)   \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, false, layout, hdim)  \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, true, layout, hdim)   \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, false, layout, hdim) \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, true, layout, hdim)
+#define FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(layout) \
+    FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, 64)   \
+    FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, 128)  \
+    FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, 256)
 FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(shuffle_5d)
 FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(hnd)
 FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(nhd)
 #undef FMHA_DECODE_PAGED5D_EXTERN_LAYOUT
+#undef FMHA_DECODE_PAGED5D_EXTERN_PAGE
+
+template <bool kQoFp16, Layout kLayout, index_t kHdim>
+hipError_t launch_hdim(const ck_tile::FmhaDecodePaged5dHostArgs& h,
+                       const ck_tile::FmhaDecodePaged5dConfig& c,
+                       hipStream_t stream)
+{
+    switch(h.page_size)
+    {
+    case 16: return launch_page<16, kQoFp16, kLayout, kHdim>(h, c, stream);
+    case 64: return launch_page<64, kQoFp16, kLayout, kHdim>(h, c, stream);
+    case 128: return launch_page<128, kQoFp16, kLayout, kHdim>(h, c, stream);
+    default: return hipErrorInvalidValue;
+    }
+}
 
 template <bool kQoFp16, Layout kLayout>
 hipError_t launch_type(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                        const ck_tile::FmhaDecodePaged5dConfig& c,
                        hipStream_t stream)
 {
-    switch(h.page_size)
+    switch(h.hdim)
     {
-    case 16: return launch_page<16, kQoFp16, kLayout>(h, c, stream);
-    case 64: return launch_page<64, kQoFp16, kLayout>(h, c, stream);
-    case 128: return launch_page<128, kQoFp16, kLayout>(h, c, stream);
+    case 64: return launch_hdim<kQoFp16, kLayout, 64>(h, c, stream);
+    case 128: return launch_hdim<kQoFp16, kLayout, 128>(h, c, stream);
+    case 256: return launch_hdim<kQoFp16, kLayout, 256>(h, c, stream);
     default: return hipErrorInvalidValue;
     }
 }
@@ -172,6 +203,7 @@ struct Case
     index_t page_size       = 16;        // tokens per cache page: 16, 64 or 128
     bool fp16               = false;     // fp16 Q and output instead of bf16
     Layout kv_layout        = Layout::shuffle_5d;
+    index_t hdim            = 128; // 64, 128 or 256
     unsigned seed           = 1;
 };
 
@@ -209,7 +241,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         res.error = "page_size must be 16, 64 or 128";
         return res;
     }
-    auto cfg = ck_tile::fmha_decode_paged5d_config(batch, c.nhead_k, max_seqlen, c.window, ps);
+    auto cfg =
+        ck_tile::fmha_decode_paged5d_config(batch, c.nhead_k, max_seqlen, c.window, ps, c.hdim);
     if(c.layout == "coop" || c.layout == "wave")
         cfg.wave_split = c.layout == "wave";
     const index_t lo_align = ps > kPage ? 4 : 1;
@@ -233,6 +266,12 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     index_t num_blocks       = 1;
     for(index_t b = 0; b < batch; ++b)
         num_blocks += (seqlens[b] + ps - 1) / ps;
+    const index_t kHdim = c.hdim;
+    if(kHdim != 64 && kHdim != 128 && kHdim != 256)
+    {
+        res.error = "hdim must be 64, 128 or 256";
+        return res;
+    }
     // one cache page of one kv head, K and V alike
     const index_t page_bytes = ps * kHdim;
     // byte of (block, kv head, token in the page, head dim) in the K or V cache
@@ -296,7 +335,7 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     ck_tile::DeviceMem bt_buf(block_table.size() * 4), sl_buf(seqlens32.size() * 4);
     ck_tile::DeviceMem o_buf(q.size() * 2), scale_buf(8);
     ck_tile::DeviceMem ws_buf(ck_tile::fmha_decode_paged5d_workspace_bytes(
-        batch, c.nhead_k, cfg.num_splits, cfg.num_groups));
+        batch, c.nhead_k, cfg.num_splits, cfg.num_groups, kHdim));
     ck_tile::DeviceMem cnt_buf(ck_tile::fmha_decode_paged5d_num_counters(batch, c.nhead_k) * 4);
     HIP_CHECK_ERROR(hipMemset(ws_buf.GetDeviceBuffer(), 0xff, ws_buf.GetBufferSize()));
     cnt_buf.SetZero();
@@ -329,7 +368,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         cfg.num_groups,
         scale_s,
         c.fp16,
-        c.kv_layout};
+        c.kv_layout,
+        kHdim};
 
     hipStream_t stream;
     HIP_CHECK_ERROR(hipDeviceSynchronize()); // the fills above, before a non-blocking stream

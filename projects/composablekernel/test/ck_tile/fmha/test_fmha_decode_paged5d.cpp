@@ -98,6 +98,32 @@ std::vector<Param> params()
     add("fp16_p64_bound_full_b8",
         {8, 16, 1, {8192}, 0, 0, 0, "auto", 131072, 64, true},
         "wave+groups");
+    // head dims 64 and 256: both layouts, several clusters, every page size, GQA and fp16
+    for(const ck_tile::index_t d : {64, 256})
+    {
+        const auto add_d = [&](const std::string& n, Case c, const char* layout = "") {
+            c.hdim = d;
+            add("d" + std::to_string(d) + "_" + n, c, layout);
+        };
+        add_d("one_split", {2, 16, 1, {700}, 2048, 1, 0, "auto"});
+        add_d("swa_coop", {2, 16, 1, {5000}, 2048, 0, 0, "coop"}, "coop");
+        add_d("swa_wave", {2, 16, 1, {5000}, 2048, 0, 0, "wave"}, "wave");
+        add_d("swa_mixed", {4, 16, 1, {9000, 100, 2048, 3333}, 2048, 0, 0, "auto"});
+        add_d("full_b1_s20000", {1, 16, 1, {20000}, 0, 0, 0, "auto"}, "wave+groups");
+        add_d("coop_groups", {1, 16, 1, {20000}, 0, 0, 0, "coop"}, "coop+groups");
+        add_d("gqa_32_4_wave", {2, 32, 4, {999}, 2048, 0, 0, "wave"}, "wave");
+        for(const ck_tile::index_t ps : {64, 128})
+        {
+            const auto pn = "p" + std::to_string(ps) + "_";
+            add_d(pn + "swa_b3_s1000_w300", {3, 16, 1, {1000}, 300, 0, 0, "auto", 0, ps});
+            add_d(pn + "full_b8_s8192", {8, 16, 1, {8192}, 0, 0, 0, "auto", 0, ps}, "wave");
+            add_d(pn + "bound_full_b8",
+                  {8, 16, 1, {8192}, 0, 0, 0, "auto", 131072, ps},
+                  "wave+groups");
+        }
+        add_d("fp16_full_b8_s8192", {8, 16, 1, {8192}, 0, 0, 0, "auto", 0, 16, true}, "wave");
+        add_d("fp16_p64_swa", {2, 16, 2, {4000}, 2048, 0, 0, "coop", 0, 64, true}, "coop");
+    }
     // every case again over hnd and nhd caches (token rows in LDS, transposing V reads)
     const size_t n5d = p.size();
     for(const auto& [prefix, layout] : {std::pair{"hnd_", fmha_decode_paged5d::Layout::hnd},
