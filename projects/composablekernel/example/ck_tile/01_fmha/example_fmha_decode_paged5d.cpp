@@ -14,7 +14,8 @@ int main(int argc, char* argv[])
     ck_tile::ArgParser arg_parser;
     arg_parser.insert("b", "1", "batch size")
         .insert("h", "16", "number of query heads")
-        .insert("h_k", "1", "number of kv heads (h / h_k <= 16)")
+        .insert("h_k", "1", "number of kv heads")
+        .insert("q_len", "1", "query tokens per sequence (MTP), the last ones of the context")
         .insert("s_k", "8192", "context length; comma separated for one per batch")
         .insert("max_s_k", "0", "context length bound the launch is sized for; 0 = longest s_k")
         .insert("window", "2048", "keys attended, the query's own included; 0 = no window")
@@ -25,6 +26,7 @@ int main(int argc, char* argv[])
         .insert("splits", "0", "workgroups per (batch, kv head); 0 = heuristic")
         .insert("pages_per_split", "0", "pages per split; 0 = heuristic")
         .insert("layout", "auto", "auto, coop or wave")
+        .insert("m_tiles", "0", "16-row tiles per workgroup: 1 or 2; 0 = heuristic")
         .insert("v", "1", "validate against the CPU reference")
         .insert("seed", "1", "random seed")
         .insert("warmup", "10", "warmup launches")
@@ -46,6 +48,8 @@ int main(int argc, char* argv[])
     c.max_seqlen_k              = arg_parser.get_int("max_s_k");
     c.page_size                 = arg_parser.get_int("page_size");
     c.hdim                      = arg_parser.get_int("d");
+    c.qlen                      = arg_parser.get_int("q_len");
+    c.m_tiles                   = arg_parser.get_int("m_tiles");
     c.fp16                      = arg_parser.get_str("prec") == "fp16";
     const std::string kv_layout = arg_parser.get_str("kv_layout");
     if(kv_layout != "5d" && kv_layout != "hnd" && kv_layout != "nhd")
@@ -69,19 +73,21 @@ int main(int argc, char* argv[])
     if(validate)
         std::printf(
             "max abs err %.4g (max |ref| %.4g), cos %.6f, ", r.max_err, r.max_ref, r.cosine);
-    std::printf("%s %s d:%d b:%d h:%d/%d s_k:%d page:%d window:%d layout:%s groups:%d splits:%d "
-                "pages/split:%d, "
-                "stream %.2f us, graph %.2f us%s\n",
+    std::printf("%s %s d:%d b:%d q:%d h:%d/%d s_k:%d page:%d window:%d layout:%s tiles:%dx%d "
+                "groups:%d splits:%d pages/split:%d, stream %.2f us, graph %.2f us%s\n",
                 c.fp16 ? "fp16" : "bf16",
                 kv_layout.c_str(),
                 c.hdim,
                 c.batch,
+                c.qlen,
                 c.nhead,
                 c.nhead_k,
                 c.seqlen_k.front(),
                 c.page_size,
                 c.window,
                 r.config.wave_split ? "wave" : "coop",
+                r.config.m_tiles,
+                r.config.row_blocks,
                 r.config.num_groups,
                 r.config.num_splits,
                 r.config.pages_per_split,

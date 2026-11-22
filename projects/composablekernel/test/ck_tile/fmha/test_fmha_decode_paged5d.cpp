@@ -18,6 +18,9 @@ struct Param
     // layout the case must run with: "coop" or "wave", "+groups" for several clusters per
     // (batch, kv head); empty: not checked
     const char* layout = "";
+    // 16-row tiles per workgroup and row blocks the case must run with; 0: not checked
+    ck_tile::index_t m_tiles    = 0;
+    ck_tile::index_t row_blocks = 0;
 };
 
 std::vector<Param> params()
@@ -25,6 +28,19 @@ std::vector<Param> params()
     std::vector<Param> p;
     const auto add = [&](const std::string& name, Case c, const char* layout = "") {
         p.push_back({name, c, layout});
+    };
+    // query_length qlen, tiles per workgroup (0: heuristic), and the tiles x row blocks the
+    // query rows must take
+    const auto add_rows = [&](const std::string& name,
+                              Case c,
+                              ck_tile::index_t qlen,
+                              ck_tile::index_t force_tiles,
+                              ck_tile::index_t m_tiles,
+                              ck_tile::index_t row_blocks,
+                              const char* layout = "") {
+        c.qlen    = qlen;
+        c.m_tiles = force_tiles;
+        p.push_back({name, c, layout, m_tiles, row_blocks});
     };
     // window 2048 at short, medium and long contexts
     add("swa_b1_s1024", {1, 16, 1, {1024}, 2048}, "coop");
@@ -124,6 +140,51 @@ std::vector<Param> params()
         add_d("fp16_full_b8_s8192", {8, 16, 1, {8192}, 0, 0, 0, "auto", 0, 16, true}, "wave");
         add_d("fp16_p64_swa", {2, 16, 2, {4000}, 2048, 0, 0, "coop", 0, 64, true}, "coop");
     }
+    // more than 16 query rows per kv head: row blocks of one tile, or of two tiles sharing each
+    // K/V page (forced here; the heuristic takes two only for large launches), rows not a multiple
+    // of 16
+    add_rows("gqa32_swa", {2, 32, 1, {5000}, 2048}, 1, 0, 1, 2);
+    add_rows("gqa24_h48_2", {3, 48, 2, {3000}, 0}, 1, 0, 1, 2);
+    add_rows("gqa64_swa", {2, 64, 1, {9000}, 2048}, 1, 0, 1, 4, "coop");
+    add_rows("gqa40_short", {2, 40, 1, {77}, 2048}, 1, 0, 1, 3);
+    add_rows("gqa128_blocks", {2, 128, 1, {4000}, 0}, 1, 0, 1, 8);
+    add_rows("gqa96_h192_2", {1, 192, 2, {2500}, 1000}, 1, 0, 1, 6);
+    add_rows("gqa32_fp16_p64", {2, 32, 1, {7000}, 0, 0, 0, "auto", 0, 64, true}, 1, 0, 1, 2);
+    add_rows("m2_gqa32_swa", {2, 32, 1, {5000}, 2048}, 1, 2, 2, 1);
+    add_rows("m2_gqa32_wave", {2, 32, 1, {5000}, 2048, 0, 0, "wave"}, 1, 2, 2, 1, "wave");
+    add_rows(
+        "m2_gqa32_wave_groups", {1, 32, 1, {20000}, 0, 0, 0, "wave"}, 1, 2, 2, 1, "wave+groups");
+    add_rows(
+        "m2_gqa64_coop_groups", {1, 64, 1, {30000}, 0, 0, 0, "coop"}, 1, 2, 2, 2, "coop+groups");
+    add_rows("m2_gqa40_short", {2, 40, 1, {77}, 2048}, 1, 2, 2, 2);
+    add_rows("m2_gqa96_h192_2", {1, 192, 2, {2500}, 1000}, 1, 2, 2, 3);
+    add_rows("m2_gqa64_p128", {2, 64, 1, {7000}, 2048, 0, 0, "auto", 0, 128}, 1, 2, 2, 2);
+    add_rows("m2_gqa32_fp16_p64", {2, 32, 1, {7000}, 0, 0, 0, "auto", 0, 64, true}, 1, 2, 2, 1);
+    // MTP: query_length tokens per sequence, each seeing the keys up to its own position
+    add_rows("mtp2_gqa8_swa", {2, 8, 1, {5000}, 2048}, 2, 0, 1, 1);
+    add_rows("mtp2_gqa8_full", {2, 8, 1, {3000}, 0}, 2, 0, 1, 1);
+    add_rows("mtp4_gqa1", {3, 4, 4, {900}, 0}, 4, 0, 1, 1);
+    add_rows("mtp3_gqa16", {2, 16, 1, {6000}, 2048}, 3, 0, 1, 3);
+    add_rows("mtp3_window5", {2, 8, 1, {300}, 5}, 3, 0, 1, 2);
+    add_rows("mtp4_short_ctx", {2, 8, 1, {2, 3}, 0}, 4, 0, 1, 2);
+    add_rows("mtp3_p64_w100", {3, 8, 1, {1000, 64, 2500}, 100, 0, 0, "auto", 0, 64}, 3, 0, 1, 2);
+    add_rows("mtp2_bound_groups", {4, 8, 1, {8192}, 0, 0, 0, "auto", 131072}, 2, 0, 1, 1);
+    add_rows("mtp2_fp16_p128", {2, 16, 2, {4000}, 0, 0, 0, "auto", 0, 128, true}, 2, 0, 1, 1);
+    add_rows("m2_mtp2_gqa16_wave", {2, 16, 1, {5000}, 0, 0, 0, "wave"}, 2, 2, 2, 1, "wave");
+    add_rows("m2_mtp5_gqa16", {1, 16, 1, {12000}, 4096}, 5, 2, 2, 3);
+    add_rows("m2_mtp3_window5", {2, 8, 1, {300}, 5}, 3, 2, 2, 1);
+    add_rows("m2_mtp4_short_ctx", {2, 8, 1, {2, 3}, 0}, 4, 2, 2, 1);
+    for(const ck_tile::index_t d : {64, 256})
+    {
+        const auto dn = "d" + std::to_string(d) + "_";
+        Case c{2, 32, 1, {5000}, 2048, 0, 0, "wave"};
+        c.hdim = d;
+        add_rows(dn + "m2_gqa32_wave", c, 1, 2, 2, 1, "wave");
+        c      = Case{2, 16, 1, {6000}, 0};
+        c.hdim = d;
+        add_rows(dn + "mtp4_gqa16", c, 4, 0, 1, 4);
+        add_rows(dn + "m2_mtp4_gqa16", c, 4, 2, 2, 2);
+    }
     // every case again over hnd and nhd caches (token rows in LDS, transposing V reads)
     const size_t n5d = p.size();
     for(const auto& [prefix, layout] : {std::pair{"hnd_", fmha_decode_paged5d::Layout::hnd},
@@ -154,9 +215,35 @@ TEST_P(DecodePaged5d, MatchesReference)
                                (r.config.num_groups > 1 ? "+groups" : "");
     if(*GetParam().layout != '\0')
         EXPECT_EQ(layout, GetParam().layout);
+    if(GetParam().m_tiles > 0)
+    {
+        EXPECT_EQ(r.config.m_tiles, GetParam().m_tiles);
+        EXPECT_EQ(r.config.row_blocks, GetParam().row_blocks);
+    }
     EXPECT_TRUE(r.valid) << "max abs err " << r.max_err << " (max |ref| " << r.max_ref << "), cos "
                          << r.cosine << ", splits " << r.config.num_splits << ", pages/split "
                          << r.config.pages_per_split << (r.config.wave_split ? ", wave" : ", coop");
+}
+
+// The tiles heuristic (host only): one tile per workgroup for small launches, two once the
+// (tile, page) tasks or the grid of single tiles are large
+TEST(DecodePaged5dConfig, Tiles)
+{
+    const auto tiles = [](ck_tile::index_t batch,
+                          ck_tile::index_t rows,
+                          ck_tile::index_t seqlen,
+                          ck_tile::index_t window) {
+        const auto c =
+            ck_tile::fmha_decode_paged5d_config(batch, 1, seqlen, window, 16, 128, rows, 1);
+        return std::pair{c.m_tiles, c.row_blocks};
+    };
+    EXPECT_EQ(tiles(8, 16, 73728, 0), std::pair(1, 1));
+    EXPECT_EQ(tiles(8, 32, 8192, 0), std::pair(1, 2));
+    EXPECT_EQ(tiles(1, 64, 73728, 0), std::pair(1, 4));
+    EXPECT_EQ(tiles(8, 32, 73728, 0), std::pair(2, 1));
+    EXPECT_EQ(tiles(32, 64, 8192, 0), std::pair(2, 2));
+    EXPECT_EQ(tiles(64, 64, 2048, 0), std::pair(2, 2));
+    EXPECT_EQ(tiles(64, 32, 8192, 2048), std::pair(1, 2));
 }
 
 INSTANTIATE_TEST_SUITE_P(Gfx125,

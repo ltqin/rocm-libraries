@@ -14,14 +14,16 @@
 //     V [num_blocks][nhead_k][page_size / 16][hdim][16 tokens]
 //   hnd: K and V [num_blocks][nhead_k][page_size tokens][hdim]
 //   nhd: K and V [num_blocks][page_size tokens][nhead_k][hdim]
-// One query token per sequence, hdim 64, 128 or 256, fp8 e4m3 K/V with per-tensor descales, bf16 or
-// fp16 Q (quantized per row in the kernel) and output of the same type. The q heads of one kv head
-// (at most 16) are the 16 columns of S^T = K Q^T. Below, a page is 16 tokens; a cache page holds
-// page_size / 16.
+// qlen query tokens per sequence (MTP: token i sees the keys before ctx - qlen + 1 + i), hdim 64,
+// 128 or 256, fp8 e4m3 K/V with per-tensor descales, bf16 or fp16 Q (quantized per row in the
+// kernel) and output of the same type. The query rows of one kv head (qlen tokens x its q heads,
+// token-major) are the columns of S^T = K Q^T, 16 per tile: a workgroup computes kMTiles tiles from
+// each K/V page it reads, and further rows go to further row blocks of the grid. Below, a page is
+// 16 tokens; a cache page holds page_size / 16.
 //
-// Grid (kNumSplits * groups, nhead_k, batch). Each kNumSplits consecutive splits are one workgroup
-// cluster; each stores O / l in bf16 and (m, l), and after a cluster barrier every split merges
-// its share of the rows (with several groups, see MergeGroups). The grid is sized for
+// Grid (kNumSplits * groups, nhead_k * row blocks, batch). Each kNumSplits consecutive splits are
+// one workgroup cluster; each stores O / l in bf16 and (m, l), and after a cluster barrier every
+// split merges its share of the rows (with several groups, see MergeGroups). The grid is sized for
 // max_seqlen_k; each (batch, kv head) spreads its own key range over it, and clusters left
 // without pages exit at once.
 //
@@ -40,14 +42,14 @@ enum class FmhaDecodePagedLayout : index_t
 
 struct FmhaDecodePaged5dHostArgs
 {
-    const void* q_ptr;           // [batch][nhead_q][hdim] bf16, or fp16 with qo_fp16
+    const void* q_ptr;           // [batch][qlen][nhead_q][hdim] bf16, or fp16 with qo_fp16
     const void* k_ptr;           // fp8, in layout
     const void* v_ptr;           // fp8, in layout
     const int32_t* block_table;  // [batch][max_blocks_per_seq]
     const int32_t* seqlen_k_ptr; // [batch]
     const float* k_descale_ptr;  // one float
     const float* v_descale_ptr;  // one float
-    void* o_ptr;                 // [batch][nhead_q][hdim], the type of Q
+    void* o_ptr;                 // [batch][qlen][nhead_q][hdim], the type of Q
     void* workspace_ptr;         // fmha_decode_paged5d_workspace_bytes, no initialization needed
     // fmha_decode_paged5d_num_counters int32; zero them once, every launch leaves them zero, so
     // launches of any shape can share them as long as they do not run concurrently
@@ -64,6 +66,7 @@ struct FmhaDecodePaged5dHostArgs
     bool qo_fp16                 = false; // Q and O are fp16 instead of bf16
     FmhaDecodePagedLayout layout = FmhaDecodePagedLayout::shuffle_5d;
     index_t hdim                 = 128; // 64, 128 or 256
+    index_t qlen                 = 1;   // query tokens per sequence, the last ones of the context
 };
 
 // num_splits workgroups per cluster, num_groups clusters per (batch, kv head)
@@ -73,18 +76,24 @@ struct FmhaDecodePaged5dConfig
     index_t pages_per_split;
     bool wave_split;
     index_t num_groups = 1;
+    // 16-row tiles per workgroup (1 or 2) and row blocks per (batch, kv head)
+    index_t m_tiles    = 1;
+    index_t row_blocks = 1;
 };
 
-// The most 16-token pages the key range of any context up to max_seqlen_k covers: a window of W
-// keys touches up to ceil(W / 16) + 1 pages, and with larger cache pages the range starts on a
-// 4-page boundary (see FmhaDecodePaged5dKernel::Run), up to 3 pages earlier.
+// The most 16-token pages the key range of any context up to max_seqlen_k covers: the windows of
+// qlen query tokens span W + qlen - 1 keys, which touch up to ceil(that / 16) + 1 pages, and with
+// larger cache pages the range starts on a 4-page boundary (see FmhaDecodePaged5dKernel::Run), up
+// to 3 pages earlier.
 CK_TILE_HOST index_t fmha_decode_paged5d_max_span(index_t max_seqlen_k,
                                                   index_t window,
-                                                  index_t page_size = 16)
+                                                  index_t page_size = 16,
+                                                  index_t qlen      = 1)
 {
     index_t span = (max_seqlen_k + 15) / 16;
     if(window > 0)
-        span = std::min<index_t>(span, (window + 15) / 16 + 1 + (page_size > 16 ? 3 : 0));
+        span =
+            std::min<index_t>(span, (window + qlen - 1 + 15) / 16 + 1 + (page_size > 16 ? 3 : 0));
     return std::max<index_t>(span, 1);
 }
 
@@ -93,22 +102,42 @@ CK_TILE_HOST index_t fmha_decode_paged5d_max_span(index_t max_seqlen_k,
 // wave-split cluster while the grid has 64 to 512 workgroups. Longer: at hdim 128, several
 // clusters (groups) of the shortest 8-, 12- or 16-page cooperative splits within 512 workgroups;
 // else wave-split splits for about 384 workgroups. The wave-split grid limits scale with
-// 128 / hdim: a wave-split workgroup's LDS (and so its residency) scales with hdim.
+// 128 / hdim: a wave-split workgroup's LDS (and so its residency) scales with hdim. rows query
+// rows per kv head (qlen x q heads per kv head) take m_tiles (1 or 2) tiles of 16 per workgroup and
+// as many row blocks as needed. A second tile per workgroup reads K/V once for twice the rows but
+// serializes their compute, so 2 tiles (m_tiles = 0) only once the (tile, page) tasks or the grid
+// of single tiles are large.
 CK_TILE_HOST FmhaDecodePaged5dConfig fmha_decode_paged5d_config(index_t batch,
                                                                 index_t nhead_k,
                                                                 index_t max_seqlen_k,
                                                                 index_t window,
                                                                 index_t page_size = 16,
-                                                                index_t hdim      = 128)
+                                                                index_t hdim      = 128,
+                                                                index_t rows      = 1,
+                                                                index_t qlen      = 1,
+                                                                index_t m_tiles   = 0)
 {
-    const index_t span  = fmha_decode_paged5d_max_span(max_seqlen_k, window, page_size);
+    const index_t span  = fmha_decode_paged5d_max_span(max_seqlen_k, window, page_size, qlen);
     const auto round_up = [](index_t x, index_t m) { return (x + m - 1) / m * m; };
     const auto ceil_div = [](index_t x, index_t y) { return (x + y - 1) / y; };
-    const index_t heads = batch * nhead_k;
-    const auto make     = [&](index_t pps, bool wave_split) {
+    if(m_tiles == 0)
+    {
+        const auto one = fmha_decode_paged5d_config(
+            batch, nhead_k, max_seqlen_k, window, page_size, hdim, rows, qlen, 1);
+        const long_index_t tasks = long_index_t{batch} * nhead_k * span * one.row_blocks;
+        const long_index_t wgs =
+            long_index_t{batch} * nhead_k * one.row_blocks * one.num_splits * one.num_groups;
+        if(rows <= 16 || (tasks < 49152 && wgs < 2048))
+            return one;
+        m_tiles = 2;
+    }
+    const index_t row_blocks = ceil_div(rows, 16 * m_tiles);
+    const index_t heads      = batch * nhead_k * row_blocks;
+    const auto make          = [&](index_t pps, bool wave_split) {
         const index_t total  = ceil_div(span, pps);
         const index_t groups = ceil_div(total, 15);
-        return FmhaDecodePaged5dConfig{ceil_div(total, groups), pps, wave_split, groups};
+        return FmhaDecodePaged5dConfig{
+            ceil_div(total, groups), pps, wave_split, groups, m_tiles, row_blocks};
     };
     if(span <= 15 * 16)
     {
@@ -129,21 +158,29 @@ CK_TILE_HOST FmhaDecodePaged5dConfig fmha_decode_paged5d_config(index_t batch,
                 true);
 }
 
-CK_TILE_HOST size_t fmha_decode_paged5d_workspace_bytes(
-    index_t batch, index_t nhead_k, index_t num_splits, index_t num_groups = 1, index_t hdim = 128)
+// block_rows: query rows per (batch, kv head) in whole row blocks, m_tiles * 16 * row_blocks
+CK_TILE_HOST size_t fmha_decode_paged5d_workspace_bytes(index_t batch,
+                                                        index_t nhead_k,
+                                                        index_t num_splits,
+                                                        index_t num_groups = 1,
+                                                        index_t hdim       = 128,
+                                                        index_t block_rows = 16)
 {
-    // per split: bf16 O / l [batch][nhead_k][groups][splits][16][hdim] and fp32 (m, l) [..][16][2];
-    // per group the same with one split
+    // per split: bf16 O / l [batch][nhead_k][block_rows / rows per block][groups][splits][rows per
+    // block][hdim] and fp32 (m, l) [..][2]; per group the same with one split
     const size_t heads = static_cast<size_t>(batch) * nhead_k;
-    const size_t rows  = heads * num_groups * num_splits * 16;
-    const size_t grows = num_groups > 1 ? heads * num_groups * 16 : 0;
+    const size_t rows  = heads * num_groups * num_splits * block_rows;
+    const size_t grows = num_groups > 1 ? heads * num_groups * block_rows : 0;
     return (rows + grows) * (static_cast<size_t>(hdim) * 2 + 2 * sizeof(float));
 }
 
-// one per (batch, kv head, row block) for any configuration
-CK_TILE_HOST size_t fmha_decode_paged5d_num_counters(index_t batch, index_t nhead_k)
+// one per (batch, kv head, row block) and merging split, for any configuration with at most
+// row_blocks row blocks
+CK_TILE_HOST size_t fmha_decode_paged5d_num_counters(index_t batch,
+                                                     index_t nhead_k,
+                                                     index_t row_blocks = 1)
 {
-    return static_cast<size_t>(batch) * nhead_k * 15;
+    return static_cast<size_t>(batch) * nhead_k * row_blocks * 15;
 }
 
 template <bool kWaveSplit_,
@@ -152,7 +189,8 @@ template <bool kWaveSplit_,
           index_t kPageSize_             = 16,
           bool kQoFp16_                  = false,
           FmhaDecodePagedLayout kLayout_ = FmhaDecodePagedLayout::shuffle_5d,
-          index_t kHdim_                 = 128>
+          index_t kHdim_                 = 128,
+          index_t kMTiles_               = 1>
 struct FmhaDecodePaged5dKernel
 {
     static constexpr FmhaDecodePagedLayout kLayout = kLayout_;
@@ -175,9 +213,13 @@ struct FmhaDecodePaged5dKernel
     static constexpr index_t kQkSteps   = kChunks / kQkChunks;
     static constexpr index_t kOutBlocks = kHdim / 16;
     // threads per row in the split merges, two head dims each
-    static constexpr index_t kMergeTpr  = kHdim / 2;
-    static constexpr index_t kPage      = 16;
-    static constexpr index_t kRows      = 16;
+    static constexpr index_t kMergeTpr = kHdim / 2;
+    static constexpr index_t kPage     = 16;
+    static constexpr index_t kRows     = 16;
+    // 16-row tiles per workgroup
+    static constexpr index_t kMTiles = kMTiles_;
+    static constexpr index_t kMRows  = kRows * kMTiles;
+    static_assert(kMTiles == 1 || kMTiles == 2);
     static constexpr index_t kPageBytes = kPage * kHdim;
     // pages per wave per step: one (cooperative) or four (wave split)
     static constexpr index_t kWavePages = kWaveSplit ? 4 : 1;
@@ -220,11 +262,17 @@ struct FmhaDecodePaged5dKernel
         index_t gqa; // nhead_q / nhead_k, so the kernel does not divide
         index_t max_blocks_per_seq;
         index_t window;
+        index_t qlen; // next to window: the key range needs both
         index_t pages_per_split;
         index_t num_groups; // read with kGroups only
         // ceil(2^32 / (kNumSplits * num_groups)), for kGroups: the high half of a product with it
         // divides by the split count
         uint32_t splits_rcp;
+        // ceil(2^31 / x) for Div (exact also for x = 1) by gqa and row_blocks
+        uint32_t gqa_rcp;
+        uint32_t row_blocks_rcp;
+        index_t rows;       // query rows per kv head, qlen * gqa
+        index_t row_blocks; // ceil(rows / kMRows), along y with the kv heads
         float scale_s;
         // used with kGroups only; last, so that the arguments the prologue needs come first
         uint16_t* gws_o;
@@ -232,11 +280,20 @@ struct FmhaDecodePaged5dKernel
         int32_t* counters; // per (batch, kv head, row block)
     };
 
+    CK_TILE_HOST static uint32_t rcp(index_t x)
+    {
+        return static_cast<uint32_t>(((uint64_t{1} << 31) + x - 1) / x);
+    }
+    CK_TILE_HOST static index_t RowBlocks(const FmhaDecodePaged5dHostArgs& h)
+    {
+        return (h.nhead_q / h.nhead_k * h.qlen + kMRows - 1) / kMRows;
+    }
+
     CK_TILE_HOST static Kargs MakeKargs(const FmhaDecodePaged5dHostArgs& h)
     {
-        const size_t heads = static_cast<size_t>(h.batch) * h.nhead_k;
-        const size_t rows  = heads * h.num_groups * kNumSplits * kRows;
-        const size_t grows = heads * h.num_groups * kRows;
+        const size_t heads = static_cast<size_t>(h.batch) * h.nhead_k * RowBlocks(h);
+        const size_t rows  = heads * h.num_groups * kNumSplits * kMRows;
+        const size_t grows = heads * h.num_groups * kMRows;
         auto* ws           = static_cast<uint8_t*>(h.workspace_ptr);
         auto* gws          = ws == nullptr ? nullptr : ws + rows * (kHdim * 2 + 8);
         return {static_cast<const uint16_t*>(h.q_ptr),
@@ -254,19 +311,24 @@ struct FmhaDecodePaged5dKernel
                 h.nhead_q / h.nhead_k,
                 h.max_blocks_per_seq,
                 h.window,
+                h.qlen,
                 h.pages_per_split,
                 h.num_groups,
                 static_cast<uint32_t>(((uint64_t{1} << 32) + kNumSplits * h.num_groups - 1) /
                                       (kNumSplits * h.num_groups)),
+                rcp(h.nhead_q / h.nhead_k),
+                rcp(RowBlocks(h)),
+                h.nhead_q / h.nhead_k * h.qlen,
+                RowBlocks(h),
                 h.scale_s,
                 reinterpret_cast<uint16_t*>(gws),
                 gws == nullptr ? nullptr : reinterpret_cast<float*>(gws + grows * kHdim * 2),
                 h.counters_ptr};
     }
 
-    CK_TILE_HOST static constexpr dim3 GridSize(index_t batch, index_t nhead_k, index_t groups = 1)
+    CK_TILE_HOST static dim3 GridSize(const FmhaDecodePaged5dHostArgs& h)
     {
-        return dim3(kNumSplits * groups, nhead_k, batch);
+        return dim3(kNumSplits * h.num_groups, h.nhead_k * RowBlocks(h), h.batch);
     }
 
     CK_TILE_HOST static constexpr dim3 BlockSize() { return dim3(kBlockSize); }
@@ -281,8 +343,8 @@ struct FmhaDecodePaged5dKernel
     {
         alignas(16) uint8_t k[kStages][kNumWaves][kPageBuf];
         alignas(16) uint8_t v[kStages][kNumWaves][kPageBuf];
-        alignas(16) uint8_t p[kRows][kNumWaves * kPage];
-        alignas(16) float red[2][kNumWaves][kRows]; // per-wave row max / row sum
+        alignas(16) uint8_t p[kMTiles][kRows][kNumWaves * kPage];
+        alignas(16) float red[2][kNumWaves][kMRows]; // per-wave row max / row sum
     };
 
     struct alignas(16) SmemWaveSplit
@@ -416,6 +478,76 @@ struct FmhaDecodePaged5dKernel
         }
         return r;
     }
+    // offset of query row r (token qi = r / gqa) of kv head g in Q and O
+    CK_TILE_DEVICE static long_index_t
+    RowOffset(const Kargs& a, index_t b, index_t g, index_t r, index_t qi)
+    {
+        return ((static_cast<long_index_t>(b) * a.qlen + qi) * a.nhead_q + g * a.gqa +
+                (r - qi * a.gqa)) *
+               kHdim;
+    }
+    // y / x for y * x < 2^30, given rcp = ceil(2^31 / x)
+    CK_TILE_DEVICE static index_t Div(index_t y, uint32_t rcp)
+    {
+        return __umulhi(2 * static_cast<uint32_t>(y), rcp);
+    }
+    CK_TILE_DEVICE static index_t QueryToken(const Kargs& a, index_t r)
+    {
+        return Div(r, a.gqa_rcp);
+    }
+    CK_TILE_DEVICE static long_index_t RowOffset(const Kargs& a, index_t b, index_t g, index_t r)
+    {
+        return RowOffset(a, b, g, r, QueryToken(a, r));
+    }
+    // S^T tile += K rows (kQkChunks 16-byte chunks per lane) x Q^T
+    CK_TILE_DEVICE static v8f wmma_qk(const int32_t* k, const int32_t* q, v8f c)
+    {
+        if constexpr(kQkChunks == 8)
+            return __builtin_amdgcn_wmma_f32_16x16x128_fp8_fp8(v16i{k[0],
+                                                                    k[1],
+                                                                    k[2],
+                                                                    k[3],
+                                                                    k[4],
+                                                                    k[5],
+                                                                    k[6],
+                                                                    k[7],
+                                                                    k[8],
+                                                                    k[9],
+                                                                    k[10],
+                                                                    k[11],
+                                                                    k[12],
+                                                                    k[13],
+                                                                    k[14],
+                                                                    k[15]},
+                                                               v16i{q[0],
+                                                                    q[1],
+                                                                    q[2],
+                                                                    q[3],
+                                                                    q[4],
+                                                                    q[5],
+                                                                    q[6],
+                                                                    q[7],
+                                                                    q[8],
+                                                                    q[9],
+                                                                    q[10],
+                                                                    q[11],
+                                                                    q[12],
+                                                                    q[13],
+                                                                    q[14],
+                                                                    q[15]},
+                                                               0,
+                                                               c,
+                                                               false,
+                                                               false);
+        else
+            return __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
+                v8i{k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]},
+                v8i{q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]},
+                0,
+                c,
+                false,
+                false);
+    }
     // pairwise: shorter dependency chains than a running max or sum
     template <index_t N>
     CK_TILE_DEVICE static float tree_max(const float* x)
@@ -457,14 +589,20 @@ struct FmhaDecodePaged5dKernel
         // groups of kNumSplits along x, one cluster each
         const index_t gi = kGroups ? blockIdx.x / kNumSplits : 0;
         const index_t s  = kGroups ? blockIdx.x % kNumSplits : blockIdx.x;
-        const index_t g = blockIdx.y, b = blockIdx.z;
-        const index_t sg  = gi * kNumSplits + s; // split index within the (batch, kv head)
-        const index_t gqa = a.gqa;
+        // y: kv head g, row block rb
+        const index_t g  = Div(blockIdx.y, a.row_blocks_rcp);
+        const index_t rb = blockIdx.y - g * a.row_blocks;
+        const index_t b  = blockIdx.z;
+        const index_t sg = gi * kNumSplits + s; // split index within the (batch, kv head)
 
         constexpr index_t kStepPages = kNumWaves * kWavePages;
         const index_t ctx            = a.seqlen_k[b];
-        const index_t lo             = a.window > 0 ? max(0, ctx - a.window) : 0;
-        const index_t pg_hi          = (ctx + kPage - 1) / kPage;
+        // query token i sees keys [hi - window, hi) with hi = ctx - qlen + 1 + i: the block reads
+        // the union of the tokens' ranges and skips the mask only where every token sees the page
+        const index_t hi_min = ctx - a.qlen + 1;
+        const index_t lo     = a.window > 0 ? max(0, hi_min - a.window) : 0;
+        const index_t lo_max = a.window > 0 ? max(0, ctx - a.window) : 0;
+        const index_t pg_hi  = (ctx + kPage - 1) / kPage;
         // with larger cache pages the range starts on a 4-page boundary, so that a wave-split
         // step's four pages of a wave lie in one cache page (positions before lo are masked)
         const index_t pg_lo = kSubPages > 1 ? lo / kPage / 4 * 4 : lo / kPage;
@@ -501,17 +639,24 @@ struct FmhaDecodePaged5dKernel
         // loads return in order: the block ids, which the first copies wait for, go out first
         __builtin_amdgcn_sched_barrier(0);
 
-        // Q^T operand of row n: 16-byte d chunks 2i + h, quantized per row (absmax) below
-        v4i qraw[kHdim / 16];
+        // column n of tile i: query row rb * kMRows + i * 16 + n (padding columns repeat the last
+        // row), its query token and the keys [lo_c, hi_c) it sees
+        index_t lo_c[kMTiles], hi_c[kMTiles];
+        // Q^T operand of each tile's column n: 16-byte d chunks 2i + h, quantized per row below
+        v4i qraw[kMTiles][kHdim / 16];
+#pragma unroll
+        for(index_t i = 0; i < kMTiles; ++i)
         {
-            const uint16_t* qrow =
-                a.q +
-                (static_cast<long_index_t>(b) * a.nhead_q + g * gqa + min(n, gqa - 1)) * kHdim;
-            for(index_t i = 0; i < kHdim / 32; ++i)
+            const index_t r      = min(rb * kMRows + i * kRows + n, a.rows - 1);
+            const index_t qi     = QueryToken(a, r);
+            hi_c[i]              = hi_min + qi;
+            lo_c[i]              = a.window > 0 ? max(0, hi_c[i] - a.window) : 0;
+            const uint16_t* qrow = a.q + RowOffset(a, b, g, r, qi);
+            for(index_t c2 = 0; c2 < kHdim / 32; ++c2)
             {
-                const index_t c = 2 * i + h;
-                qraw[2 * i]     = *ptr_as<v4i>(qrow + c * 16);
-                qraw[2 * i + 1] = *ptr_as<v4i>(qrow + c * 16 + 8);
+                const index_t c     = 2 * c2 + h;
+                qraw[i][2 * c2]     = *ptr_as<v4i>(qrow + c * 16);
+                qraw[i][2 * c2 + 1] = *ptr_as<v4i>(qrow + c * 16 + 8);
             }
         }
 
@@ -540,8 +685,8 @@ struct FmhaDecodePaged5dKernel
         };
         // block id of the cache page holding page idx (relative to pg0)
         const auto block_of = [&](index_t idx) {
-            const index_t rb = (pg0 + idx) / kSubPages - blk0;
-            return __builtin_amdgcn_readlane((rb >> 5) == cur_chunk ? bt_cur : bt_next, rb & 31);
+            const index_t cb = (pg0 + idx) / kSubPages - blk0;
+            return __builtin_amdgcn_readlane((cb >> 5) == cur_chunk ? bt_cur : bt_next, cb & 31);
         };
         // K and V of step t, one TDM gather each; a page past the split repeats the last one (its V
         // is zeroed once it lands)
@@ -625,13 +770,19 @@ struct FmhaDecodePaged5dKernel
             issue(t);
         asm volatile("" ::"s"(kds), "s"(vd));
 
-        float qv[kHdim / 2];
-        const auto widen = [&](auto fp16) {
+        // per tile: Q^T operand bytes (int 4i + e holds bytes 4e..4e+3 of chunk 2i + h) and the
+        // scale of column n of S^T in log2 units
+        int32_t qf[kMTiles][kHdim / 8];
+        float scl[kMTiles];
+#pragma unroll
+        for(index_t i = 0; i < kMTiles; ++i)
+        {
+            float qv[kHdim / 2];
             for(index_t j = 0; j < kHdim / 16; ++j)
                 for(index_t e = 0; e < 4; ++e)
                 {
-                    const uint32_t u = static_cast<uint32_t>(qraw[j][e]);
-                    if constexpr(decltype(fp16)::value)
+                    const uint32_t u = static_cast<uint32_t>(qraw[i][j][e]);
+                    if constexpr(kQoFp16)
                     {
                         qv[j * 8 + 2 * e]     = fp16_to_f32(u & 0xffff);
                         qv[j * 8 + 2 * e + 1] = fp16_to_f32(u >> 16);
@@ -642,24 +793,20 @@ struct FmhaDecodePaged5dKernel
                         qv[j * 8 + 2 * e + 1] = bf16_to_f32(u >> 16);
                     }
                 }
-        };
-        widen(bool_constant<kQoFp16>{});
-        float qmax = 1e-20f;
-        for(index_t i = 0; i < kHdim / 2; ++i)
-            qmax = fmaxf(qmax, fabsf(qv[i]));
-        qmax             = fmaxf(qmax, __shfl_xor(qmax, 16, 32));
-        const float qinv = 448.f / qmax;
-        // Q^T operand bytes: int 4i + e holds bytes 4e..4e+3 of chunk 2i + h
-        int32_t qf[kHdim / 8];
-        for(index_t j = 0; j < kHdim / 8; ++j)
-        {
-            const int32_t x =
-                __builtin_amdgcn_cvt_pk_fp8_f32(qv[4 * j] * qinv, qv[4 * j + 1] * qinv, 0, false);
-            qf[j] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                qv[4 * j + 2] * qinv, qv[4 * j + 3] * qinv, x, true);
+            float qmax = 1e-20f;
+            for(index_t j = 0; j < kHdim / 2; ++j)
+                qmax = fmaxf(qmax, fabsf(qv[j]));
+            qmax             = fmaxf(qmax, __shfl_xor(qmax, 16, 32));
+            const float qinv = 448.f / qmax;
+            for(index_t j = 0; j < kHdim / 8; ++j)
+            {
+                const int32_t x = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    qv[4 * j] * qinv, qv[4 * j + 1] * qinv, 0, false);
+                qf[i][j] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    qv[4 * j + 2] * qinv, qv[4 * j + 3] * qinv, x, true);
+            }
+            scl[i] = qmax / 448.f * kds * a.scale_s * 1.4426950408889634f;
         }
-        // column n of S^T in log2 units
-        const float scl = qmax / 448.f * kds * a.scale_s * 1.4426950408889634f;
 
         // step t's copies of this wave are in LDS; zero the V bytes of tokens past the context
         const auto land = [&](index_t t) {
@@ -707,96 +854,65 @@ struct FmhaDecodePaged5dKernel
             }
         };
 
-        float m_run = -numeric<float>::infinity(), l_run = 0.f;
-        // 16-wide head-dim blocks per wave: all of them, or every fourth (cooperative)
+        float m_run[kMTiles], l_run[kMTiles];
+        // 16-wide head-dim blocks per wave and tile: all of them, or every fourth (cooperative)
         constexpr index_t kAcc = kWaveSplit ? kOutBlocks : kOutBlocks / kNumWaves;
-        v8f acc[kAcc];
-        for(index_t i = 0; i < kAcc; ++i)
-            acc[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        v8f acc[kMTiles][kAcc];
+#pragma unroll
+        for(index_t i = 0; i < kMTiles; ++i)
+        {
+            m_run[i] = -numeric<float>::infinity();
+            l_run[i] = 0.f;
+            for(index_t j = 0; j < kAcc; ++j)
+                acc[i][j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        }
 
-        // S^T of 16 key rows of stage st (row m: page kq(m), token kt(m) of this wave's pages);
-        // lane (n, h) gets rows h*8 + r of column n, unscaled, -inf outside the range when
-        // masked (first page pg_first)
+        // S^T of 16 key rows of stage st (row m: page kq(m), token kt(m) of this wave's pages) for
+        // every tile, from one read of the K rows; lane (n, h) gets rows h*8 + r of column n,
+        // unscaled, -inf outside the column's keys when masked (first page pg_first)
         const auto qk_tile = [&](index_t st,
                                  index_t kq,
                                  index_t kt,
                                  index_t pg_first,
                                  index_t tok_h,
-                                 float(&sv)[8],
+                                 float(&sv)[kMTiles][8],
                                  auto masked) {
             const uint8_t* kb = kbuf(st, kq) + kt * kKTokStride;
-            v8f st8{0, 0, 0, 0, 0, 0, 0, 0};
+            v8f st8[kMTiles];
+#pragma unroll
+            for(index_t i = 0; i < kMTiles; ++i)
+                st8[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
             for(index_t ks = 0; ks < kQkSteps; ++ks)
             {
                 // chunks ks * kQkChunks + 2i + h on both operands
                 int32_t kf[kQkChunks * 2];
-                for(index_t i = 0; i < kQkChunks / 2; ++i)
+                for(index_t c2 = 0; c2 < kQkChunks / 2; ++c2)
                 {
-                    const v4i x = *ptr_as<v4i>(kb + (ks * kQkChunks + 2 * i + h) * kKChunkStride);
+                    const v4i x = *ptr_as<v4i>(kb + (ks * kQkChunks + 2 * c2 + h) * kKChunkStride);
                     for(index_t e = 0; e < 4; ++e)
-                        kf[4 * i + e] = x[e];
+                        kf[4 * c2 + e] = x[e];
                 }
-                const int32_t* q = qf + ks * kQkChunks * 2;
-                if constexpr(kQkChunks == 8)
-                    st8 = __builtin_amdgcn_wmma_f32_16x16x128_fp8_fp8(v16i{kf[0],
-                                                                           kf[1],
-                                                                           kf[2],
-                                                                           kf[3],
-                                                                           kf[4],
-                                                                           kf[5],
-                                                                           kf[6],
-                                                                           kf[7],
-                                                                           kf[8],
-                                                                           kf[9],
-                                                                           kf[10],
-                                                                           kf[11],
-                                                                           kf[12],
-                                                                           kf[13],
-                                                                           kf[14],
-                                                                           kf[15]},
-                                                                      v16i{q[0],
-                                                                           q[1],
-                                                                           q[2],
-                                                                           q[3],
-                                                                           q[4],
-                                                                           q[5],
-                                                                           q[6],
-                                                                           q[7],
-                                                                           q[8],
-                                                                           q[9],
-                                                                           q[10],
-                                                                           q[11],
-                                                                           q[12],
-                                                                           q[13],
-                                                                           q[14],
-                                                                           q[15]},
-                                                                      0,
-                                                                      st8,
-                                                                      false,
-                                                                      false);
-                else
-                    st8 = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
-                        v8i{kf[0], kf[1], kf[2], kf[3], kf[4], kf[5], kf[6], kf[7]},
-                        v8i{q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]},
-                        0,
-                        st8,
-                        false,
-                        false);
+#pragma unroll
+                for(index_t i = 0; i < kMTiles; ++i)
+                    st8[i] = wmma_qk(kf, qf[i] + ks * kQkChunks * 2, st8[i]);
             }
-            for(index_t r = 0; r < 8; ++r)
-            {
-                sv[r] = st8[r];
-                if constexpr(decltype(masked)::value)
+#pragma unroll
+            for(index_t i = 0; i < kMTiles; ++i)
+                for(index_t r = 0; r < 8; ++r)
                 {
-                    const index_t pos = pg_first * kPage + tok_h + r;
-                    if(!(pos >= lo && pos < ctx && pos < pend * kPage))
-                        sv[r] = -numeric<float>::infinity();
+                    sv[i][r] = st8[i][r];
+                    if constexpr(decltype(masked)::value)
+                    {
+                        const index_t pos = pg_first * kPage + tok_h + r;
+                        if(!(pos >= lo_c[i] && pos < hi_c[i] && pos < pend * kPage))
+                            sv[i][r] = -numeric<float>::infinity();
+                    }
                 }
-            }
         };
-        // pages [pg, pg + count) need no mask
+        // pages [pg, pg + count) need no mask for any column
         const auto inside = [&](index_t pg, index_t count) {
-            return pg * kPage >= lo && (pg + count) * kPage <= ctx && pg + count <= pend;
+            return pg * kPage >= lo_max && (pg + count) * kPage <= hi_min && pg + count <= pend;
         };
         // P scaled by 448 (the row max lands on e4m3's largest normal): exp2(s * scl + c)
         constexpr float kLog2P = 8.807354922057604f; // log2(448)
@@ -811,53 +927,66 @@ struct FmhaDecodePaged5dKernel
                 // 2 + j/2, so lane (n, h) gets all tokens of pages 2h and 2h + 1: byte j*8 + r of
                 // its P^T operand is token (j%2)*8 + r of page 2h + j/2, as on the V^T operand
                 const index_t pgw = pg0 + page_idx(t, 0);
-                float sv[kWavePages][8];
+                float sv[kMTiles][kWavePages][8];
                 const auto qk4 = [&](auto masked) {
                     for(index_t j = 0; j < kWavePages; ++j)
+                    {
+                        float sj[kMTiles][8];
                         qk_tile(st,
                                 (n < 8 ? 0 : 2) + j / 2,
                                 (j % 2) * 8 + (n & 7),
                                 pgw + 2 * h + j / 2,
                                 (j % 2) * 8,
-                                sv[j],
+                                sj,
                                 masked);
+#pragma unroll
+                        for(index_t i = 0; i < kMTiles; ++i)
+                            for(index_t r = 0; r < 8; ++r)
+                                sv[i][j][r] = sj[i][r];
+                    }
                 };
                 if(inside(pgw, kWavePages))
                     qk4(bool_constant<false>{});
                 else
                     qk4(bool_constant<true>{});
-                float mx          = tree_max<kWavePages * 8>(&sv[0][0]);
-                mx                = fmaxf(mx, __shfl_xor(mx, 16, 32)) * scl;
-                const float m_new = fmaxf(m_run, mx);
-                const float m_use = is_neg_inf(m_new) ? 0.f : m_new;
-                const float c     = kLog2P - m_use;
-                float pv[kWavePages][8];
-                int32_t pk[8];
-                for(index_t j = 0; j < kWavePages; ++j)
-                    for(index_t r2 = 0; r2 < 4; ++r2)
-                    {
-                        const float p0    = exp2(fmaf(sv[j][2 * r2], scl, c));
-                        const float p1    = exp2(fmaf(sv[j][2 * r2 + 1], scl, c));
-                        pv[j][2 * r2]     = p0;
-                        pv[j][2 * r2 + 1] = p1;
-                        const index_t e   = j * 8 + 2 * r2; // operand byte
-                        pk[e / 4]         = (e & 3) == 0
-                                                ? __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, 0, false)
-                                                : __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, pk[e / 4], true);
-                    }
-                float ps = tree_sum<kWavePages * 8>(&pv[0][0]);
-                ps       = ps + __shfl_xor(ps, 16, 32);
-                // rescale only when a row max grew
-                if(__builtin_amdgcn_ballot_w32(m_new > m_run) != 0)
+                v8i pf[kMTiles];
+#pragma unroll
+                for(index_t i = 0; i < kMTiles; ++i)
                 {
-                    const float alpha = exp2(m_run - m_use);
-                    l_run *= alpha;
-                    for(index_t db = 0; db < kAcc; ++db)
-                        acc[db] *= alpha;
+                    float mx          = tree_max<kWavePages * 8>(&sv[i][0][0]);
+                    mx                = fmaxf(mx, __shfl_xor(mx, 16, 32)) * scl[i];
+                    const float m_new = fmaxf(m_run[i], mx);
+                    const float m_use = is_neg_inf(m_new) ? 0.f : m_new;
+                    const float c     = kLog2P - m_use;
+                    float pv[kWavePages][8];
+                    int32_t pk[8];
+                    for(index_t j = 0; j < kWavePages; ++j)
+                        for(index_t r2 = 0; r2 < 4; ++r2)
+                        {
+                            const float p0    = exp2(fmaf(sv[i][j][2 * r2], scl[i], c));
+                            const float p1    = exp2(fmaf(sv[i][j][2 * r2 + 1], scl[i], c));
+                            pv[j][2 * r2]     = p0;
+                            pv[j][2 * r2 + 1] = p1;
+                            const index_t e   = j * 8 + 2 * r2; // operand byte
+                            pk[e / 4] =
+                                (e & 3) == 0
+                                    ? __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, 0, false)
+                                    : __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, pk[e / 4], true);
+                        }
+                    float ps = tree_sum<kWavePages * 8>(&pv[0][0]);
+                    ps       = ps + __shfl_xor(ps, 16, 32);
+                    // rescale only when a row max grew
+                    if(__builtin_amdgcn_ballot_w32(m_new > m_run[i]) != 0)
+                    {
+                        const float alpha = exp2(m_run[i] - m_use);
+                        l_run[i] *= alpha;
+                        for(index_t db = 0; db < kAcc; ++db)
+                            acc[i][db] *= alpha;
+                    }
+                    l_run[i] += ps;
+                    m_run[i] = m_new;
+                    pf[i]    = v8i{pk[0], pk[1], pk[2], pk[3], pk[4], pk[5], pk[6], pk[7]};
                 }
-                l_run += ps;
-                m_run = m_new;
-                const v8i pf{pk[0], pk[1], pk[2], pk[3], pk[4], pk[5], pk[6], pk[7]};
                 for(index_t db = 0; db < kAcc; ++db)
                 {
                     v8i vf;
@@ -876,8 +1005,10 @@ struct FmhaDecodePaged5dKernel
                         const v4i y       = *ptr_as<v4i>(&sm.kv.v[st][w][2 * h + 1][off]);
                         vf                = v8i{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
                     }
-                    acc[db] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
-                        vf, pf, 0, acc[db], false, false);
+#pragma unroll
+                    for(index_t i = 0; i < kMTiles; ++i)
+                        acc[i][db] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
+                            vf, pf[i], 0, acc[i][db], false, false);
                 }
                 // this wave is done with stage st: it takes step t + kStages
                 if(t + kStages < steps)
@@ -897,15 +1028,19 @@ struct FmhaDecodePaged5dKernel
             {
                 const index_t st = t % kStages;
                 const index_t pg = pg0 + page_idx(t, 0);
-                float sv[8];
+                float sv[kMTiles][8];
                 if(inside(pg, 1))
                     qk_tile(st, 0, n, pg, h * 8, sv, bool_constant<false>{});
                 else
                     qk_tile(st, 0, n, pg, h * 8, sv, bool_constant<true>{});
-                float mx = tree_max<8>(sv);
-                mx       = fmaxf(mx, __shfl_xor(mx, 16, 32)) * scl;
-                if(h == 0)
-                    sm.red[0][w][n] = mx;
+#pragma unroll
+                for(index_t i = 0; i < kMTiles; ++i)
+                {
+                    float mx = tree_max<8>(sv[i]);
+                    mx       = fmaxf(mx, __shfl_xor(mx, 16, 32)) * scl[i];
+                    if(h == 0)
+                        sm.red[0][w][i * kRows + n] = mx;
+                }
                 __syncthreads();
                 // every wave is past step t-1's PV: its stage takes step t + 2
                 if(t >= 1 && t + 2 < steps)
@@ -914,38 +1049,49 @@ struct FmhaDecodePaged5dKernel
                     issue(t + 2);
                     ++issued;
                 }
-                float m_step = sm.red[0][0][n];
-                for(index_t i = 1; i < kNumWaves; ++i)
-                    m_step = fmaxf(m_step, sm.red[0][i][n]);
-                const float m_new = fmaxf(m_run, m_step);
-                const float m_use = is_neg_inf(m_new) ? 0.f : m_new;
-                const float c     = kLog2P - m_use;
-                float pv[8];
-                for(index_t r = 0; r < 8; ++r)
-                    pv[r] = exp2(fmaf(sv[r], scl, c));
-                float ps   = tree_sum<8>(pv);
-                ps         = ps + __shfl_xor(ps, 16, 32);
-                int32_t p0 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[0], pv[1], 0, false);
-                p0         = __builtin_amdgcn_cvt_pk_fp8_f32(pv[2], pv[3], p0, true);
-                int32_t p1 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[4], pv[5], 0, false);
-                p1         = __builtin_amdgcn_cvt_pk_fp8_f32(pv[6], pv[7], p1, true);
-                *ptr_as<int2>(&sm.p[n][w * kPage + h * 8]) = make_int2(p0, p1);
-                if(h == 0)
-                    sm.red[1][w][n] = ps;
+                float m_new[kMTiles], m_use[kMTiles];
+#pragma unroll
+                for(index_t i = 0; i < kMTiles; ++i)
+                {
+                    float m_step = sm.red[0][0][i * kRows + n];
+                    for(index_t k = 1; k < kNumWaves; ++k)
+                        m_step = fmaxf(m_step, sm.red[0][k][i * kRows + n]);
+                    m_new[i]      = fmaxf(m_run[i], m_step);
+                    m_use[i]      = is_neg_inf(m_new[i]) ? 0.f : m_new[i];
+                    const float c = kLog2P - m_use[i];
+                    float pv[8];
+                    for(index_t r = 0; r < 8; ++r)
+                        pv[r] = exp2(fmaf(sv[i][r], scl[i], c));
+                    float ps   = tree_sum<8>(pv);
+                    ps         = ps + __shfl_xor(ps, 16, 32);
+                    int32_t p0 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[0], pv[1], 0, false);
+                    p0         = __builtin_amdgcn_cvt_pk_fp8_f32(pv[2], pv[3], p0, true);
+                    int32_t p1 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[4], pv[5], 0, false);
+                    p1         = __builtin_amdgcn_cvt_pk_fp8_f32(pv[6], pv[7], p1, true);
+                    *ptr_as<int2>(&sm.p[i][n][w * kPage + h * 8]) = make_int2(p0, p1);
+                    if(h == 0)
+                        sm.red[1][w][i * kRows + n] = ps;
+                }
                 if(t + 1 < steps)
                     land(t + 1);
                 __syncthreads();
-                float psum = 0.f;
-                for(index_t i = 0; i < kNumWaves; ++i)
-                    psum += sm.red[1][i][n];
-                const float alpha = exp2(m_run - m_use);
-                l_run             = l_run * alpha + psum;
-                m_run             = m_new;
-                // O^T += V^T P^T for head-dim blocks w and w + 4; tokens of pages h and h + 2 on
-                // both operands
-                const v4i px = *ptr_as<v4i>(&sm.p[n][h * kPage]);
-                const v4i py = *ptr_as<v4i>(&sm.p[n][(h + 2) * kPage]);
-                const v8i pf{px[0], px[1], px[2], px[3], py[0], py[1], py[2], py[3]};
+                float alpha[kMTiles];
+                v8i pf[kMTiles];
+#pragma unroll
+                for(index_t i = 0; i < kMTiles; ++i)
+                {
+                    float psum = 0.f;
+                    for(index_t k = 0; k < kNumWaves; ++k)
+                        psum += sm.red[1][k][i * kRows + n];
+                    alpha[i] = exp2(m_run[i] - m_use[i]);
+                    l_run[i] = l_run[i] * alpha[i] + psum;
+                    m_run[i] = m_new[i];
+                    // tokens of pages h and h + 2 on both operands
+                    const v4i px = *ptr_as<v4i>(&sm.p[i][n][h * kPage]);
+                    const v4i py = *ptr_as<v4i>(&sm.p[i][n][(h + 2) * kPage]);
+                    pf[i]        = v8i{px[0], px[1], px[2], px[3], py[0], py[1], py[2], py[3]};
+                }
+                // O^T += V^T P^T for head-dim blocks w, w + 4, ...
                 for(index_t bk = 0; bk < kAcc; ++bk)
                 {
                     const index_t d0 = (bk * kNumWaves + w) * 16;
@@ -963,161 +1109,175 @@ struct FmhaDecodePaged5dKernel
                         const v4i y = *ptr_as<v4i>(&sm.v[st][h + 2][(d0 + n) * 16]);
                         vf          = v8i{x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3]};
                     }
-                    acc[bk] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
-                        vf, pf, 0, acc[bk] * alpha, false, false);
+#pragma unroll
+                    for(index_t i = 0; i < kMTiles; ++i)
+                        acc[i][bk] = __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8(
+                            vf, pf[i], 0, acc[i][bk] * alpha[i], false, false);
                 }
             }
         }
 
-        // this split's result in registers of thread (row, 16 or 2 head dims): o[], m_row, l_row
-        index_t row;
-        index_t d0;
-        // wave split: 8 threads per row, kHdim / 8 head dims each
-        float o[kHdim / 8];
-        float m_row, l_row;
-        if constexpr(kWaveSplit)
-        {
-            // merge the waves; lane (n, h) holds O[row n][d = db*16 + h*8 + r]
-            if(h == 0)
-            {
-                sm.ml[0][w][n] = m_run;
-                sm.ml[1][w][n] = l_run;
-            }
-            __syncthreads(); // also: every wave is done with the stages the merge buffer reuses
-            float M = -numeric<float>::infinity();
-            for(index_t i = 0; i < kNumWaves; ++i)
-                M = fmaxf(M, sm.ml[0][i][n]);
-            const float f = exp2(m_run - (is_neg_inf(M) ? 0.f : M));
-            for(index_t db = 0; db < kAcc; ++db)
-            {
-                const v8f x = acc[db] * f;
-                float4* dst = ptr_as<float4>(&sm.o[w][n][db * 16 + h * 8]);
-                dst[0]      = make_float4(x[0], x[1], x[2], x[3]);
-                dst[1]      = make_float4(x[4], x[5], x[6], x[7]);
-            }
-            __syncthreads();
-            row   = threadIdx.x / 8;
-            d0    = (threadIdx.x % 8) * (kHdim / 8);
-            m_row = -numeric<float>::infinity();
-            for(index_t i = 0; i < kNumWaves; ++i)
-                m_row = fmaxf(m_row, sm.ml[0][i][row]);
-            const float mu = is_neg_inf(m_row) ? 0.f : m_row;
-            l_row          = 0.f;
-            for(index_t i = 0; i < kNumWaves; ++i)
-                l_row += sm.ml[1][i][row] * exp2(sm.ml[0][i][row] - mu);
-            for(index_t e = 0; e < kHdim / 8; ++e)
-                o[e] = 0.f;
-            for(index_t i = 0; i < kNumWaves; ++i)
-                for(index_t e4 = 0; e4 < kHdim / 32; ++e4)
-                {
-                    const float4 x = *ptr_as<float4>(&sm.o[i][row][d0 + 4 * e4]);
-                    o[4 * e4] += x.x;
-                    o[4 * e4 + 1] += x.y;
-                    o[4 * e4 + 2] += x.z;
-                    o[4 * e4 + 3] += x.w;
-                }
-        }
-        else
-        {
-            row   = n;
-            m_row = m_run;
-            l_row = l_run;
-            d0    = 0; // unused: the lane holds d = (bk*4 + w)*16 + h*8 + r
-        }
-
+        // (batch, kv head, row block) of this workgroup, and its partials of this group
+        const long_index_t head =
+            (static_cast<long_index_t>(b) * a.nhead_k + g) * a.row_blocks + rb;
+        const long_index_t part0 =
+            ((head * (kGroups ? a.num_groups : 1) + gi) * kNumSplits) * kMRows;
         // O in the output type; partials stay bf16
         const auto pack_out = [&](float x, float y) {
             return kQoFp16 ? pack_fp16(x, y) : pack_bf16(x, y);
         };
-        const auto store_rows = [&](uint16_t* base_ptr, float f, auto pack) {
-            // base_ptr points at row 0 of this (batch, kv head) block, rows hdim apart
+        const auto pack_part = [](float x, float y) { return pack_bf16(x, y); };
+
+#pragma unroll
+        for(index_t i = 0; i < kMTiles; ++i)
+        {
+            // tile i's result in registers of thread (row, kHdim / 8 or 16-wide blocks of head
+            // dims): o[] (wave split) or acc[i], m_row, l_row; stored as O / l. The tile loops
+            // are unrolled: acc[i] with a variable i would live in scratch.
+            index_t row;
+            index_t d0;
+            // wave split: 8 threads per row, kHdim / 8 head dims each
+            [[maybe_unused]] float o[kWaveSplit ? kHdim / 8 : 1];
+            float m_row, l_row;
             if constexpr(kWaveSplit)
             {
-                uint32_t pk[kHdim / 16];
-                for(index_t e = 0; e < kHdim / 16; ++e)
-                    pk[e] = pack(o[2 * e] * f, o[2 * e + 1] * f);
-                v4i* dst = ptr_as<v4i>(base_ptr + row * kHdim + d0);
-                for(index_t e = 0; e < kHdim / 64; ++e)
-                    dst[e] = v4i{int32_t(pk[4 * e]),
-                                 int32_t(pk[4 * e + 1]),
-                                 int32_t(pk[4 * e + 2]),
-                                 int32_t(pk[4 * e + 3])};
+                // merge the waves; lane (n, h) holds O[row n][d = db*16 + h*8 + r]
+                if(i > 0)
+                    __syncthreads(); // the previous tile's merge reads are done
+                if(h == 0)
+                {
+                    sm.ml[0][w][n] = m_run[i];
+                    sm.ml[1][w][n] = l_run[i];
+                }
+                __syncthreads(); // also: every wave is done with the stages the merge buffer reuses
+                float M = -numeric<float>::infinity();
+                for(index_t k = 0; k < kNumWaves; ++k)
+                    M = fmaxf(M, sm.ml[0][k][n]);
+                const float f = exp2(m_run[i] - (is_neg_inf(M) ? 0.f : M));
+                for(index_t db = 0; db < kAcc; ++db)
+                {
+                    const v8f x = acc[i][db] * f;
+                    float4* dst = ptr_as<float4>(&sm.o[w][n][db * 16 + h * 8]);
+                    dst[0]      = make_float4(x[0], x[1], x[2], x[3]);
+                    dst[1]      = make_float4(x[4], x[5], x[6], x[7]);
+                }
+                __syncthreads();
+                row   = threadIdx.x / 8;
+                d0    = (threadIdx.x % 8) * (kHdim / 8);
+                m_row = -numeric<float>::infinity();
+                for(index_t k = 0; k < kNumWaves; ++k)
+                    m_row = fmaxf(m_row, sm.ml[0][k][row]);
+                const float mu = is_neg_inf(m_row) ? 0.f : m_row;
+                l_row          = 0.f;
+                for(index_t k = 0; k < kNumWaves; ++k)
+                    l_row += sm.ml[1][k][row] * exp2(sm.ml[0][k][row] - mu);
+                for(index_t e = 0; e < kHdim / 8; ++e)
+                    o[e] = 0.f;
+                for(index_t k = 0; k < kNumWaves; ++k)
+                    for(index_t e4 = 0; e4 < kHdim / 32; ++e4)
+                    {
+                        const float4 x = *ptr_as<float4>(&sm.o[k][row][d0 + 4 * e4]);
+                        o[4 * e4] += x.x;
+                        o[4 * e4 + 1] += x.y;
+                        o[4 * e4 + 2] += x.z;
+                        o[4 * e4 + 3] += x.w;
+                    }
             }
             else
             {
-                for(index_t bk = 0; bk < kAcc; ++bk)
-                {
-                    uint32_t pk[4];
-                    for(index_t e = 0; e < 4; ++e)
-                        pk[e] = pack(acc[bk][2 * e] * f, acc[bk][2 * e + 1] * f);
-                    *ptr_as<v4i>(base_ptr + row * kHdim + (bk * kNumWaves + w) * 16 + h * 8) =
-                        v4i{int32_t(pk[0]), int32_t(pk[1]), int32_t(pk[2]), int32_t(pk[3])};
-                }
+                row   = n;
+                m_row = m_run[i];
+                l_row = l_run[i];
+                d0    = 0; // unused: the lane holds d = (bk*4 + w)*16 + h*8 + r
             }
-        };
-        const bool row_ok = row < gqa;
-
-        if constexpr(kNumSplits == 1)
-        {
-            if(row_ok)
-                store_rows(a.o + (static_cast<long_index_t>(b) * a.nhead_q + g * gqa) * kHdim,
-                           l_row > 0.f ? vd / l_row : 0.f,
-                           pack_out);
-            return;
+            // row_ptr: this thread's row, hdim elements
+            const auto store_row = [&](uint16_t* row_ptr, float f, auto pack) {
+                if constexpr(kWaveSplit)
+                {
+                    uint32_t pk[kHdim / 16];
+                    for(index_t e = 0; e < kHdim / 16; ++e)
+                        pk[e] = pack(o[2 * e] * f, o[2 * e + 1] * f);
+                    v4i* dst = ptr_as<v4i>(row_ptr + d0);
+                    for(index_t e = 0; e < kHdim / 64; ++e)
+                        dst[e] = v4i{int32_t(pk[4 * e]),
+                                     int32_t(pk[4 * e + 1]),
+                                     int32_t(pk[4 * e + 2]),
+                                     int32_t(pk[4 * e + 3])};
+                }
+                else
+                {
+                    for(index_t bk = 0; bk < kAcc; ++bk)
+                    {
+                        uint32_t pk[4];
+                        for(index_t e = 0; e < 4; ++e)
+                            pk[e] = pack(acc[i][bk][2 * e] * f, acc[i][bk][2 * e + 1] * f);
+                        *ptr_as<v4i>(row_ptr + (bk * kNumWaves + w) * 16 + h * 8) =
+                            v4i{int32_t(pk[0]), int32_t(pk[1]), int32_t(pk[2]), int32_t(pk[3])};
+                    }
+                }
+            };
+            const index_t lr = i * kRows + row; // row within the block
+            if constexpr(kNumSplits == 1)
+            {
+                const index_t r = rb * kMRows + lr;
+                if(r < a.rows)
+                    store_row(
+                        a.o + RowOffset(a, b, g, r), l_row > 0.f ? vd / l_row : 0.f, pack_out);
+            }
+            else
+            {
+                store_row(a.ws_o + (part0 + s * kMRows + lr) * kHdim,
+                          l_row > 0.f ? 1.f / l_row : 0.f,
+                          pack_part);
+                const bool ml_writer = kWaveSplit ? (threadIdx.x % 8 == 0) : (w == 0 && h == 0);
+                if(ml_writer)
+                    *ptr_as<float2>(a.ws_ml + (part0 + s * kMRows + lr) * 2) =
+                        make_float2(m_row, l_row);
+            }
         }
-        else
+
+        if constexpr(kNumSplits > 1)
         {
-            const long_index_t head = static_cast<long_index_t>(b) * a.nhead_k + g;
-            const long_index_t part0 =
-                ((head * (kGroups ? a.num_groups : 1) + gi) * kNumSplits) * kRows;
-            store_rows(a.ws_o + (part0 + s * kRows) * kHdim,
-                       l_row > 0.f ? 1.f / l_row : 0.f,
-                       [](float x, float y) { return pack_bf16(x, y); });
-            const bool ml_writer = kWaveSplit ? (threadIdx.x % 8 == 0) : (w == 0 && h == 0);
-            if(ml_writer)
-                *ptr_as<float2>(a.ws_ml + (part0 + s * kRows + row) * 2) =
-                    make_float2(m_row, l_row);
             asm volatile("s_wait_storecnt 0x0" ::: "memory");
             __builtin_amdgcn_s_cluster_barrier();
             asm volatile("global_inv scope:SCOPE_SE" ::: "memory");
 
             // merge the splits: split s takes rows [s*kRowsPer, +kRowsPer); thread -> (row, 2 dims)
-            constexpr index_t kRowsPer = (kRows + kNumSplits - 1) / kNumSplits;
+            constexpr index_t kRowsPer = (kMRows + kNumSplits - 1) / kNumSplits;
             for(index_t rr = threadIdx.x / kMergeTpr; rr < kRowsPer; rr += kBlockSize / kMergeTpr)
             {
                 const index_t mrow = s * kRowsPer + rr;
-                if(mrow >= gqa)
+                if(mrow >= kMRows || rb * kMRows + mrow >= a.rows)
                     break;
                 const index_t d2 = (threadIdx.x % kMergeTpr) * 2;
                 float2 mlv[kNumSplits];
                 uint32_t oi[kNumSplits];
-                for(index_t i = 0; i < kNumSplits; ++i)
+                for(index_t k = 0; k < kNumSplits; ++k)
                 {
-                    mlv[i] = *ptr_as<float2>(a.ws_ml + (part0 + i * kRows + mrow) * 2);
-                    oi[i]  = *ptr_as<uint32_t>(a.ws_o + (part0 + i * kRows + mrow) * kHdim + d2);
+                    mlv[k] = *ptr_as<float2>(a.ws_ml + (part0 + k * kMRows + mrow) * 2);
+                    oi[k]  = *ptr_as<uint32_t>(a.ws_o + (part0 + k * kMRows + mrow) * kHdim + d2);
                 }
                 float mm = -numeric<float>::infinity();
-                for(index_t i = 0; i < kNumSplits; ++i)
-                    mm = fmaxf(mm, mlv[i].x);
+                for(index_t k = 0; k < kNumSplits; ++k)
+                    mm = fmaxf(mm, mlv[k].x);
                 float ll = 0.f, o0 = 0.f, o1 = 0.f;
-                for(index_t i = 0; i < kNumSplits; ++i)
+                for(index_t k = 0; k < kNumSplits; ++k)
                 {
-                    const float wgt = mlv[i].y > 0.f ? mlv[i].y * exp2(mlv[i].x - mm) : 0.f;
+                    const float wgt = mlv[k].y > 0.f ? mlv[k].y * exp2(mlv[k].x - mm) : 0.f;
                     ll += wgt;
-                    o0 += wgt * bf16_to_f32(oi[i] & 0xffff);
-                    o1 += wgt * bf16_to_f32(oi[i] >> 16);
+                    o0 += wgt * bf16_to_f32(oi[k] & 0xffff);
+                    o1 += wgt * bf16_to_f32(oi[k] >> 16);
                 }
                 if constexpr(!kGroups)
                 {
                     const float f = ll > 0.f ? vd / ll : 0.f;
-                    *ptr_as<uint32_t>(
-                        a.o + (static_cast<long_index_t>(b) * a.nhead_q + g * gqa + mrow) * kHdim +
-                        d2) = pack_out(o0 * f, o1 * f);
+                    *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, rb * kMRows + mrow) + d2) =
+                        pack_out(o0 * f, o1 * f);
                 }
                 else
                 {
                     // this group's rows: O / L and (M, L), at device scope for the other groups
-                    const long_index_t grow = (head * a.num_groups + gi) * kRows + mrow;
+                    const long_index_t grow = (head * a.num_groups + gi) * kMRows + mrow;
                     const float f           = ll > 0.f ? 1.f / ll : 0.f;
                     __scoped_atomic_store_n(ptr_as<uint32_t>(a.gws_o + grow * kHdim + d2),
                                             pack_bf16(o0 * f, o1 * f),
@@ -1137,7 +1297,7 @@ struct FmhaDecodePaged5dKernel
                 }
             }
             if constexpr(kGroups)
-                MergeGroups(a, head, b, g, gqa, s, (span - 1) / (kNumSplits * pps) + 1, vd);
+                MergeGroups(a, head, b, g, rb, s, (span - 1) / (kNumSplits * pps) + 1, vd);
         }
     }
 
@@ -1148,12 +1308,12 @@ struct FmhaDecodePaged5dKernel
                                     long_index_t head,
                                     index_t b,
                                     index_t g,
-                                    index_t gqa,
+                                    index_t rb,
                                     index_t s,
                                     index_t groups,
                                     float vd) const
     {
-        constexpr index_t kRowsPer = (kRows + kNumSplits - 1) / kNumSplits;
+        constexpr index_t kRowsPer = (kMRows + kNumSplits - 1) / kNumSplits;
         __shared__ int32_t last;
         asm volatile("s_wait_storecnt 0x0" ::: "memory");
         __syncthreads();
@@ -1173,14 +1333,14 @@ struct FmhaDecodePaged5dKernel
         for(index_t rr = threadIdx.x / kMergeTpr; rr < kRowsPer; rr += kBlockSize / kMergeTpr)
         {
             const index_t mrow = s * kRowsPer + rr;
-            if(mrow >= gqa)
+            if(mrow >= kMRows || rb * kMRows + mrow >= a.rows)
                 break;
             const index_t d2 = (threadIdx.x % kMergeTpr) * 2;
             float mm = -numeric<float>::infinity(), ll = 0.f, o0 = 0.f, o1 = 0.f;
             // kChunk groups per round of loads; the device-scope buffer loads of a round go out
             // together (atomic loads would be issued one round trip at a time)
             constexpr index_t kChunk = 8;
-            const long_index_t row0  = head * a.num_groups * kRows + mrow;
+            const long_index_t row0  = head * a.num_groups * kMRows + mrow;
             const auto ml_res        = make_wave_buffer_resource(a.gws_ml, 0x7ffffffe);
             const auto o_res         = make_wave_buffer_resource(a.gws_o, 0x7ffffffe);
             for(index_t i0 = 0; i0 < groups; i0 += kChunk)
@@ -1189,7 +1349,7 @@ struct FmhaDecodePaged5dKernel
                 uint32_t oi[kChunk];
                 for(index_t j = 0; j < kChunk; ++j)
                 {
-                    const long_index_t grow = row0 + min(i0 + j, groups - 1) * kRows;
+                    const long_index_t grow = row0 + min(i0 + j, groups - 1) * kMRows;
                     const auto ml2 =
                         amd_buffer_load_impl<float, 2, amd_buffer_coherence_enum::DEVICE>(
                             ml_res, static_cast<index_t>(grow * 2 * sizeof(float)), 0);
@@ -1213,8 +1373,7 @@ struct FmhaDecodePaged5dKernel
                 }
             }
             const float f = ll > 0.f ? vd / ll : 0.f;
-            *ptr_as<uint32_t>(
-                a.o + (static_cast<long_index_t>(b) * a.nhead_q + g * gqa + mrow) * kHdim + d2) =
+            *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, rb * kMRows + mrow) + d2) =
                 kQoFp16 ? pack_fp16(o0 * f, o1 * f) : pack_bf16(o0 * f, o1 * f);
         }
     }

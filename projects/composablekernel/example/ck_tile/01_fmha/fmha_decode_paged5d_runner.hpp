@@ -33,7 +33,8 @@ template <bool kWaveSplit,
           index_t kPageSize,
           bool kQoFp16,
           Layout kLayout,
-          index_t kHdim>
+          index_t kHdim,
+          index_t kMTiles>
 hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t stream)
 {
     using K    = ck_tile::FmhaDecodePaged5dKernel<kWaveSplit,
@@ -42,10 +43,11 @@ hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t s
                                                   kPageSize,
                                                   kQoFp16,
                                                   kLayout,
-                                                  kHdim>;
+                                                  kHdim,
+                                                  kMTiles>;
     auto kargs = K::MakeKargs(h);
     hipLaunchConfig_t cfg{};
-    cfg.gridDim  = K::GridSize(h.batch, h.nhead_k, h.num_groups);
+    cfg.gridDim  = K::GridSize(h);
     cfg.blockDim = K::BlockSize();
     cfg.stream   = stream;
     // must match the cluster_dims of the entry
@@ -65,6 +67,7 @@ template <bool kWaveSplit,
           bool kQoFp16,
           Layout kLayout,
           index_t kHdim,
+          index_t kMTiles,
           index_t... Ns>
 hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                     index_t splits,
@@ -80,42 +83,47 @@ hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                            kPageSize,
                            kQoFp16,
                            kLayout,
-                           kHdim>(h, stream);
+                           kHdim,
+                           kMTiles>(h, stream);
     };
     (try_one(ck_tile::number<Ns + 1>{}), ...);
     return e;
 }
 
-template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim>
+template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim, index_t kMTiles>
 hipError_t launch_page(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                        const ck_tile::FmhaDecodePaged5dConfig& c,
                        hipStream_t stream)
 {
     const auto seq = std::make_integer_sequence<index_t, 15>{};
-    if(c.num_groups > 1)
-        return c.wave_split ? dispatch<true, true, kPageSize, kQoFp16, kLayout, kHdim>(
+    if(c.wave_split)
+        return c.num_groups > 1
+                   ? dispatch<true, true, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
+                         h, c.num_splits, stream, seq)
+                   : dispatch<true, false, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
+                         h, c.num_splits, stream, seq);
+    return c.num_groups > 1 ? dispatch<false, true, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
                                   h, c.num_splits, stream, seq)
-                            : dispatch<false, true, kPageSize, kQoFp16, kLayout, kHdim>(
+                            : dispatch<false, false, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
                                   h, c.num_splits, stream, seq);
-    return c.wave_split ? dispatch<true, false, kPageSize, kQoFp16, kLayout, kHdim>(
-                              h, c.num_splits, stream, seq)
-                        : dispatch<false, false, kPageSize, kQoFp16, kLayout, kHdim>(
-                              h, c.num_splits, stream, seq);
 }
 
 // launch_page is instantiated in the translation units of fmha_decode_paged5d_instances.cmake
-#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout, hdim) \
-    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout, hdim>(   \
-        const ck_tile::FmhaDecodePaged5dHostArgs&,                             \
-        const ck_tile::FmhaDecodePaged5dConfig&,                               \
+#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout, hdim, m_tiles) \
+    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout, hdim, m_tiles>(   \
+        const ck_tile::FmhaDecodePaged5dHostArgs&,                                      \
+        const ck_tile::FmhaDecodePaged5dConfig&,                                        \
         hipStream_t);
-#define FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, hdim)                       \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, false, layout, hdim)  \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 16, true, layout, hdim)   \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, false, layout, hdim)  \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 64, true, layout, hdim)   \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, false, layout, hdim) \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, 128, true, layout, hdim)
+#define FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, m_tiles)                    \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, page_size, false, layout, hdim, m_tiles) \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, page_size, true, layout, hdim, m_tiles)
+#define FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, page_size) \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 1)  \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 2)
+#define FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, hdim) \
+    FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, 16)   \
+    FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, 64)   \
+    FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, 128)
 #define FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(layout) \
     FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, 64)   \
     FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, 128)  \
@@ -125,6 +133,21 @@ FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(hnd)
 FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(nhd)
 #undef FMHA_DECODE_PAGED5D_EXTERN_LAYOUT
 #undef FMHA_DECODE_PAGED5D_EXTERN_PAGE
+#undef FMHA_DECODE_PAGED5D_EXTERN_MT
+#undef FMHA_DECODE_PAGED5D_EXTERN_QO
+
+template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim>
+hipError_t launch_mt(const ck_tile::FmhaDecodePaged5dHostArgs& h,
+                     const ck_tile::FmhaDecodePaged5dConfig& c,
+                     hipStream_t stream)
+{
+    switch(c.m_tiles)
+    {
+    case 1: return launch_page<kPageSize, kQoFp16, kLayout, kHdim, 1>(h, c, stream);
+    case 2: return launch_page<kPageSize, kQoFp16, kLayout, kHdim, 2>(h, c, stream);
+    default: return hipErrorInvalidValue;
+    }
+}
 
 template <bool kQoFp16, Layout kLayout, index_t kHdim>
 hipError_t launch_hdim(const ck_tile::FmhaDecodePaged5dHostArgs& h,
@@ -133,9 +156,9 @@ hipError_t launch_hdim(const ck_tile::FmhaDecodePaged5dHostArgs& h,
 {
     switch(h.page_size)
     {
-    case 16: return launch_page<16, kQoFp16, kLayout, kHdim>(h, c, stream);
-    case 64: return launch_page<64, kQoFp16, kLayout, kHdim>(h, c, stream);
-    case 128: return launch_page<128, kQoFp16, kLayout, kHdim>(h, c, stream);
+    case 16: return launch_mt<16, kQoFp16, kLayout, kHdim>(h, c, stream);
+    case 64: return launch_mt<64, kQoFp16, kLayout, kHdim>(h, c, stream);
+    case 128: return launch_mt<128, kQoFp16, kLayout, kHdim>(h, c, stream);
     default: return hipErrorInvalidValue;
     }
 }
@@ -160,6 +183,9 @@ inline hipError_t launch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
 {
     // larger cache pages need whole 4-page groups per split (see FmhaDecodePaged5dKernel::Run)
     if(h.page_size != 16 && c.pages_per_split % 4 != 0)
+        return hipErrorInvalidValue;
+    // the row blocks of c must cover the query rows
+    if(h.qlen < 1 || c.row_blocks * c.m_tiles * 16 < h.nhead_q / h.nhead_k * h.qlen)
         return hipErrorInvalidValue;
     const auto with_layout = [&](auto layout) {
         constexpr Layout kLayout = decltype(layout)::value;
@@ -204,6 +230,8 @@ struct Case
     bool fp16               = false;     // fp16 Q and output instead of bf16
     Layout kv_layout        = Layout::shuffle_5d;
     index_t hdim            = 128; // 64, 128 or 256
+    index_t qlen            = 1;   // query tokens per sequence (MTP)
+    index_t m_tiles         = 0;   // 16-row tiles per workgroup: 1 or 2; 0 = heuristic
     unsigned seed           = 1;
 };
 
@@ -229,11 +257,13 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         seqlens[b] = c.seqlen_k[std::min<size_t>(b, c.seqlen_k.size() - 1)];
     const index_t max_seqlen =
         std::max(c.max_seqlen_k, *std::max_element(seqlens.begin(), seqlens.end()));
-    if(c.nhead % c.nhead_k != 0 || c.nhead / c.nhead_k > 16)
+    if(c.nhead % c.nhead_k != 0 || c.qlen < 1)
     {
-        res.error = "h / h_k must be an integer <= 16";
+        res.error = "h must be a multiple of h_k, q_len at least 1";
         return res;
     }
+    const index_t gqa  = c.nhead / c.nhead_k;
+    const index_t qlen = c.qlen;
 
     const index_t ps = c.page_size;
     if(ps != 16 && ps != 64 && ps != 128)
@@ -241,12 +271,12 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         res.error = "page_size must be 16, 64 or 128";
         return res;
     }
-    auto cfg =
-        ck_tile::fmha_decode_paged5d_config(batch, c.nhead_k, max_seqlen, c.window, ps, c.hdim);
+    auto cfg = ck_tile::fmha_decode_paged5d_config(
+        batch, c.nhead_k, max_seqlen, c.window, ps, c.hdim, gqa * qlen, qlen, c.m_tiles);
     if(c.layout == "coop" || c.layout == "wave")
         cfg.wave_split = c.layout == "wave";
     const index_t lo_align = ps > kPage ? 4 : 1;
-    const index_t span     = ck_tile::fmha_decode_paged5d_max_span(max_seqlen, c.window, ps);
+    const index_t span     = ck_tile::fmha_decode_paged5d_max_span(max_seqlen, c.window, ps, qlen);
     if(c.pages_per_split > 0)
         cfg.pages_per_split = c.pages_per_split;
     if(c.splits > 0)
@@ -284,7 +314,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         return blk_head * page_bytes + (is_v ? (tok / 16) * kHdim * 16 + d * 16 + tok % 16
                                              : (d / 16) * ps * 16 + tok * 16 + d % 16);
     };
-    std::vector<uint16_t> q(static_cast<size_t>(batch) * c.nhead * kHdim);
+    // [batch][qlen][nhead][hdim]
+    std::vector<uint16_t> q(static_cast<size_t>(batch) * qlen * c.nhead * kHdim);
     for(auto& x : q)
         x = c.fp16 ? ck_tile::bit_cast<uint16_t>(
                          ck_tile::type_convert<ck_tile::fp16_t>(2.f * uni(rng)))
@@ -334,9 +365,15 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     ck_tile::DeviceMem q_buf(q.size() * 2), k_buf(k.size()), v_buf(v.size());
     ck_tile::DeviceMem bt_buf(block_table.size() * 4), sl_buf(seqlens32.size() * 4);
     ck_tile::DeviceMem o_buf(q.size() * 2), scale_buf(8);
-    ck_tile::DeviceMem ws_buf(ck_tile::fmha_decode_paged5d_workspace_bytes(
-        batch, c.nhead_k, cfg.num_splits, cfg.num_groups, kHdim));
-    ck_tile::DeviceMem cnt_buf(ck_tile::fmha_decode_paged5d_num_counters(batch, c.nhead_k) * 4);
+    ck_tile::DeviceMem ws_buf(
+        ck_tile::fmha_decode_paged5d_workspace_bytes(batch,
+                                                     c.nhead_k,
+                                                     cfg.num_splits,
+                                                     cfg.num_groups,
+                                                     kHdim,
+                                                     cfg.row_blocks * cfg.m_tiles * 16));
+    ck_tile::DeviceMem cnt_buf(
+        ck_tile::fmha_decode_paged5d_num_counters(batch, c.nhead_k, cfg.row_blocks) * 4);
     HIP_CHECK_ERROR(hipMemset(ws_buf.GetDeviceBuffer(), 0xff, ws_buf.GetBufferSize()));
     cnt_buf.SetZero();
     q_buf.ToDevice(q.data());
@@ -369,7 +406,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         scale_s,
         c.fp16,
         c.kv_layout,
-        kHdim};
+        kHdim,
+        qlen};
 
     hipStream_t stream;
     HIP_CHECK_ERROR(hipDeviceSynchronize()); // the fills above, before a non-blocking stream
@@ -381,51 +419,50 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     {
         std::vector<uint16_t> out(q.size());
         o_buf.FromDevice(out.data());
-        const index_t gqa = c.nhead / c.nhead_k;
         double dot = 0, nr = 0, ng = 0;
         for(index_t b = 0; b < batch; ++b)
-        {
-            const index_t sk = seqlens[b];
-            const index_t lo = c.window > 0 ? std::max(0, sk - c.window) : 0;
-            for(index_t hq = 0; hq < c.nhead; ++hq)
-            {
-                const index_t hk = hq / gqa;
-                const auto at    = [&](index_t t, index_t d, bool is_v) {
-                    return addr(block_table[b * max_blocks + t / ps], hk, t % ps, d, is_v);
-                };
-                std::vector<double> sc(std::max(0, sk - lo));
-                double mx = -1e300;
-                for(index_t t = lo; t < sk; ++t)
+            for(index_t qi = 0; qi < qlen; ++qi)
+                for(index_t hq = 0; hq < c.nhead; ++hq)
                 {
-                    double acc = 0;
+                    // query token qi is the context's (qlen - qi)-th last
+                    const index_t sk  = std::max(seqlens[b] - qlen + 1 + qi, 0);
+                    const index_t lo  = c.window > 0 ? std::max(0, sk - c.window) : 0;
+                    const size_t qrow = (static_cast<size_t>(b) * qlen + qi) * c.nhead + hq;
+                    const index_t hk  = hq / gqa;
+                    const auto at     = [&](index_t t, index_t d, bool is_v) {
+                        return addr(block_table[b * max_blocks + t / ps], hk, t % ps, d, is_v);
+                    };
+                    std::vector<double> sc(std::max(0, sk - lo));
+                    double mx = -1e300;
+                    for(index_t t = lo; t < sk; ++t)
+                    {
+                        double acc = 0;
+                        for(index_t d = 0; d < kHdim; ++d)
+                            acc +=
+                                qo_to_float(q[qrow * kHdim + d]) * fp8_to_float(k[at(t, d, false)]);
+                        sc[t - lo] = acc * k_descale * scale_s;
+                        mx         = std::max(mx, sc[t - lo]);
+                    }
+                    double l = 0;
+                    std::vector<double> o(kHdim, 0.0);
+                    for(index_t t = lo; t < sk; ++t)
+                    {
+                        const double p = std::exp(sc[t - lo] - mx);
+                        l += p;
+                        for(index_t d = 0; d < kHdim; ++d)
+                            o[d] += p * fp8_to_float(v[at(t, d, true)]);
+                    }
                     for(index_t d = 0; d < kHdim; ++d)
-                        acc += qo_to_float(q[(static_cast<size_t>(b) * c.nhead + hq) * kHdim + d]) *
-                               fp8_to_float(k[at(t, d, false)]);
-                    sc[t - lo] = acc * k_descale * scale_s;
-                    mx         = std::max(mx, sc[t - lo]);
+                    {
+                        const double ref = l > 0 ? o[d] / l * v_descale : 0.0;
+                        const double got = qo_to_float(out[qrow * kHdim + d]);
+                        res.max_err      = std::max(res.max_err, std::fabs(ref - got));
+                        res.max_ref      = std::max(res.max_ref, std::fabs(ref));
+                        dot += ref * got;
+                        nr += ref * ref;
+                        ng += got * got;
+                    }
                 }
-                double l = 0;
-                std::vector<double> o(kHdim, 0.0);
-                for(index_t t = lo; t < sk; ++t)
-                {
-                    const double p = std::exp(sc[t - lo] - mx);
-                    l += p;
-                    for(index_t d = 0; d < kHdim; ++d)
-                        o[d] += p * fp8_to_float(v[at(t, d, true)]);
-                }
-                for(index_t d = 0; d < kHdim; ++d)
-                {
-                    const double ref = l > 0 ? o[d] / l * v_descale : 0.0;
-                    const double got =
-                        qo_to_float(out[(static_cast<size_t>(b) * c.nhead + hq) * kHdim + d]);
-                    res.max_err = std::max(res.max_err, std::fabs(ref - got));
-                    res.max_ref = std::max(res.max_ref, std::fabs(ref));
-                    dot += ref * got;
-                    nr += ref * ref;
-                    ng += got * got;
-                }
-            }
-        }
         res.cosine = nr + ng <= 0.0 ? 1.0 : dot / std::sqrt(nr * ng + 1e-300);
         // fp8 Q and P: the output follows the reference direction tightly, element errors stay
         // a few percent of the largest output

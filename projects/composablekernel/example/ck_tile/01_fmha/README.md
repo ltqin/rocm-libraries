@@ -468,13 +468,13 @@ Pass `-kname=1` to print which instance was dispatched.
 ## fp8 decode over a paged KV cache (gfx125)
 
 `tile_example_fmha_decode_paged5d` runs `FmhaDecodePaged5dKernel`
-(`ck_tile/ops/fmha/kernel/fmha_fwd_decode_paged5d_kernel.hpp`): one query token per sequence over a
-paged cache in one of three layouts (`-kv_layout`): `5d`, sglang's SHUFFLE layout, K
+(`ck_tile/ops/fmha/kernel/fmha_fwd_decode_paged5d_kernel.hpp`): one or more query tokens per
+sequence (`-q_len`, MTP: each token sees the keys up to its own position) over a paged cache in one of three layouts (`-kv_layout`): `5d`, sglang's SHUFFLE layout, K
 `[num_blocks][nhead_k][d / 16][page_size][16 B]` and V `[num_blocks][nhead_k][page_size / 16][d][16]`;
 `hnd`, K and V `[num_blocks][nhead_k][page_size][d]`; `nhd`, K and V
 `[num_blocks][page_size][nhead_k][d]`. page_size 16, 64 or 128, d 64, 128 or 256 (`-d`), fp8 e4m3 K/V
-with per-tensor descales, bf16 or fp16 Q and output (`-prec`), at most 16 query heads per kv head,
-an optional sliding window. It needs no codegen.
+with per-tensor descales, bf16 or fp16 Q and output (`-prec`), any number of query heads per kv
+head, an optional sliding window. It needs no codegen.
 
 ```
 ninja tile_example_fmha_decode_paged5d
@@ -482,12 +482,12 @@ ninja tile_example_fmha_decode_paged5d
 ```
 
 `-s_k` takes one length per batch (comma separated), `-max_s_k` sizes the launch for a longer
-bound than the lengths (as a captured graph does), `-splits` / `-pages_per_split` / `-layout`
-override the heuristic. The run validates against a CPU reference and reports stream and
+bound than the lengths (as a captured graph does), `-splits` / `-pages_per_split` / `-layout` /
+`-m_tiles` (16-row query tiles per workgroup) override the heuristic. The run validates against a CPU reference and reports stream and
 HIP-graph times.
 
 `ck_fmha_decode_paged5d` builds `libck_fmha_decode_paged5d.so`, a C API that
 `fmha_decode_paged5d.py` wraps for PyTorch with the arguments of aiter's FlyDSL `pa_decode`.
-The launch depends on the batch, the kv heads, the window and `max_context_length` (default:
+The launch depends on the batch, the heads, the query length, the window and `max_context_length` (default:
 block-table width x page_size), not on the context lengths, so one call can be captured in a graph and
 replayed for every decode step.
