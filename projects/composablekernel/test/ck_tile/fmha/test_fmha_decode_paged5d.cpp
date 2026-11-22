@@ -185,6 +185,37 @@ std::vector<Param> params()
         add_rows(dn + "mtp4_gqa16", c, 4, 0, 1, 4);
         add_rows(dn + "m2_mtp4_gqa16", c, 4, 2, 2, 2);
     }
+    // sinks (one -inf, one +inf) and the log-sum-exp, through each way the output is finished:
+    // one split, a cluster merge, a group merge; also rows without keys (MTP, short contexts)
+    const auto sink_case = [](Case c, ck_tile::index_t qlen = 1, ck_tile::index_t tiles = 0) {
+        c.sink    = true;
+        c.lse     = true;
+        c.qlen    = qlen;
+        c.m_tiles = tiles;
+        return c;
+    };
+    add("sink_one_split", sink_case({2, 16, 1, {700}, 2048, 1}));
+    add("sink_coop", sink_case({2, 16, 1, {3000}, 2048}), "coop");
+    add("sink_wave", sink_case({2, 16, 1, {5000}, 0, 0, 0, "wave"}), "wave");
+    add("sink_coop_groups", sink_case({1, 16, 1, {20000}, 0}), "coop+groups");
+    add("sink_wave_groups", sink_case({8, 16, 1, {8192}, 0, 0, 0, "auto", 131072}), "wave+groups");
+    add("sink_short", sink_case({2, 16, 1, {1, 5}, 2048}));
+    add("sink_gqa8_h_k2", sink_case({2, 16, 2, {4000}, 0, 0, 0, "auto", 0, 64}));
+    add("sink_m2_gqa32", sink_case({2, 32, 1, {5000}, 2048}, 1, 2));
+    add("sink_mtp3_window5", sink_case({2, 8, 1, {300}, 5}, 3));
+    add("sink_mtp4_short_ctx", sink_case({2, 8, 1, {2, 3}, 0}, 4));
+    add("sink_fp16_p128", sink_case({2, 16, 1, {9000}, 0, 0, 0, "auto", 0, 128, true}));
+    {
+        Case c{2, 16, 1, {3000}, 0};
+        c.lse = true;
+        add("lse_only", c);
+    }
+    for(const ck_tile::index_t d : {64, 256})
+    {
+        Case c{2, 16, 1, {5000}, 0, 0, 0, "wave"};
+        c.hdim = d;
+        add("sink_d" + std::to_string(d) + "_wave", sink_case(c), "wave");
+    }
     // every case again over hnd and nhd caches (token rows in LDS, transposing V reads)
     const size_t n5d = p.size();
     for(const auto& [prefix, layout] : {std::pair{"hnd_", fmha_decode_paged5d::Layout::hnd},

@@ -27,6 +27,8 @@ int main(int argc, char* argv[])
         .insert("pages_per_split", "0", "pages per split; 0 = heuristic")
         .insert("layout", "auto", "auto, coop or wave")
         .insert("m_tiles", "0", "16-row tiles per workgroup: 1 or 2; 0 = heuristic")
+        .insert("sink", "0", "random sinks per q head")
+        .insert("lse", "0", "store (and validate) the log-sum-exp")
         .insert("v", "1", "validate against the CPU reference")
         .insert("seed", "1", "random seed")
         .insert("warmup", "10", "warmup launches")
@@ -50,6 +52,8 @@ int main(int argc, char* argv[])
     c.hdim                      = arg_parser.get_int("d");
     c.qlen                      = arg_parser.get_int("q_len");
     c.m_tiles                   = arg_parser.get_int("m_tiles");
+    c.sink                      = arg_parser.get_bool("sink");
+    c.lse                       = arg_parser.get_bool("lse");
     c.fp16                      = arg_parser.get_str("prec") == "fp16";
     const std::string kv_layout = arg_parser.get_str("kv_layout");
     if(kv_layout != "5d" && kv_layout != "hnd" && kv_layout != "nhd")
@@ -73,6 +77,8 @@ int main(int argc, char* argv[])
     if(validate)
         std::printf(
             "max abs err %.4g (max |ref| %.4g), cos %.6f, ", r.max_err, r.max_ref, r.cosine);
+    if(validate && c.lse)
+        std::printf("lse err %.3g, ", r.max_lse_err);
     std::printf("%s %s d:%d b:%d q:%d h:%d/%d s_k:%d page:%d window:%d layout:%s tiles:%dx%d "
                 "groups:%d splits:%d pages/split:%d, stream %.2f us, graph %.2f us%s\n",
                 c.fp16 ? "fp16" : "bf16",

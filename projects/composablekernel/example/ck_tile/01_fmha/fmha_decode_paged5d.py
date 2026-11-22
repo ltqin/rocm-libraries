@@ -20,6 +20,7 @@ HDIMS = (64, 128, 256)
 PAGE_SIZES = (16, 64, 128)
 # ck_tile::FmhaDecodePagedLayout
 KV_LAYOUTS = {"shuffle_5d": 0, "hnd": 1, "nhd": 2}
+SINK_DTYPES = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 
 _lib = None
 _buffers = {}
@@ -40,7 +41,9 @@ def _load():
         lib.ck_fmha_decode_paged5d.argtypes = (
             [ctypes.c_void_p] * 4
             + [ctypes.c_int]
-            + [ctypes.c_void_p] * 6
+            + [ctypes.c_void_p] * 3
+            + [ctypes.c_void_p, ctypes.c_int]
+            + [ctypes.c_void_p] * 4
             + [ctypes.c_int] * 10
             + [ctypes.c_float, ctypes.c_void_p]
         )
@@ -100,6 +103,8 @@ def pa_decode(
     key_scale=None,  # [1] float32 on the device
     value_scale=None,  # [1] float32 on the device
     sliding_window=0,  # keys attended, the query's own included; 0 = no window
+    sinks=None,  # [num_query_heads] logits joining every denominator; -inf: none
+    lse=None,  # optional fp32 [num_seqs * query_length, num_query_heads] output
     max_context_length=None,
     kv_layout="auto",
     work_plan=None,  # accepted for call compatibility; this kernel needs no plan
@@ -174,7 +179,21 @@ def pa_decode(
         raise ValueError("block_tables must have unit column stride and num_seqs rows")
     if context_lengths.numel() < batch:
         raise ValueError("context_lengths must have num_seqs entries")
+    if sinks is not None:
+        if sinks.shape != (nhead_q,):
+            raise ValueError("sinks must have shape [num_query_heads]")
+        if sinks.dtype not in SINK_DTYPES or not sinks.is_contiguous():
+            raise ValueError("sinks must be a contiguous fp32, bf16 or fp16 tensor")
+    if lse is not None and (
+        lse.shape != (rows, nhead_q)
+        or lse.dtype != torch.float32
+        or not lse.is_contiguous()
+    ):
+        raise ValueError(
+            "lse must be a contiguous fp32 [num_seqs * query_length, num_query_heads]"
+        )
     tensors = [output, query, key_cache, value_cache, context_lengths, block_tables]
+    tensors += [t for t in (sinks, lse) if t is not None]
     tensors += [s for s in (key_scale, value_scale) if isinstance(s, torch.Tensor)]
     if any(t.device != query.device for t in tensors):
         raise ValueError("all tensors must be on the query's device")
@@ -210,7 +229,10 @@ def pa_decode(
         context_lengths.data_ptr(),
         _scale_ptr(key_scale, device),
         _scale_ptr(value_scale, device),
+        0 if sinks is None else sinks.data_ptr(),
+        0 if sinks is None else SINK_DTYPES[sinks.dtype],
         output.data_ptr(),
+        0 if lse is None else lse.data_ptr(),
         ws.data_ptr(),
         counters.data_ptr(),
         batch,

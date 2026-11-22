@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <string>
@@ -229,9 +230,11 @@ struct Case
     index_t page_size       = 16;        // tokens per cache page: 16, 64 or 128
     bool fp16               = false;     // fp16 Q and output instead of bf16
     Layout kv_layout        = Layout::shuffle_5d;
-    index_t hdim            = 128; // 64, 128 or 256
-    index_t qlen            = 1;   // query tokens per sequence (MTP)
-    index_t m_tiles         = 0;   // 16-row tiles per workgroup: 1 or 2; 0 = heuristic
+    index_t hdim            = 128;   // 64, 128 or 256
+    index_t qlen            = 1;     // query tokens per sequence (MTP)
+    index_t m_tiles         = 0;     // 16-row tiles per workgroup: 1 or 2; 0 = heuristic
+    bool sink               = false; // random sinks per q head (one -inf, one +inf with >= 4 heads)
+    bool lse                = false; // store and check the log-sum-exp
     unsigned seed           = 1;
 };
 
@@ -239,6 +242,7 @@ struct Result
 {
     bool valid     = false; // set only when validated
     double max_err = 0, max_ref = 0, cosine = 0;
+    double max_lse_err = 0; // set only when the case stores the log-sum-exp
     ck_tile::FmhaDecodePaged5dConfig config{};
     float us_stream = 0, us_graph = 0; // set only when timed
     bool graph_same = true;            // graph replay wrote the output of a stream launch
@@ -360,11 +364,24 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         }
     }
     const float k_descale = 0.75f, v_descale = 1.25f;
+    // sinks around the scale of the scores; -inf (none) and +inf (no output) once each
+    std::vector<float> sinks(c.nhead, -std::numeric_limits<float>::infinity());
+    if(c.sink)
+    {
+        for(auto& x : sinks)
+            x = 3.f * uni(rng);
+        if(c.nhead >= 4)
+        {
+            sinks[1] = -std::numeric_limits<float>::infinity();
+            sinks[2] = std::numeric_limits<float>::infinity();
+        }
+    }
     const float scale_s = 1.f / std::sqrt(static_cast<float>(kHdim));
 
     ck_tile::DeviceMem q_buf(q.size() * 2), k_buf(k.size()), v_buf(v.size());
     ck_tile::DeviceMem bt_buf(block_table.size() * 4), sl_buf(seqlens32.size() * 4);
     ck_tile::DeviceMem o_buf(q.size() * 2), scale_buf(8);
+    ck_tile::DeviceMem sink_buf(sinks.size() * 4), lse_buf(q.size() / kHdim * 4);
     ck_tile::DeviceMem ws_buf(
         ck_tile::fmha_decode_paged5d_workspace_bytes(batch,
                                                      c.nhead_k,
@@ -383,6 +400,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     sl_buf.ToDevice(seqlens32.data());
     const float scales[2] = {k_descale, v_descale};
     scale_buf.ToDevice(scales);
+    sink_buf.ToDevice(sinks.data());
+    HIP_CHECK_ERROR(hipMemset(lse_buf.GetDeviceBuffer(), 0xff, lse_buf.GetBufferSize()));
 
     const ck_tile::FmhaDecodePaged5dHostArgs args{
         q_buf.GetDeviceBuffer(),
@@ -407,7 +426,10 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         c.fp16,
         c.kv_layout,
         kHdim,
-        qlen};
+        qlen,
+        c.sink ? sink_buf.GetDeviceBuffer() : nullptr,
+        0,
+        c.lse ? static_cast<float*>(lse_buf.GetDeviceBuffer()) : nullptr};
 
     hipStream_t stream;
     HIP_CHECK_ERROR(hipDeviceSynchronize()); // the fills above, before a non-blocking stream
@@ -419,6 +441,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     {
         std::vector<uint16_t> out(q.size());
         o_buf.FromDevice(out.data());
+        std::vector<float> lse(q.size() / kHdim);
+        lse_buf.FromDevice(lse.data());
         double dot = 0, nr = 0, ng = 0;
         for(index_t b = 0; b < batch; ++b)
             for(index_t qi = 0; qi < qlen; ++qi)
@@ -452,9 +476,24 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
                         for(index_t d = 0; d < kHdim; ++d)
                             o[d] += p * fp8_to_float(v[at(t, d, true)]);
                     }
+                    // the sink joins the denominator; no keys: the max is the sink's
+                    if(sk <= lo)
+                        mx = 0;
+                    if(c.sink)
+                        l += std::exp(static_cast<double>(sinks[hq]) - mx);
+                    if(c.lse)
+                    {
+                        const double ref = l > 0 ? mx + std::log(l) : -INFINITY;
+                        const double got = lse[qrow];
+                        const double err = std::isinf(ref) && std::isinf(got) &&
+                                                   std::signbit(ref) == std::signbit(got)
+                                               ? 0.0
+                                               : std::fabs(ref - got);
+                        res.max_lse_err  = std::max(res.max_lse_err, err);
+                    }
                     for(index_t d = 0; d < kHdim; ++d)
                     {
-                        const double ref = l > 0 ? o[d] / l * v_descale : 0.0;
+                        const double ref = l > 0 && std::isfinite(l) ? o[d] / l * v_descale : 0.0;
                         const double got = qo_to_float(out[qrow * kHdim + d]);
                         res.max_err      = std::max(res.max_err, std::fabs(ref - got));
                         res.max_ref      = std::max(res.max_ref, std::fabs(ref));
@@ -468,6 +507,9 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         // a few percent of the largest output
         res.valid = std::isfinite(res.max_err) && res.cosine > 0.999 &&
                     res.max_err < 0.05 * std::max(res.max_ref, 1e-3);
+        // scores from fp8 Q and K: a few hundredths in the log
+        if(c.lse)
+            res.valid = res.valid && res.max_lse_err < 0.05;
     }
 
     if(repeat > 0)

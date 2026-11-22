@@ -59,7 +59,9 @@ size_t ck_fmha_decode_paged5d_num_counters(int batch, int nhead_q, int nhead_k, 
 // of page_size (16, 64 or 128) tokens per page in kv_layout (ck_tile::FmhaDecodePagedLayout:
 // 0 shuffle_5d, 1 hnd, 2 nhd); hdim: 64, 128 or 256; block_table: int32 rows of
 // block_table_stride entries; seqlen_k: int32 [batch], each <= max_seqlen_k; k/v descale: one
-// float each. Returns a hipError_t.
+// float each; sinks: optional [nhead_q] logits joining every denominator (-inf: none), fp32,
+// bf16 or fp16 by sink_dtype 0, 1, 2;
+// lse: optional fp32 [batch][qlen][nhead_q] log-sum-exp output. Returns a hipError_t.
 int ck_fmha_decode_paged5d(const void* q,
                            const void* k,
                            const void* v,
@@ -68,7 +70,10 @@ int ck_fmha_decode_paged5d(const void* q,
                            const int32_t* seqlen_k,
                            const float* k_descale,
                            const float* v_descale,
+                           const void* sinks,
+                           int sink_dtype,
                            void* o,
+                           float* lse,
                            void* workspace,
                            int32_t* counters,
                            int batch,
@@ -89,6 +94,8 @@ int ck_fmha_decode_paged5d(const void* q,
     if(workspace == nullptr || counters == nullptr || kv_layout < 0 || kv_layout > 2)
         return hipErrorInvalidValue;
     if(hdim != 64 && hdim != 128 && hdim != 256)
+        return hipErrorInvalidValue;
+    if(sink_dtype < 0 || sink_dtype > 2)
         return hipErrorInvalidValue;
     const auto c = config(batch, nhead_q, nhead_k, max_seqlen_k, window, page_size, hdim, qlen);
     const ck_tile::FmhaDecodePaged5dHostArgs args{
@@ -114,7 +121,10 @@ int ck_fmha_decode_paged5d(const void* q,
         qo_fp16 != 0,
         static_cast<ck_tile::FmhaDecodePagedLayout>(kv_layout),
         hdim,
-        qlen};
+        qlen,
+        sinks,
+        sink_dtype,
+        lse};
     return fmha_decode_paged5d::launch(args, c, stream);
 }
 }

@@ -67,6 +67,12 @@ struct FmhaDecodePaged5dHostArgs
     FmhaDecodePagedLayout layout = FmhaDecodePagedLayout::shuffle_5d;
     index_t hdim                 = 128; // 64, 128 or 256
     index_t qlen                 = 1;   // query tokens per sequence, the last ones of the context
+    // optional: per q head logit that joins every softmax denominator (unscaled, with no value;
+    // -inf: none; fp32, bf16 or fp16 by sink_dtype 0, 1, 2), and fp32 [batch][qlen][nhead_q]
+    // output of the log-sum-exp of the scaled scores (natural log, sink included)
+    const void* sink_ptr = nullptr;
+    index_t sink_dtype   = 0;
+    float* lse_ptr       = nullptr;
 };
 
 // num_splits workgroups per cluster, num_groups clusters per (batch, kv head)
@@ -216,6 +222,10 @@ struct FmhaDecodePaged5dKernel
     static constexpr index_t kMergeTpr = kHdim / 2;
     static constexpr index_t kPage     = 16;
     static constexpr index_t kRows     = 16;
+    // P scaled by 448 (the row max lands on e4m3's largest normal): exp2(s * scl + log2(448) - m)
+    static constexpr float kLog2P = 8.807354922057604f;
+    static constexpr float kLog2e = 1.4426950408889634f;
+    static constexpr float kLn2   = 0.6931471805599453f;
     // 16-row tiles per workgroup
     static constexpr index_t kMTiles = kMTiles_;
     static constexpr index_t kMRows  = kRows * kMTiles;
@@ -274,6 +284,9 @@ struct FmhaDecodePaged5dKernel
         index_t rows;       // query rows per kv head, qlen * gqa
         index_t row_blocks; // ceil(rows / kMRows), along y with the kv heads
         float scale_s;
+        const void* sink; // nullptr: none
+        float* lse;       // nullptr: not stored
+        index_t sink_dtype;
         // used with kGroups only; last, so that the arguments the prologue needs come first
         uint16_t* gws_o;
         float* gws_ml;
@@ -321,6 +334,9 @@ struct FmhaDecodePaged5dKernel
                 h.nhead_q / h.nhead_k * h.qlen,
                 RowBlocks(h),
                 h.scale_s,
+                h.sink_ptr,
+                h.lse_ptr,
+                h.sink_dtype,
                 reinterpret_cast<uint16_t*>(gws),
                 gws == nullptr ? nullptr : reinterpret_cast<float*>(gws + grows * kHdim * 2),
                 h.counters_ptr};
@@ -478,13 +494,18 @@ struct FmhaDecodePaged5dKernel
         }
         return r;
     }
-    // offset of query row r (token qi = r / gqa) of kv head g in Q and O
+    // index of query row r (token qi = r / gqa) of kv head g in [batch][qlen][nhead_q]
+    CK_TILE_DEVICE static long_index_t
+    RowIndex(const Kargs& a, index_t b, index_t g, index_t r, index_t qi)
+    {
+        return (static_cast<long_index_t>(b) * a.qlen + qi) * a.nhead_q + g * a.gqa +
+               (r - qi * a.gqa);
+    }
+    // its offset in Q and O
     CK_TILE_DEVICE static long_index_t
     RowOffset(const Kargs& a, index_t b, index_t g, index_t r, index_t qi)
     {
-        return ((static_cast<long_index_t>(b) * a.qlen + qi) * a.nhead_q + g * a.gqa +
-                (r - qi * a.gqa)) *
-               kHdim;
+        return RowIndex(a, b, g, r, qi) * kHdim;
     }
     // y / x for y * x < 2^30, given rcp = ceil(2^31 / x)
     CK_TILE_DEVICE static index_t Div(index_t y, uint32_t rcp)
@@ -498,6 +519,35 @@ struct FmhaDecodePaged5dKernel
     CK_TILE_DEVICE static long_index_t RowOffset(const Kargs& a, index_t b, index_t g, index_t r)
     {
         return RowOffset(a, b, g, r, QueryToken(a, r));
+    }
+    // sink of query row r of kv head g in log2 units; -inf without sinks
+    CK_TILE_DEVICE static float SinkLog2(const Kargs& a, index_t g, index_t r)
+    {
+        if(a.sink == nullptr)
+            return -numeric<float>::infinity();
+        const index_t hq = g * a.gqa + r - QueryToken(a, r) * a.gqa;
+        const float x    = a.sink_dtype == 0   ? ptr_as<float>(a.sink)[hq]
+                           : a.sink_dtype == 1 ? bf16_to_f32(ptr_as<uint16_t>(a.sink)[hq])
+                                               : fp16_to_f32(ptr_as<uint16_t>(a.sink)[hq]);
+        return x * kLog2e;
+    }
+    // Last normalization of query row r of kv head g, running max m and sum l in P units (see
+    // kLog2P): the sink of its q head joins l; the log-sum-exp is stored when requested (one
+    // writer per row). Returns the factor of the accumulated O. Without either, the branch keeps
+    // the plain division off the sink's loads.
+    CK_TILE_DEVICE static float
+    Finish(const Kargs& a, index_t b, index_t g, index_t r, float m, float l, float vd, bool writer)
+    {
+        if(a.sink == nullptr && a.lse == nullptr)
+            return l > 0.f ? vd / l : 0.f;
+        const float mu        = is_neg_inf(m) ? 0.f : m;
+        const float sink_log2 = SinkLog2(a, g, r);
+        if(!is_neg_inf(sink_log2))
+            l += exp2(sink_log2 + kLog2P - mu);
+        if(writer && a.lse != nullptr)
+            a.lse[RowIndex(a, b, g, r, QueryToken(a, r))] =
+                l > 0.f ? (mu + __log2f(l) - kLog2P) * kLn2 : -numeric<float>::infinity();
+        return l > 0.f ? vd / l : 0.f;
     }
     // S^T tile += K rows (kQkChunks 16-byte chunks per lane) x Q^T
     CK_TILE_DEVICE static v8f wmma_qk(const int32_t* k, const int32_t* q, v8f c)
@@ -805,7 +855,7 @@ struct FmhaDecodePaged5dKernel
                 qf[i][j] = __builtin_amdgcn_cvt_pk_fp8_f32(
                     qv[4 * j + 2] * qinv, qv[4 * j + 3] * qinv, x, true);
             }
-            scl[i] = qmax / 448.f * kds * a.scale_s * 1.4426950408889634f;
+            scl[i] = qmax / 448.f * kds * a.scale_s * kLog2e;
         }
 
         // step t's copies of this wave are in LDS; zero the V bytes of tokens past the context
@@ -914,8 +964,6 @@ struct FmhaDecodePaged5dKernel
         const auto inside = [&](index_t pg, index_t count) {
             return pg * kPage >= lo_max && (pg + count) * kPage <= hi_min && pg + count <= pend;
         };
-        // P scaled by 448 (the row max lands on e4m3's largest normal): exp2(s * scl + c)
-        constexpr float kLog2P = 8.807354922057604f; // log2(448)
 
         if constexpr(kWaveSplit)
         {
@@ -1219,10 +1267,12 @@ struct FmhaDecodePaged5dKernel
             const index_t lr = i * kRows + row; // row within the block
             if constexpr(kNumSplits == 1)
             {
-                const index_t r = rb * kMRows + lr;
+                const index_t r   = rb * kMRows + lr;
+                const bool writer = kWaveSplit ? (threadIdx.x % 8 == 0) : (w == 0 && h == 0);
                 if(r < a.rows)
-                    store_row(
-                        a.o + RowOffset(a, b, g, r), l_row > 0.f ? vd / l_row : 0.f, pack_out);
+                    store_row(a.o + RowOffset(a, b, g, r),
+                              Finish(a, b, g, r, m_row, l_row, vd, writer),
+                              pack_out);
             }
             else
             {
@@ -1270,9 +1320,9 @@ struct FmhaDecodePaged5dKernel
                 }
                 if constexpr(!kGroups)
                 {
-                    const float f = ll > 0.f ? vd / ll : 0.f;
-                    *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, rb * kMRows + mrow) + d2) =
-                        pack_out(o0 * f, o1 * f);
+                    const index_t r = rb * kMRows + mrow;
+                    const float f   = Finish(a, b, g, r, mm, ll, vd, d2 == 0);
+                    *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, r) + d2) = pack_out(o0 * f, o1 * f);
                 }
                 else
                 {
@@ -1372,8 +1422,9 @@ struct FmhaDecodePaged5dKernel
                     mm = mn;
                 }
             }
-            const float f = ll > 0.f ? vd / ll : 0.f;
-            *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, rb * kMRows + mrow) + d2) =
+            const index_t r = rb * kMRows + mrow;
+            const float f   = Finish(a, b, g, r, mm, ll, vd, d2 == 0);
+            *ptr_as<uint32_t>(a.o + RowOffset(a, b, g, r) + d2) =
                 kQoFp16 ? pack_fp16(o0 * f, o1 * f) : pack_bf16(o0 * f, o1 * f);
         }
     }
