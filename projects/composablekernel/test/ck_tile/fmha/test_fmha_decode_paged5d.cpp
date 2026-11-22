@@ -216,6 +216,41 @@ std::vector<Param> params()
         c.hdim = d;
         add("sink_d" + std::to_string(d) + "_wave", sink_case(c), "wave");
     }
+    // per-token K/V scales (NaN past each sequence's end) through both layouts, every finishing
+    // path, cache page sizes, two tiles, MTP with sinks, head dims
+    const auto pt_case = [](Case c, ck_tile::index_t qlen = 1, ck_tile::index_t tiles = 0) {
+        c.per_token = true;
+        c.qlen      = qlen;
+        c.m_tiles   = tiles;
+        return c;
+    };
+    add("pt_one_split", pt_case({2, 16, 1, {700}, 2048, 1}));
+    add("pt_coop", pt_case({2, 16, 1, {3000}, 2048}), "coop");
+    add("pt_wave", pt_case({2, 16, 1, {5000}, 0, 0, 0, "wave"}), "wave");
+    add("pt_coop_groups", pt_case({1, 16, 1, {20000}, 0}), "coop+groups");
+    add("pt_wave_groups", pt_case({8, 16, 1, {8192}, 0, 0, 0, "auto", 131072}), "wave+groups");
+    add("pt_short", pt_case({3, 16, 1, {1, 5, 77}, 2048}));
+    add("pt_mixed", pt_case({4, 16, 1, {9000, 100, 2048, 3333}, 2048}));
+    add("pt_p64_wave", pt_case({2, 16, 1, {5000}, 2048, 0, 0, "wave", 0, 64}), "wave");
+    add("pt_p128", pt_case({3, 16, 1, {1000}, 300, 0, 0, "auto", 0, 128}));
+    add("pt_gqa8_h_k2", pt_case({2, 16, 2, {4000}, 0}));
+    add("pt_m2_gqa32", pt_case({2, 32, 1, {5000}, 2048}, 1, 2));
+    add("pt_fp16", pt_case({8, 16, 1, {8192}, 0, 0, 0, "auto", 0, 16, true}));
+    {
+        Case c = pt_case({2, 8, 1, {300, 2}, 5}, 3);
+        c.sink = true;
+        c.lse  = true;
+        add("pt_mtp3_sink_lse", c);
+    }
+    for(const ck_tile::index_t d : {64, 256})
+    {
+        Case c{2, 16, 1, {5000}, 0, 0, 0, "wave"};
+        c.hdim = d;
+        add("pt_d" + std::to_string(d) + "_wave", pt_case(c), "wave");
+        c      = Case{2, 16, 1, {3000}, 2048, 0, 0, "coop"};
+        c.hdim = d;
+        add("pt_d" + std::to_string(d) + "_coop", pt_case(c), "coop");
+    }
     // every case again over hnd and nhd caches (token rows in LDS, transposing V reads)
     const size_t n5d = p.size();
     for(const auto& [prefix, layout] : {std::pair{"hnd_", fmha_decode_paged5d::Layout::hnd},

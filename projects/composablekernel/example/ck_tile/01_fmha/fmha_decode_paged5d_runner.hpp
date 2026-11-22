@@ -35,7 +35,8 @@ template <bool kWaveSplit,
           bool kQoFp16,
           Layout kLayout,
           index_t kHdim,
-          index_t kMTiles>
+          index_t kMTiles,
+          bool kPerTokenScale>
 hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t stream)
 {
     using K    = ck_tile::FmhaDecodePaged5dKernel<kWaveSplit,
@@ -45,7 +46,8 @@ hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t s
                                                   kQoFp16,
                                                   kLayout,
                                                   kHdim,
-                                                  kMTiles>;
+                                                  kMTiles,
+                                                  kPerTokenScale>;
     auto kargs = K::MakeKargs(h);
     hipLaunchConfig_t cfg{};
     cfg.gridDim  = K::GridSize(h);
@@ -62,14 +64,24 @@ hipError_t launch_one(const ck_tile::FmhaDecodePaged5dHostArgs& h, hipStream_t s
     return hipLaunchKernelEx(&cfg, ck_tile::fmha_decode_paged5d_entry<K>, kargs);
 }
 
-template <bool kWaveSplit,
-          bool kGroups,
-          index_t kPageSize,
-          bool kQoFp16,
-          Layout kLayout,
-          index_t kHdim,
-          index_t kMTiles,
-          index_t... Ns>
+// the kernel's compile-time parameters other than the split count and the layout of the splits
+template <index_t kPageSize_,
+          bool kQoFp16_,
+          Layout kLayout_,
+          index_t kHdim_,
+          index_t kMTiles_,
+          bool kPerTokenScale_>
+struct Instance
+{
+    static constexpr index_t kPageSize   = kPageSize_;
+    static constexpr bool kQoFp16        = kQoFp16_;
+    static constexpr Layout kLayout      = kLayout_;
+    static constexpr index_t kHdim       = kHdim_;
+    static constexpr index_t kMTiles     = kMTiles_;
+    static constexpr bool kPerTokenScale = kPerTokenScale_;
+};
+
+template <bool kWaveSplit, bool kGroups, typename I, index_t... Ns>
 hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                     index_t splits,
                     hipStream_t stream,
@@ -81,46 +93,46 @@ hipError_t dispatch(const ck_tile::FmhaDecodePaged5dHostArgs& h,
             e = launch_one<kWaveSplit,
                            decltype(ns)::value,
                            kGroups,
-                           kPageSize,
-                           kQoFp16,
-                           kLayout,
-                           kHdim,
-                           kMTiles>(h, stream);
+                           I::kPageSize,
+                           I::kQoFp16,
+                           I::kLayout,
+                           I::kHdim,
+                           I::kMTiles,
+                           I::kPerTokenScale>(h, stream);
     };
     (try_one(ck_tile::number<Ns + 1>{}), ...);
     return e;
 }
 
-template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim, index_t kMTiles>
-hipError_t launch_page(const ck_tile::FmhaDecodePaged5dHostArgs& h,
-                       const ck_tile::FmhaDecodePaged5dConfig& c,
-                       hipStream_t stream)
+template <typename I>
+hipError_t launch_instance(const ck_tile::FmhaDecodePaged5dHostArgs& h,
+                           const ck_tile::FmhaDecodePaged5dConfig& c,
+                           hipStream_t stream)
 {
     const auto seq = std::make_integer_sequence<index_t, 15>{};
     if(c.wave_split)
-        return c.num_groups > 1
-                   ? dispatch<true, true, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
-                         h, c.num_splits, stream, seq)
-                   : dispatch<true, false, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
-                         h, c.num_splits, stream, seq);
-    return c.num_groups > 1 ? dispatch<false, true, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
-                                  h, c.num_splits, stream, seq)
-                            : dispatch<false, false, kPageSize, kQoFp16, kLayout, kHdim, kMTiles>(
-                                  h, c.num_splits, stream, seq);
+        return c.num_groups > 1 ? dispatch<true, true, I>(h, c.num_splits, stream, seq)
+                                : dispatch<true, false, I>(h, c.num_splits, stream, seq);
+    return c.num_groups > 1 ? dispatch<false, true, I>(h, c.num_splits, stream, seq)
+                            : dispatch<false, false, I>(h, c.num_splits, stream, seq);
 }
 
-// launch_page is instantiated in the translation units of fmha_decode_paged5d_instances.cmake
-#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout, hdim, m_tiles) \
-    prefix hipError_t launch_page<page_size, qo_fp16, Layout::layout, hdim, m_tiles>(   \
-        const ck_tile::FmhaDecodePaged5dHostArgs&,                                      \
-        const ck_tile::FmhaDecodePaged5dConfig&,                                        \
+// launch_instance is instantiated in the translation units of fmha_decode_paged5d_instances.cmake
+#define FMHA_DECODE_PAGED5D_INSTANCE(prefix, page_size, qo_fp16, layout, hdim, m_tiles, per_token) \
+    prefix hipError_t                                                                              \
+    launch_instance<Instance<page_size, qo_fp16, Layout::layout, hdim, m_tiles, per_token>>(       \
+        const ck_tile::FmhaDecodePaged5dHostArgs&,                                                 \
+        const ck_tile::FmhaDecodePaged5dConfig&,                                                   \
         hipStream_t);
-#define FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, m_tiles)                    \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, page_size, false, layout, hdim, m_tiles) \
-    FMHA_DECODE_PAGED5D_INSTANCE(extern template, page_size, true, layout, hdim, m_tiles)
-#define FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, page_size) \
-    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 1)  \
-    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 2)
+#define FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, m_tiles, per_token) \
+    FMHA_DECODE_PAGED5D_INSTANCE(                                                  \
+        extern template, page_size, false, layout, hdim, m_tiles, per_token)       \
+    FMHA_DECODE_PAGED5D_INSTANCE(extern template, page_size, true, layout, hdim, m_tiles, per_token)
+#define FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, page_size)       \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 1, false) \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 2, false) \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 1, true)  \
+    FMHA_DECODE_PAGED5D_EXTERN_QO(layout, hdim, page_size, 2, true)
 #define FMHA_DECODE_PAGED5D_EXTERN_PAGE(layout, hdim) \
     FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, 16)   \
     FMHA_DECODE_PAGED5D_EXTERN_MT(layout, hdim, 64)   \
@@ -137,6 +149,18 @@ FMHA_DECODE_PAGED5D_EXTERN_LAYOUT(nhd)
 #undef FMHA_DECODE_PAGED5D_EXTERN_MT
 #undef FMHA_DECODE_PAGED5D_EXTERN_QO
 
+template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim, index_t kMTiles>
+hipError_t launch_scale(const ck_tile::FmhaDecodePaged5dHostArgs& h,
+                        const ck_tile::FmhaDecodePaged5dConfig& c,
+                        hipStream_t stream)
+{
+    return h.per_token_scale
+               ? launch_instance<Instance<kPageSize, kQoFp16, kLayout, kHdim, kMTiles, true>>(
+                     h, c, stream)
+               : launch_instance<Instance<kPageSize, kQoFp16, kLayout, kHdim, kMTiles, false>>(
+                     h, c, stream);
+}
+
 template <index_t kPageSize, bool kQoFp16, Layout kLayout, index_t kHdim>
 hipError_t launch_mt(const ck_tile::FmhaDecodePaged5dHostArgs& h,
                      const ck_tile::FmhaDecodePaged5dConfig& c,
@@ -144,8 +168,8 @@ hipError_t launch_mt(const ck_tile::FmhaDecodePaged5dHostArgs& h,
 {
     switch(c.m_tiles)
     {
-    case 1: return launch_page<kPageSize, kQoFp16, kLayout, kHdim, 1>(h, c, stream);
-    case 2: return launch_page<kPageSize, kQoFp16, kLayout, kHdim, 2>(h, c, stream);
+    case 1: return launch_scale<kPageSize, kQoFp16, kLayout, kHdim, 1>(h, c, stream);
+    case 2: return launch_scale<kPageSize, kQoFp16, kLayout, kHdim, 2>(h, c, stream);
     default: return hipErrorInvalidValue;
     }
 }
@@ -235,7 +259,11 @@ struct Case
     index_t m_tiles         = 0;     // 16-row tiles per workgroup: 1 or 2; 0 = heuristic
     bool sink               = false; // random sinks per q head (one -inf, one +inf with >= 4 heads)
     bool lse                = false; // store and check the log-sum-exp
-    unsigned seed           = 1;
+    // per-token K/V scales instead of one each, K 2^-1 .. 2^1, V 2^-2 .. 2^2: larger K scales
+    // sharpen these scores (fp8 Q error amplified), wider V scales let a few tokens carry the
+    // output with the fp8 P error of each, past the checks
+    bool per_token = false;
+    unsigned seed  = 1;
 };
 
 struct Result
@@ -364,6 +392,31 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         }
     }
     const float k_descale = 0.75f, v_descale = 1.25f;
+    // per-token scales [num_blocks][nhead_k][page], NaN past each sequence's last token
+    std::vector<float> ks(c.per_token ? k.size() / kHdim : 0), vs(ks.size());
+    for(size_t i = 0; i < ks.size(); ++i)
+    {
+        ks[i] = std::exp2(uni(rng));
+        vs[i] = std::exp2(2.f * uni(rng));
+    }
+    if(c.per_token)
+        for(index_t b = 0; b < batch; ++b)
+        {
+            const index_t pages = (seqlens[b] + ps - 1) / ps;
+            if(pages == 0)
+                continue;
+            const size_t last = static_cast<size_t>(block_table[b * max_blocks + pages - 1]);
+            for(index_t hk = 0; hk < c.nhead_k; ++hk)
+                for(index_t tok = seqlens[b] - (pages - 1) * ps; tok < ps; ++tok)
+                    ks[(last * c.nhead_k + hk) * ps + tok] =
+                        vs[(last * c.nhead_k + hk) * ps + tok] =
+                            std::numeric_limits<float>::quiet_NaN();
+        }
+    // K or V scale of token t of block blk, kv head hk
+    const auto tok_scale = [&](bool is_v, int32_t blk, index_t hk, index_t t) {
+        return c.per_token ? (is_v ? vs : ks)[(static_cast<size_t>(blk) * c.nhead_k + hk) * ps + t]
+                           : (is_v ? v_descale : k_descale);
+    };
     // sinks around the scale of the scores; -inf (none) and +inf (no output) once each
     std::vector<float> sinks(c.nhead, -std::numeric_limits<float>::infinity());
     if(c.sink)
@@ -381,6 +434,7 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     ck_tile::DeviceMem q_buf(q.size() * 2), k_buf(k.size()), v_buf(v.size());
     ck_tile::DeviceMem bt_buf(block_table.size() * 4), sl_buf(seqlens32.size() * 4);
     ck_tile::DeviceMem o_buf(q.size() * 2), scale_buf(8);
+    ck_tile::DeviceMem ks_buf(ks.size() * 4), vs_buf(vs.size() * 4);
     ck_tile::DeviceMem sink_buf(sinks.size() * 4), lse_buf(q.size() / kHdim * 4);
     ck_tile::DeviceMem ws_buf(
         ck_tile::fmha_decode_paged5d_workspace_bytes(batch,
@@ -400,6 +454,8 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
     sl_buf.ToDevice(seqlens32.data());
     const float scales[2] = {k_descale, v_descale};
     scale_buf.ToDevice(scales);
+    ks_buf.ToDevice(ks.data());
+    vs_buf.ToDevice(vs.data());
     sink_buf.ToDevice(sinks.data());
     HIP_CHECK_ERROR(hipMemset(lse_buf.GetDeviceBuffer(), 0xff, lse_buf.GetBufferSize()));
 
@@ -409,8 +465,11 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         v_buf.GetDeviceBuffer(),
         static_cast<const int32_t*>(bt_buf.GetDeviceBuffer()),
         static_cast<const int32_t*>(sl_buf.GetDeviceBuffer()),
-        static_cast<const float*>(scale_buf.GetDeviceBuffer()),
-        static_cast<const float*>(scale_buf.GetDeviceBuffer()) + 1,
+        static_cast<const float*>(c.per_token ? ks_buf.GetDeviceBuffer()
+                                              : scale_buf.GetDeviceBuffer()),
+        static_cast<const float*>(c.per_token ? vs_buf.GetDeviceBuffer()
+                                              : scale_buf.GetDeviceBuffer()) +
+            (c.per_token ? 0 : 1),
         o_buf.GetDeviceBuffer(),
         ws_buf.GetDeviceBuffer(),
         static_cast<int32_t*>(cnt_buf.GetDeviceBuffer()),
@@ -427,6 +486,7 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
         c.kv_layout,
         kHdim,
         qlen,
+        c.per_token,
         c.sink ? sink_buf.GetDeviceBuffer() : nullptr,
         0,
         c.lse ? static_cast<float*>(lse_buf.GetDeviceBuffer()) : nullptr};
@@ -464,8 +524,11 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
                         for(index_t d = 0; d < kHdim; ++d)
                             acc +=
                                 qo_to_float(q[qrow * kHdim + d]) * fp8_to_float(k[at(t, d, false)]);
-                        sc[t - lo] = acc * k_descale * scale_s;
-                        mx         = std::max(mx, sc[t - lo]);
+                        sc[t - lo] =
+                            acc *
+                            tok_scale(false, block_table[b * max_blocks + t / ps], hk, t % ps) *
+                            scale_s;
+                        mx = std::max(mx, sc[t - lo]);
                     }
                     double l = 0;
                     std::vector<double> o(kHdim, 0.0);
@@ -473,8 +536,10 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
                     {
                         const double p = std::exp(sc[t - lo] - mx);
                         l += p;
+                        const double pv =
+                            p * tok_scale(true, block_table[b * max_blocks + t / ps], hk, t % ps);
                         for(index_t d = 0; d < kHdim; ++d)
-                            o[d] += p * fp8_to_float(v[at(t, d, true)]);
+                            o[d] += pv * fp8_to_float(v[at(t, d, true)]);
                     }
                     // the sink joins the denominator; no keys: the max is the sink's
                     if(sk <= lo)
@@ -493,7 +558,7 @@ inline Result run(const Case& c, bool validate, int warmup = 0, int repeat = 0)
                     }
                     for(index_t d = 0; d < kHdim; ++d)
                     {
-                        const double ref = l > 0 && std::isfinite(l) ? o[d] / l * v_descale : 0.0;
+                        const double ref = l > 0 && std::isfinite(l) ? o[d] / l : 0.0;
                         const double got = qo_to_float(out[qrow * kHdim + d]);
                         res.max_err      = std::max(res.max_err, std::fabs(ref - got));
                         res.max_ref      = std::max(res.max_ref, std::fabs(ref));

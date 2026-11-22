@@ -59,9 +59,10 @@ size_t ck_fmha_decode_paged5d_num_counters(int batch, int nhead_q, int nhead_k, 
 // of page_size (16, 64 or 128) tokens per page in kv_layout (ck_tile::FmhaDecodePagedLayout:
 // 0 shuffle_5d, 1 hnd, 2 nhd); hdim: 64, 128 or 256; block_table: int32 rows of
 // block_table_stride entries; seqlen_k: int32 [batch], each <= max_seqlen_k; k/v descale: one
-// float each; sinks: optional [nhead_q] logits joining every denominator (-inf: none), fp32,
-// bf16 or fp16 by sink_dtype 0, 1, 2;
-// lse: optional fp32 [batch][qlen][nhead_q] log-sum-exp output. Returns a hipError_t.
+// float each, or with per_token_scale != 0 fp32 [num_blocks][nhead_k][page_size] each; sinks:
+// optional [nhead_q] logits joining every denominator (-inf: none), fp32, bf16 or fp16 by
+// sink_dtype 0, 1, 2; lse: optional fp32 [batch][qlen][nhead_q] log-sum-exp output. Returns a
+// hipError_t.
 int ck_fmha_decode_paged5d(const void* q,
                            const void* k,
                            const void* v,
@@ -86,6 +87,7 @@ int ck_fmha_decode_paged5d(const void* q,
                            int hdim,
                            int kv_layout,
                            int qo_fp16,
+                           int per_token_scale,
                            float scale_s,
                            hipStream_t stream)
 {
@@ -122,6 +124,7 @@ int ck_fmha_decode_paged5d(const void* q,
         static_cast<ck_tile::FmhaDecodePagedLayout>(kv_layout),
         hdim,
         qlen,
+        per_token_scale != 0,
         sinks,
         sink_dtype,
         lse};

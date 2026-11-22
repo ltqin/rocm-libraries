@@ -47,10 +47,11 @@ struct FmhaDecodePaged5dHostArgs
     const void* v_ptr;           // fp8, in layout
     const int32_t* block_table;  // [batch][max_blocks_per_seq]
     const int32_t* seqlen_k_ptr; // [batch]
-    const float* k_descale_ptr;  // one float
-    const float* v_descale_ptr;  // one float
-    void* o_ptr;                 // [batch][qlen][nhead_q][hdim], the type of Q
-    void* workspace_ptr;         // fmha_decode_paged5d_workspace_bytes, no initialization needed
+    const float*
+        k_descale_ptr; // one float, or [num_blocks][nhead_k][page_size] with per_token_scale
+    const float* v_descale_ptr; // the same for V
+    void* o_ptr;                // [batch][qlen][nhead_q][hdim], the type of Q
+    void* workspace_ptr;        // fmha_decode_paged5d_workspace_bytes, no initialization needed
     // fmha_decode_paged5d_num_counters int32; zero them once, every launch leaves them zero, so
     // launches of any shape can share them as long as they do not run concurrently
     int32_t* counters_ptr;
@@ -70,6 +71,7 @@ struct FmhaDecodePaged5dHostArgs
     // optional: per q head logit that joins every softmax denominator (unscaled, with no value;
     // -inf: none; fp32, bf16 or fp16 by sink_dtype 0, 1, 2), and fp32 [batch][qlen][nhead_q]
     // output of the log-sum-exp of the scaled scores (natural log, sink included)
+    bool per_token_scale = false; // see k_descale_ptr
     const void* sink_ptr = nullptr;
     index_t sink_dtype   = 0;
     float* lse_ptr       = nullptr;
@@ -196,7 +198,8 @@ template <bool kWaveSplit_,
           bool kQoFp16_                  = false,
           FmhaDecodePagedLayout kLayout_ = FmhaDecodePagedLayout::shuffle_5d,
           index_t kHdim_                 = 128,
-          index_t kMTiles_               = 1>
+          index_t kMTiles_               = 1,
+          bool kPerTokenScale_           = false>
 struct FmhaDecodePaged5dKernel
 {
     static constexpr FmhaDecodePagedLayout kLayout = kLayout_;
@@ -230,7 +233,10 @@ struct FmhaDecodePaged5dKernel
     static constexpr index_t kMTiles = kMTiles_;
     static constexpr index_t kMRows  = kRows * kMTiles;
     static_assert(kMTiles == 1 || kMTiles == 2);
-    static constexpr index_t kPageBytes = kPage * kHdim;
+    // per-token K/V scales (k_descale / v_descale: fp32 [num_blocks][nhead_k][page_size]),
+    // staged with each page in LDS
+    static constexpr bool kPerTokenScale = kPerTokenScale_;
+    static constexpr index_t kPageBytes  = kPage * kHdim;
     // pages per wave per step: one (cooperative) or four (wave split)
     static constexpr index_t kWavePages = kWaveSplit ? 4 : 1;
     static constexpr index_t kStages    = kWaveSplit ? 2 : 3;
@@ -251,9 +257,11 @@ struct FmhaDecodePaged5dKernel
     static constexpr index_t kKChunkStride =
         kRowMajor ? 16 : (kWaveSplit && kSubPages > 1 ? 1024 : 256);
     // TDM instructions per step and wave (the waits count them): hnd / nhd copy each page of a
-    // page-16 wave-split step separately
-    static constexpr index_t kTdmPerStep = kRowMajor ? (kWaveSplit && kSubPages == 1 ? 8 : 2)
-                                                     : (kSubPages == 1 ? 2 : (kChunks + 7) / 8 + 1);
+    // page-16 wave-split step separately; two more gather the per-token scales
+    static constexpr index_t kTdmPerStep =
+        (kRowMajor ? (kWaveSplit && kSubPages == 1 ? 8 : 2)
+                   : (kSubPages == 1 ? 2 : (kChunks + 7) / 8 + 1)) +
+        (kPerTokenScale ? 2 : 0);
 
     struct Kargs
     {
@@ -361,6 +369,9 @@ struct FmhaDecodePaged5dKernel
         alignas(16) uint8_t v[kStages][kNumWaves][kPageBuf];
         alignas(16) uint8_t p[kMTiles][kRows][kNumWaves * kPage];
         alignas(16) float red[2][kNumWaves][kMRows]; // per-wave row max / row sum
+        // per-token K and V scales of the stages' pages; each wave's largest V scale of a step
+        alignas(16) float sc[2][kStages][kNumWaves][kPage];
+        float vmax[kNumWaves];
     };
 
     struct alignas(16) SmemWaveSplit
@@ -371,6 +382,8 @@ struct FmhaDecodePaged5dKernel
             {
                 alignas(16) uint8_t k[kStages][kNumWaves][kWavePages][kPageBuf];
                 alignas(16) uint8_t v[kStages][kNumWaves][kWavePages][kPageBuf];
+                // per-token K and V scales of the stages' pages
+                alignas(16) float sc[2][kStages][kNumWaves][kWavePages][kPage];
             } kv;
             // the waves' O for the intra-workgroup merge; padded rows keep the column-wise
             // stores of 16 rows off one bank
@@ -598,6 +611,11 @@ struct FmhaDecodePaged5dKernel
                 false,
                 false);
     }
+    // e with 2^e above x >= 0 (integer ops only)
+    CK_TILE_DEVICE static int32_t ExpAbove(float x)
+    {
+        return static_cast<int32_t>((__float_as_uint(x) >> 23) & 0xff) - 126;
+    }
     // pairwise: shorter dependency chains than a running max or sum
     template <index_t N>
     CK_TILE_DEVICE static float tree_max(const float* x)
@@ -685,7 +703,8 @@ struct FmhaDecodePaged5dKernel
         int32_t bt_cur = load_bt(0), bt_next = load_bt(1);
         index_t cur_chunk = 0;
         // the descales go out with the prologue loads instead of after the Q quantization
-        const float kds = *a.k_descale, vd = *a.v_descale;
+        const float kds = kPerTokenScale ? 1.f : *a.k_descale;
+        const float vd  = kPerTokenScale ? 1.f : *a.v_descale;
         // loads return in order: the block ids, which the first copies wait for, go out first
         __builtin_amdgcn_sched_barrier(0);
 
@@ -727,6 +746,16 @@ struct FmhaDecodePaged5dKernel
             {
                 ignore = q;
                 return &sm.v[st][w][0];
+            }
+        };
+        // per-token scales (kv 0: K, 1: V) of wave w's q-th page of stage st
+        const auto scbuf = [&](index_t kv, index_t st, index_t q) -> float* {
+            if constexpr(kWaveSplit)
+                return &sm.kv.sc[kv][st][w][q][0];
+            else
+            {
+                ignore = q;
+                return &sm.sc[kv][st][w][0];
             }
         };
         // page index (within the split) of wave w's q-th page of step t
@@ -814,6 +843,21 @@ struct FmhaDecodePaged5dKernel
                 const int32_t vrows[1] = {row * kSubPages + sub};
                 tdm_rows<kPageBytes>(a.v, vbuf(t % kStages, 0), vrows);
             }
+            if constexpr(kPerTokenScale)
+            {
+                // after the K/V copies: the pages' 16-token rows of the
+                // [num_blocks][nhead_k][page_size] scales
+                int32_t rows[kWavePages];
+                for(index_t q = 0; q < kWavePages; ++q)
+                {
+                    const index_t idx = min(page_idx(t, q), last);
+                    rows[q] = (block_of(idx) * a.nhead_k + g) * kSubPages + (pg0 + idx) % kSubPages;
+                }
+                tdm_rows<kPage * 4>(
+                    ptr_as<uint8_t>(a.k_descale), ptr_as<uint8_t>(scbuf(0, t % kStages, 0)), rows);
+                tdm_rows<kPage * 4>(
+                    ptr_as<uint8_t>(a.v_descale), ptr_as<uint8_t>(scbuf(1, t % kStages, 0)), rows);
+            }
         };
         index_t issued = min(steps, kStages);
         for(index_t t = 0; t < issued; ++t)
@@ -871,6 +915,10 @@ struct FmhaDecodePaged5dKernel
                 const index_t pg    = pg0 + page_idx(t, q);
                 const index_t valid = __builtin_amdgcn_readfirstlane(
                     pg < pend ? min(max(ctx - pg * kPage, 0), kPage) : 0);
+                // scales past the context may be any bytes: their V scales become 0
+                if constexpr(kPerTokenScale)
+                    if(l >= valid && l < kPage)
+                        scbuf(1, t % kStages, q)[l] = 0.f;
                 uint8_t* vd8 = vbuf(t % kStages, q);
                 if constexpr(kRowMajor)
                 {
@@ -905,6 +953,9 @@ struct FmhaDecodePaged5dKernel
         };
 
         float m_run[kMTiles], l_run[kMTiles];
+        // per-token: P^T bytes carry vs / 2^e_run, 2^e_run above every V scale seen so far (P
+        // stays within e4m3); O is accumulated in units of 2^-e_run
+        [[maybe_unused]] int32_t e_run = -127;
         // 16-wide head-dim blocks per wave and tile: all of them, or every fourth (cooperative)
         constexpr index_t kAcc = kWaveSplit ? kOutBlocks : kOutBlocks / kNumWaves;
         v8f acc[kMTiles][kAcc];
@@ -925,6 +976,7 @@ struct FmhaDecodePaged5dKernel
                                  index_t kt,
                                  index_t pg_first,
                                  index_t tok_h,
+                                 const float* ksc,
                                  float(&sv)[kMTiles][8],
                                  auto masked) {
             const uint8_t* kb = kbuf(st, kq) + kt * kKTokStride;
@@ -947,11 +999,24 @@ struct FmhaDecodePaged5dKernel
                 for(index_t i = 0; i < kMTiles; ++i)
                     st8[i] = wmma_qk(kf, qf[i] + ks * kQkChunks * 2, st8[i]);
             }
+            // per-token: the K scales of the 8 key rows (ksc), one multiply per score
+            float k8[8];
+            if constexpr(kPerTokenScale)
+                for(index_t r4 = 0; r4 < 2; ++r4)
+                {
+                    const float4 x = *ptr_as<float4>(ksc + 4 * r4);
+                    k8[4 * r4]     = x.x;
+                    k8[4 * r4 + 1] = x.y;
+                    k8[4 * r4 + 2] = x.z;
+                    k8[4 * r4 + 3] = x.w;
+                }
+            else
+                ignore = ksc;
 #pragma unroll
             for(index_t i = 0; i < kMTiles; ++i)
                 for(index_t r = 0; r < 8; ++r)
                 {
-                    sv[i][r] = st8[i][r];
+                    sv[i][r] = kPerTokenScale ? st8[i][r] * k8[r] : st8[i][r];
                     if constexpr(decltype(masked)::value)
                     {
                         const index_t pos = pg_first * kPage + tok_h + r;
@@ -985,6 +1050,7 @@ struct FmhaDecodePaged5dKernel
                                 (j % 2) * 8 + (n & 7),
                                 pgw + 2 * h + j / 2,
                                 (j % 2) * 8,
+                                scbuf(0, st, 2 * h + j / 2) + (j % 2) * 8,
                                 sj,
                                 masked);
 #pragma unroll
@@ -997,6 +1063,29 @@ struct FmhaDecodePaged5dKernel
                     qk4(bool_constant<false>{});
                 else
                     qk4(bool_constant<true>{});
+                // per-token: the V scales of this lane's tokens; e_run grows with the wave's
+                // largest, cfac rescales O when it does
+                [[maybe_unused]] float vw[kWavePages][8];
+                [[maybe_unused]] float cfac = 1.f;
+                if constexpr(kPerTokenScale)
+                {
+                    float vmx = 0.f;
+                    for(index_t j = 0; j < kWavePages; ++j)
+                        for(index_t r4 = 0; r4 < 2; ++r4)
+                        {
+                            const float4 x =
+                                *ptr_as<float4>(scbuf(1, st, 2 * h + j / 2) + (j % 2) * 8 + 4 * r4);
+                            vw[j][4 * r4]     = x.x;
+                            vw[j][4 * r4 + 1] = x.y;
+                            vw[j][4 * r4 + 2] = x.z;
+                            vw[j][4 * r4 + 3] = x.w;
+                            vmx               = fmaxf(fmaxf(vmx, fmaxf(x.x, x.y)), fmaxf(x.z, x.w));
+                        }
+                    vmx                 = fmaxf(vmx, __shfl_xor(vmx, 16, 32));
+                    const int32_t e_new = max(e_run, ExpAbove(vmx));
+                    cfac                = __builtin_amdgcn_ldexpf(1.f, e_run - e_new);
+                    e_run               = e_new;
+                }
                 v8i pf[kMTiles];
 #pragma unroll
                 for(index_t i = 0; i < kMTiles; ++i)
@@ -1005,7 +1094,8 @@ struct FmhaDecodePaged5dKernel
                     mx                = fmaxf(mx, __shfl_xor(mx, 16, 32)) * scl[i];
                     const float m_new = fmaxf(m_run[i], mx);
                     const float m_use = is_neg_inf(m_new) ? 0.f : m_new;
-                    const float c     = kLog2P - m_use;
+                    const float c =
+                        kLog2P - m_use - (kPerTokenScale ? static_cast<float>(e_run) : 0.f);
                     float pv[kWavePages][8];
                     int32_t pk[8];
                     for(index_t j = 0; j < kWavePages; ++j)
@@ -1015,23 +1105,25 @@ struct FmhaDecodePaged5dKernel
                             const float p1    = exp2(fmaf(sv[i][j][2 * r2 + 1], scl[i], c));
                             pv[j][2 * r2]     = p0;
                             pv[j][2 * r2 + 1] = p1;
+                            const float q0    = kPerTokenScale ? p0 * vw[j][2 * r2] : p0;
+                            const float q1    = kPerTokenScale ? p1 * vw[j][2 * r2 + 1] : p1;
                             const index_t e   = j * 8 + 2 * r2; // operand byte
                             pk[e / 4] =
                                 (e & 3) == 0
-                                    ? __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, 0, false)
-                                    : __builtin_amdgcn_cvt_pk_fp8_f32(p0, p1, pk[e / 4], true);
+                                    ? __builtin_amdgcn_cvt_pk_fp8_f32(q0, q1, 0, false)
+                                    : __builtin_amdgcn_cvt_pk_fp8_f32(q0, q1, pk[e / 4], true);
                         }
                     float ps = tree_sum<kWavePages * 8>(&pv[0][0]);
                     ps       = ps + __shfl_xor(ps, 16, 32);
-                    // rescale only when a row max grew
-                    if(__builtin_amdgcn_ballot_w32(m_new > m_run[i]) != 0)
+                    // rescale only when a row max (or c) grew
+                    if(__builtin_amdgcn_ballot_w32(m_new > m_run[i] || cfac < 1.f) != 0)
                     {
                         const float alpha = exp2(m_run[i] - m_use);
                         l_run[i] *= alpha;
                         for(index_t db = 0; db < kAcc; ++db)
-                            acc[i][db] *= alpha;
+                            acc[i][db] *= alpha * cfac;
                     }
-                    l_run[i] += ps;
+                    l_run[i] += kPerTokenScale ? __builtin_amdgcn_ldexpf(ps, e_run) : ps;
                     m_run[i] = m_new;
                     pf[i]    = v8i{pk[0], pk[1], pk[2], pk[3], pk[4], pk[5], pk[6], pk[7]};
                 }
@@ -1077,10 +1169,29 @@ struct FmhaDecodePaged5dKernel
                 const index_t st = t % kStages;
                 const index_t pg = pg0 + page_idx(t, 0);
                 float sv[kMTiles][8];
+                const float* ksc = scbuf(0, st, 0) + h * 8;
                 if(inside(pg, 1))
-                    qk_tile(st, 0, n, pg, h * 8, sv, bool_constant<false>{});
+                    qk_tile(st, 0, n, pg, h * 8, ksc, sv, bool_constant<false>{});
                 else
-                    qk_tile(st, 0, n, pg, h * 8, sv, bool_constant<true>{});
+                    qk_tile(st, 0, n, pg, h * 8, ksc, sv, bool_constant<true>{});
+                // per-token: the V scales of this lane's 8 tokens and the page's largest
+                [[maybe_unused]] float v8[8];
+                if constexpr(kPerTokenScale)
+                {
+                    float vmx = 0.f;
+                    for(index_t r4 = 0; r4 < 2; ++r4)
+                    {
+                        const float4 x = *ptr_as<float4>(scbuf(1, st, 0) + h * 8 + 4 * r4);
+                        v8[4 * r4]     = x.x;
+                        v8[4 * r4 + 1] = x.y;
+                        v8[4 * r4 + 2] = x.z;
+                        v8[4 * r4 + 3] = x.w;
+                        vmx            = fmaxf(fmaxf(vmx, fmaxf(x.x, x.y)), fmaxf(x.z, x.w));
+                    }
+                    vmx = fmaxf(vmx, __shfl_xor(vmx, 16, 32));
+                    if(l == 0)
+                        sm.vmax[w] = vmx;
+                }
 #pragma unroll
                 for(index_t i = 0; i < kMTiles; ++i)
                 {
@@ -1097,6 +1208,18 @@ struct FmhaDecodePaged5dKernel
                     issue(t + 2);
                     ++issued;
                 }
+                // per-token: e_run grows with the workgroup's largest V scale, cfac rescales O
+                // when it does
+                [[maybe_unused]] float cfac = 1.f;
+                if constexpr(kPerTokenScale)
+                {
+                    float vstep = sm.vmax[0];
+                    for(index_t k = 1; k < kNumWaves; ++k)
+                        vstep = fmaxf(vstep, sm.vmax[k]);
+                    const int32_t e_new = max(e_run, ExpAbove(vstep));
+                    cfac                = __builtin_amdgcn_ldexpf(1.f, e_run - e_new);
+                    e_run               = e_new;
+                }
                 float m_new[kMTiles], m_use[kMTiles];
 #pragma unroll
                 for(index_t i = 0; i < kMTiles; ++i)
@@ -1104,14 +1227,18 @@ struct FmhaDecodePaged5dKernel
                     float m_step = sm.red[0][0][i * kRows + n];
                     for(index_t k = 1; k < kNumWaves; ++k)
                         m_step = fmaxf(m_step, sm.red[0][k][i * kRows + n]);
-                    m_new[i]      = fmaxf(m_run[i], m_step);
-                    m_use[i]      = is_neg_inf(m_new[i]) ? 0.f : m_new[i];
-                    const float c = kLog2P - m_use[i];
+                    m_new[i] = fmaxf(m_run[i], m_step);
+                    m_use[i] = is_neg_inf(m_new[i]) ? 0.f : m_new[i];
+                    const float c =
+                        kLog2P - m_use[i] - (kPerTokenScale ? static_cast<float>(e_run) : 0.f);
                     float pv[8];
                     for(index_t r = 0; r < 8; ++r)
                         pv[r] = exp2(fmaf(sv[i][r], scl[i], c));
-                    float ps   = tree_sum<8>(pv);
-                    ps         = ps + __shfl_xor(ps, 16, 32);
+                    float ps = tree_sum<8>(pv);
+                    ps       = ps + __shfl_xor(ps, 16, 32);
+                    if constexpr(kPerTokenScale)
+                        for(index_t r = 0; r < 8; ++r)
+                            pv[r] *= v8[r];
                     int32_t p0 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[0], pv[1], 0, false);
                     p0         = __builtin_amdgcn_cvt_pk_fp8_f32(pv[2], pv[3], p0, true);
                     int32_t p1 = __builtin_amdgcn_cvt_pk_fp8_f32(pv[4], pv[5], 0, false);
@@ -1132,7 +1259,9 @@ struct FmhaDecodePaged5dKernel
                     for(index_t k = 0; k < kNumWaves; ++k)
                         psum += sm.red[1][k][i * kRows + n];
                     alpha[i] = exp2(m_run[i] - m_use[i]);
-                    l_run[i] = l_run[i] * alpha[i] + psum;
+                    l_run[i] = l_run[i] * alpha[i] +
+                               (kPerTokenScale ? __builtin_amdgcn_ldexpf(psum, e_run) : psum);
+                    alpha[i] *= cfac;
                     m_run[i] = m_new[i];
                     // tokens of pages h and h + 2 on both operands
                     const v4i px = *ptr_as<v4i>(&sm.p[i][n][h * kPage]);
@@ -1201,7 +1330,8 @@ struct FmhaDecodePaged5dKernel
                 float M = -numeric<float>::infinity();
                 for(index_t k = 0; k < kNumWaves; ++k)
                     M = fmaxf(M, sm.ml[0][k][n]);
-                const float f = exp2(m_run[i] - (is_neg_inf(M) ? 0.f : M));
+                const float f = exp2(m_run[i] - (is_neg_inf(M) ? 0.f : M)) *
+                                (kPerTokenScale ? __builtin_amdgcn_ldexpf(1.f, e_run) : 1.f);
                 for(index_t db = 0; db < kAcc; ++db)
                 {
                     const v8f x = acc[i][db] * f;
@@ -1265,19 +1395,22 @@ struct FmhaDecodePaged5dKernel
                 }
             };
             const index_t lr = i * kRows + row; // row within the block
+            // per-token, cooperative: acc is in units of 2^-e_run (wave split folds it above)
+            const float cfin =
+                kPerTokenScale && !kWaveSplit ? __builtin_amdgcn_ldexpf(1.f, e_run) : 1.f;
             if constexpr(kNumSplits == 1)
             {
                 const index_t r   = rb * kMRows + lr;
                 const bool writer = kWaveSplit ? (threadIdx.x % 8 == 0) : (w == 0 && h == 0);
                 if(r < a.rows)
                     store_row(a.o + RowOffset(a, b, g, r),
-                              Finish(a, b, g, r, m_row, l_row, vd, writer),
+                              Finish(a, b, g, r, m_row, l_row, vd, writer) * cfin,
                               pack_out);
             }
             else
             {
                 store_row(a.ws_o + (part0 + s * kMRows + lr) * kHdim,
-                          l_row > 0.f ? 1.f / l_row : 0.f,
+                          (l_row > 0.f ? 1.f / l_row : 0.f) * cfin,
                           pack_part);
                 const bool ml_writer = kWaveSplit ? (threadIdx.x % 8 == 0) : (w == 0 && h == 0);
                 if(ml_writer)

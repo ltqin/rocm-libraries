@@ -28,6 +28,7 @@ int main(int argc, char* argv[])
         .insert("layout", "auto", "auto, coop or wave")
         .insert("m_tiles", "0", "16-row tiles per workgroup: 1 or 2; 0 = heuristic")
         .insert("sink", "0", "random sinks per q head")
+        .insert("per_token", "0", "per-token K/V scales instead of one each")
         .insert("lse", "0", "store (and validate) the log-sum-exp")
         .insert("v", "1", "validate against the CPU reference")
         .insert("seed", "1", "random seed")
@@ -53,6 +54,7 @@ int main(int argc, char* argv[])
     c.qlen                      = arg_parser.get_int("q_len");
     c.m_tiles                   = arg_parser.get_int("m_tiles");
     c.sink                      = arg_parser.get_bool("sink");
+    c.per_token                 = arg_parser.get_bool("per_token");
     c.lse                       = arg_parser.get_bool("lse");
     c.fp16                      = arg_parser.get_str("prec") == "fp16";
     const std::string kv_layout = arg_parser.get_str("kv_layout");

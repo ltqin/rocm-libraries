@@ -44,7 +44,7 @@ def _load():
             + [ctypes.c_void_p] * 3
             + [ctypes.c_void_p, ctypes.c_int]
             + [ctypes.c_void_p] * 4
-            + [ctypes.c_int] * 10
+            + [ctypes.c_int] * 11
             + [ctypes.c_float, ctypes.c_void_p]
         )
         _lib = lib
@@ -100,8 +100,8 @@ def pa_decode(
     softmax_scale,
     query_length=1,
     *,
-    key_scale=None,  # [1] float32 on the device
-    value_scale=None,  # [1] float32 on the device
+    key_scale=None,  # [1], or per token [num_blocks, num_kv_heads, page(, 1)], fp32 on the device
+    value_scale=None,  # as key_scale
     sliding_window=0,  # keys attended, the query's own included; 0 = no window
     sinks=None,  # [num_query_heads] logits joining every denominator; -inf: none
     lse=None,  # optional fp32 [num_seqs * query_length, num_query_heads] output
@@ -192,6 +192,21 @@ def pa_decode(
         raise ValueError(
             "lse must be a contiguous fp32 [num_seqs * query_length, num_query_heads]"
         )
+    per_token = isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1
+    if per_token:
+        scale_shape = (num_blocks, nhead_k, page)
+        for name, sc in (("key_scale", key_scale), ("value_scale", value_scale)):
+            if (
+                not isinstance(sc, torch.Tensor)
+                or sc.dtype != torch.float32
+                or not sc.is_contiguous()
+                or tuple(sc.shape[:3]) != scale_shape
+                or sc.numel() != num_blocks * nhead_k * page
+            ):
+                raise ValueError(
+                    f"per-token {name} must be a contiguous fp32 {list(scale_shape)} (or with "
+                    "a trailing 1), like key_scale"
+                )
     tensors = [output, query, key_cache, value_cache, context_lengths, block_tables]
     tensors += [t for t in (sinks, lse) if t is not None]
     tensors += [s for s in (key_scale, value_scale) if isinstance(s, torch.Tensor)]
@@ -227,8 +242,8 @@ def pa_decode(
         block_tables.data_ptr(),
         block_tables.stride(0),
         context_lengths.data_ptr(),
-        _scale_ptr(key_scale, device),
-        _scale_ptr(value_scale, device),
+        key_scale.data_ptr() if per_token else _scale_ptr(key_scale, device),
+        value_scale.data_ptr() if per_token else _scale_ptr(value_scale, device),
         0 if sinks is None else sinks.data_ptr(),
         0 if sinks is None else SINK_DTYPES[sinks.dtype],
         output.data_ptr(),
@@ -245,6 +260,7 @@ def pa_decode(
         hdim,
         KV_LAYOUTS[kv_layout],
         1 if query.dtype == torch.float16 else 0,
+        1 if per_token else 0,
         float(softmax_scale),
         stream,
     )
