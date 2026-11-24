@@ -1169,6 +1169,27 @@ fwd_result fmha_fwd_run(mode_enum mode,
                                                       hdim_v,
                                                       p_drop,
                                                       num_splits);
+        // The fp8bf16 d128 decode instances combine up to a cluster of splits themselves
+        // (FmhaFwdSplitKVKernel::ClusterCombine), which makes short splits pay: a power of
+        // two with two tiles or more each, on a grid of at most 512 workgroups. Longer
+        // ranges, which want more splits than a cluster holds, keep the split count above.
+        const int max_cluster = ck_tile::get_max_cluster_size();
+        if(tdm && data_type == "fp8bf16" && hdim_q == 128 && hdim_v == 128 &&
+           mode == mode_enum::batch && (qscale.type == quant_scale_enum::pertensor || dynamic_q) &&
+           nhead_merged < nhead && p_drop == 0.0f && 1 < max_cluster && num_splits <= max_cluster)
+        {
+            constexpr int kN0           = 64;
+            constexpr int kMaxWorkgroup = 512;
+            const int num_kv_tiles      = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
+            const int num_m_blocks      = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
+            const int limit             = std::min({max_cluster,
+                                                    num_kv_tiles / 2,
+                                                    kMaxWorkgroup / (batch * nhead_merged * num_m_blocks)});
+            int cluster_splits          = 1;
+            while(2 * cluster_splits <= limit)
+                cluster_splits *= 2;
+            num_splits = std::max(num_splits, cluster_splits);
+        }
     }
     if(128 < num_splits)
     {

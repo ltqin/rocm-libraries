@@ -30,7 +30,9 @@ template <typename T>
 using has_dynamic_q = decltype(T::kDynamicQ);
 } // namespace detail
 
-template <typename FmhaPipeline_, typename EpiloguePipeline_>
+// FinalODataType_: the type of the final output for kernels that can combine their splits
+// themselves (see ClusterCombine); void for kernels that leave it to the combine kernel.
+template <typename FmhaPipeline_, typename EpiloguePipeline_, typename FinalODataType_ = void>
 struct FmhaFwdSplitKVKernel
 {
     using FmhaPipeline                            = ck_tile::remove_cvref_t<FmhaPipeline_>;
@@ -136,6 +138,15 @@ struct FmhaFwdSplitKVKernel
     }();
     static_assert(QScaleEnum != BlockAttentionQuantScaleEnum::DYNAMIC_Q || kPipelineQuantizesQ,
                   "split-kv dynamic Q needs a pipeline that quantizes Q (kDynamicQ)");
+
+    // The kernel can combine its splits (ClusterCombine) when launched with the splits of a
+    // tile as one workgroup cluster; kargs.o_ptr selects it at launch.
+    static constexpr bool kClusterCombine = !std::is_void_v<FinalODataType_>;
+    static_assert(!kClusterCombine ||
+                      (kMergeNumHeadGroupsSeqLenQ && !kIsGroupMode && kUsesTdmAffineDramPath),
+                  "cluster combine: merged-head batch mode on the gfx1250 TDM pipelines");
+    // splits one cluster combines; a cluster holds at most 16 workgroups
+    static constexpr index_t kMaxClusterSplits = 16;
 
     // clang-format off
     template <typename T> struct t2s;
@@ -310,6 +321,18 @@ struct FmhaFwdSplitKVKernel
         const int32_t* cache_batch_idx;
     };
 
+    // The final output of a cluster-combining launch; o_ptr == nullptr leaves the splits in
+    // o_acc / lse_acc for the combine kernel.
+    struct ClusterCombineKargs
+    {
+        void* o_ptr                       = nullptr;
+        void* lse_ptr                     = nullptr; // optional
+        ck_tile::index_t nhead_stride_o   = 0;
+        ck_tile::index_t batch_stride_o   = 0;
+        ck_tile::index_t nhead_stride_lse = 0;
+        ck_tile::index_t batch_stride_lse = 0;
+    };
+
     struct BatchModeKargs
         : CommonKargs,
           std::conditional_t<BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS,
@@ -332,6 +355,8 @@ struct FmhaFwdSplitKVKernel
                                          // single vcache page-block
         ck_tile::index_t batch_stride_lse_acc;
         ck_tile::index_t batch_stride_o_acc;
+
+        std::conditional_t<kClusterCombine, ClusterCombineKargs, EmptyKargs<6>> combine = {};
     };
 
     struct GroupModeKargs
@@ -1354,7 +1379,153 @@ struct FmhaFwdSplitKVKernel
                              {i_m0, i_n1});
 
         EpiloguePipeline{}(o_acc_dram_window, o_acc_tile, nullptr);
+
+        if constexpr(kClusterCombine)
+        {
+            if(kargs.combine.o_ptr != nullptr)
+                ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch);
+        }
     }
+
+    // Combines the splits of this tile into the final output. The num_splits workgroups of the
+    // tile must be one workgroup cluster (launch with cluster x = num_splits <=
+    // kMaxClusterSplits) and seqlen_q must be 1, so that a row is a Q head. After the cluster
+    // barrier every split's o_acc / lse_acc is visible, and each workgroup combines its share
+    // of the rows.
+    template <bool Cond = kClusterCombine>
+    CK_TILE_DEVICE static std::enable_if_t<Cond> ClusterCombine(
+        const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
+    {
+#if defined(__gfx125__)
+        const index_t num_splits = kargs.num_splits;
+        if(num_splits > 1)
+        {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
+            cluster_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
+        }
+        // the splits padded to a power of two, so that a thread's loads are a constant count
+        if(num_splits <= 2)
+            CombineRows<2>(kargs, i_m0, i_split, i_nhead, i_batch);
+        else if(num_splits <= 4)
+            CombineRows<4>(kargs, i_m0, i_split, i_nhead, i_batch);
+        else if(num_splits <= 8)
+            CombineRows<8>(kargs, i_m0, i_split, i_nhead, i_batch);
+        else
+            CombineRows<16>(kargs, i_m0, i_split, i_nhead, i_batch);
+#else
+        ignore = kargs;
+        ignore = i_m0;
+        ignore = i_split;
+        ignore = i_nhead;
+        ignore = i_batch;
+#endif
+    }
+
+#if defined(__gfx125__)
+    // The rows of split i_split, for num_splits <= kSplits: 64 threads per row with 2 head dims
+    // each, and kMaxClusterSplits / kSplits rows per thread. A thread issues all its loads
+    // before it uses one; splits past num_splits read the last one again and weigh nothing.
+    template <index_t kSplits, bool Cond = kClusterCombine>
+    CK_TILE_DEVICE static std::enable_if_t<Cond>
+    CombineRows(const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
+    {
+        using FinalODataType       = FinalODataType_;
+        constexpr index_t kThreads = 64; // per row
+        constexpr index_t kRows    = kMaxClusterSplits / kSplits;
+        static_assert(FmhaPipeline::kM0 <= kMaxClusterSplits);
+        static_assert(kBlockSize == 2 * kThreads || kBlockSize == 4 * kThreads);
+        constexpr index_t kRowGroups = 2; // of the wave32 block
+
+        const index_t num_splits  = kargs.num_splits;
+        const index_t i_head0     = i_nhead * kargs.nhead_ratio_qk;
+        const OaccDataType* o_acc = reinterpret_cast<const OaccDataType*>(kargs.o_acc_ptr) +
+                                    static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
+                                    static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc;
+        const LSEDataType* lse_acc =
+            reinterpret_cast<const LSEDataType*>(kargs.lse_acc_ptr) +
+            static_cast<long_index_t>(i_head0) * kargs.nhead_stride_lse_acc +
+            static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc;
+        FinalODataType* o = reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
+                            static_cast<long_index_t>(i_head0) * kargs.combine.nhead_stride_o +
+                            static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o;
+
+        // rows [row0, row_end) of the tile are this split's
+        const index_t num_rows = min(kargs.nhead_ratio_qk - i_m0, FmhaPipeline::kM0);
+        const index_t rows_per = (FmhaPipeline::kM0 + num_splits - 1) / num_splits;
+        const index_t row0     = i_split * rows_per;
+        const index_t row_end  = min(row0 + rows_per, num_rows);
+        const index_t i_group  = threadIdx.x / kThreads;
+        const index_t i_d      = (threadIdx.x % kThreads) * 2;
+        if(i_d >= kargs.hdim_v || row0 + i_group >= row_end)
+            return;
+
+        // the two head dims of a thread as one load
+        using OaccPair = ext_vector_t<OaccDataType, 2>;
+        LSEDataType lse[kRows][kSplits];
+        OaccPair part[kRows][kSplits];
+        for(index_t j = 0; j < kRows; ++j)
+        {
+            // rows past the share read its last row again and are not stored
+            const index_t i_row = i_m0 + min(row0 + j * kRowGroups + i_group, row_end - 1);
+            for(index_t s = 0; s < kSplits; ++s)
+            {
+                const index_t i_s = min(s, num_splits - 1);
+                lse[j][s] = lse_acc[static_cast<long_index_t>(i_s) * kargs.split_stride_lse_acc +
+                                    static_cast<long_index_t>(i_row) * kargs.nhead_stride_lse_acc];
+                const OaccDataType* src =
+                    o_acc + static_cast<long_index_t>(i_s) * kargs.split_stride_o_acc +
+                    static_cast<long_index_t>(i_row) * kargs.nhead_stride_o_acc + i_d;
+                __builtin_memcpy(&part[j][s], src, sizeof(OaccPair));
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+        for(index_t j = 0; j < kRows; ++j)
+        {
+            const index_t row = row0 + j * kRowGroups + i_group;
+            if(row >= row_end)
+                break;
+            const index_t i_row = i_m0 + row;
+
+            LSEDataType lse_max = -numeric<LSEDataType>::infinity();
+            for(index_t s = 0; s < kSplits; ++s)
+            {
+                lse[j][s] = s < num_splits ? lse[j][s] : -numeric<LSEDataType>::infinity();
+                lse_max   = max(lse_max, lse[j][s]);
+            }
+            // a row without keys in any split is all zeros
+            const bool empty = lse_max == -numeric<LSEDataType>::infinity();
+            LSEDataType sum  = 0;
+            OaccDataType o0  = 0;
+            OaccDataType o1  = 0;
+            for(index_t s = 0; s < kSplits; ++s)
+            {
+                const LSEDataType w =
+                    empty ? LSEDataType(0)
+                          : ck_tile::exp2((lse[j][s] - lse_max) * log2e_v<LSEDataType>);
+                sum += w;
+                o0 += w * part[j][s][0];
+                o1 += w * part[j][s][1];
+            }
+            const LSEDataType rcp = empty ? LSEDataType(0) : LSEDataType(1) / sum;
+
+            FinalODataType* dst =
+                o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o + i_d;
+            dst[0] = type_convert<FinalODataType>(o0 * rcp);
+            dst[1] = type_convert<FinalODataType>(o1 * rcp);
+
+            if(kargs.combine.lse_ptr != nullptr && i_d == 0)
+            {
+                LSEDataType* lse_out =
+                    reinterpret_cast<LSEDataType*>(kargs.combine.lse_ptr) +
+                    static_cast<long_index_t>(i_head0 + i_row) * kargs.combine.nhead_stride_lse +
+                    static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_lse;
+                *lse_out = empty ? lse_max : ck_tile::log(sum) + lse_max;
+            }
+        }
+    }
+#endif
 };
 
 } // namespace ck_tile

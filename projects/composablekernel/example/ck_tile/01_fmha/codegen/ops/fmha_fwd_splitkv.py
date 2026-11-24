@@ -140,7 +140,16 @@ using fmha_epilogue =
                                            false, false>>;
 
 using fmha_kernel =
-    ck_tile::FmhaFwdSplitKVKernel<fmha_pipeline, fmha_epilogue>;
+    ck_tile::FmhaFwdSplitKVKernel<fmha_pipeline, fmha_epilogue{F_final_o}>;
+
+// The launch combines the splits itself, without the combine kernel: decode (one query token)
+// with the splits of a tile as one workgroup cluster.
+static bool combines(const fmha_fwd_splitkv_args& a)
+{{
+    using k_ = fmha_kernel;
+    return k_::kClusterCombine && a.max_seqlen_q == 1 && a.o_ptr != nullptr &&
+           a.num_splits <= std::min<int>(ck_tile::get_max_cluster_size(), k_::kMaxClusterSplits);
+}}
 
 static void run(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a)
 {{
@@ -150,6 +159,23 @@ static void run(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a)
     constexpr ck_tile::index_t kBlockPerCu = k_::kMaxWavesPerEu == 0 ? k_::kBlockPerCu : 0;
     using attr_ = std::conditional_t<k_::kMaxWavesPerEu == 0, {F_arch.tag},
         ck_tile::kernel_attr_for<{F_arch.tag}, ck_tile::kernel_attr_max_waves_per_eu<k_::kMaxWavesPerEu>>>;
+#if CK_TILE_ENABLE_CLUSTER_LAUNCH
+    if constexpr(k_::kClusterCombine) {{
+        if(combines(a)) {{
+            kargs.combine.o_ptr            = a.o_ptr;
+            kargs.combine.lse_ptr          = a.lse_ptr;
+            kargs.combine.nhead_stride_o   = a.nhead_stride_o;
+            kargs.combine.batch_stride_o   = a.batch_stride_o;
+            kargs.combine.nhead_stride_lse = a.nhead_stride_lse;
+            kargs.combine.batch_stride_lse = a.batch_stride_lse;
+            if(a.num_splits > 1) {{
+                ck_tile::make_cluster_kernel<kBlockPerCu, attr_>(
+                    k_{{}}, dim3(a.num_splits, 1, 1), grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
+                return;
+            }}
+        }}
+    }}
+#endif
     ck_tile::make_kernel<kBlockPerCu, attr_>(k_{{}}, grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
 }}
 }}; // struct instance
@@ -180,6 +206,20 @@ void run_instance(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a) {{
 }}
 }} // anonymous namespace
 
+namespace {{
+// combines() of the instance run_instance launches
+template <typename = void>
+bool instance_combines(const fmha_fwd_splitkv_args& a) {{
+    if constexpr ({F_bias} == ck_tile::BlockAttentionBiasEnum::NO_BIAS && (!{F_sink} || {F_merge_sink})
+                  && (std::is_same_v<{F_mask}, ck_tile::SimplifiedGenericAttentionMask<false>>
+                      || std::is_same_v<{F_mask}, FmhaMasks::NoMask> || {F_merge_masked})) {{
+        if (a.max_seqlen_q == 1 && a.nhead_k < a.nhead_q)
+            return instance</*kHasUnevenSplits=*/true, /*kMergeNumHeadGroupsSeqLenQ=*/true>::combines(a);
+    }}
+    return false;
+}}
+}} // anonymous namespace
+
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
@@ -200,6 +240,12 @@ void fmha_fwd_splitkv_oneshot_<trait_{F_idx}, {F_arch.tag}>(const ck_tile::strea
     }} else {{
         run_instance</*kHasUnevenSplits=*/true>(s, a);
     }}
+}}
+
+template<>
+bool fmha_fwd_splitkv_combines_<trait_{F_idx}, {F_arch.tag}>(const fmha_fwd_splitkv_args& a)
+{{
+    return instance_combines<>(a);
 }}
 
 template<>
@@ -303,6 +349,11 @@ float fmha_fwd_splitkv_(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a
             << ", " << fmha_fwd_splitkv_get_name_<fmha_fwd_splitkv_traits_, Arch>()
             << ", " << fmha_fwd_splitkv_combine_get_name_<fmha_fwd_splitkv_combine_traits_, Arch>()
             << std::flush;
+
+    // the split kernel writes the output itself
+    if(fmha_fwd_splitkv_combines_<fmha_fwd_splitkv_traits_, Arch>(a))
+        return ck_tile::launch_kernel(s,
+            [=](const ck_tile::stream_config& s_){{ fmha_fwd_splitkv_oneshot_<fmha_fwd_splitkv_traits_, Arch>(s_, a); }});
 
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_fwd_splitkv_oneshot_<fmha_fwd_splitkv_traits_, Arch>(s_, a); }},
@@ -782,6 +833,13 @@ class FmhaFwdSplitKVKernel:
             F_pagedkv=BOOL_MAP[self.F_pipeline.F_pagedkv],
             F_occupancy=self.F_tile.F_occupancy,
             F_sink=BOOL_MAP[self.F_pipeline.F_sink],
+            # the batch-mode pingpong instances can combine their splits (ClusterCombine)
+            F_final_o=(
+                ", std::conditional_t<kMergeNumHeadGroupsSeqLenQ, "
+                f"typename FmhaFwdTypeConfig<{FWD_DTYPE_MAP[self.F_dtype]}>::ODataType, void>"
+            )
+            if self.F_pipeline.tag == "qr_tdm_pingpong" and self.F_mode == "batch"
+            else "",
             F_qscale=qscale_template_arg(self.F_pipeline.F_qscale),
             F_kvlayout=kvlayout_template_arg(
                 self.F_pipeline.F_qscale, self.F_pipeline.F_kvlayout
