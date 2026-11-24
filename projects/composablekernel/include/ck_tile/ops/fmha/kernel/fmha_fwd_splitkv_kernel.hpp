@@ -880,6 +880,16 @@ struct FmhaFwdSplitKVKernel
                                batch_offset_o_acc + i_split * kargs.split_stride_o_acc;
 
         // Q/K/V DRAM and DRAM window
+        // The merged rows, (Q head of the group, seqlen_q), of the Q, lse_acc and o_acc views.
+        // Built once: the transform computes the magic numbers of its division from the
+        // run-time lengths.
+        [[maybe_unused]] const auto merge_rows = [&] {
+            if constexpr(kMergeNumHeadGroupsSeqLenQ)
+                return make_merge_transform(make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q));
+            else
+                return 0;
+        }();
+
         const auto q_dram = [&] {
             const auto q_dram_naive = [&] {
                 if constexpr(kMergeNumHeadGroupsSeqLenQ)
@@ -895,9 +905,7 @@ struct FmhaFwdSplitKVKernel
 
                     return transform_tensor_view(
                         view,
-                        make_tuple(
-                            make_merge_transform(make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q)),
-                            make_pass_through_transform(kargs.hdim_q)),
+                        make_tuple(merge_rows, make_pass_through_transform(kargs.hdim_q)),
                         make_tuple(sequence<0, 1>{}, sequence<2>{}),
                         make_tuple(sequence<0>{}, sequence<1>{}));
                 }
@@ -1174,8 +1182,7 @@ struct FmhaFwdSplitKVKernel
                             number<1>{});
 
                         return transform_tensor_view(view,
-                                                     make_tuple(make_merge_transform(make_tuple(
-                                                         kargs.nhead_ratio_qk, kargs.seqlen_q))),
+                                                     make_tuple(merge_rows),
                                                      make_tuple(sequence<0, 1>{}),
                                                      make_tuple(sequence<0>{}));
                     }
@@ -1350,9 +1357,7 @@ struct FmhaFwdSplitKVKernel
 
                     return transform_tensor_view(
                         view,
-                        make_tuple(
-                            make_merge_transform(make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q)),
-                            make_pass_through_transform(kargs.hdim_v)),
+                        make_tuple(merge_rows, make_pass_through_transform(kargs.hdim_v)),
                         make_tuple(sequence<0, 1>{}, sequence<2>{}),
                         make_tuple(sequence<0>{}, sequence<1>{}));
                 }
