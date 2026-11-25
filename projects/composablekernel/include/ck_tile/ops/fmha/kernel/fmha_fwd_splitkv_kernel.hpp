@@ -1428,19 +1428,25 @@ struct FmhaFwdSplitKVKernel
     }
 
 #if defined(__gfx125__)
-    // The rows of split i_split, for num_splits <= kSplits: 64 threads per row with 2 head dims
-    // each, and kMaxClusterSplits / kSplits rows per thread. A thread issues all its loads
-    // before it uses one; splits past num_splits read the last one again and weigh nothing.
+    // The rows of split i_split, for num_splits <= kSplits: kThreads threads per row with kDims
+    // head dims each (hdim_v is a multiple of kDims), a 16-byte store of the output. A thread
+    // issues all its loads before it uses one; splits past num_splits read the last one again
+    // and weigh nothing.
     template <index_t kSplits, bool Cond = kClusterCombine>
     CK_TILE_DEVICE static std::enable_if_t<Cond>
     CombineRows(const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
     {
         using FinalODataType       = FinalODataType_;
-        constexpr index_t kThreads = 64; // per row
-        constexpr index_t kRows    = kMaxClusterSplits / kSplits;
-        static_assert(FmhaPipeline::kM0 <= kMaxClusterSplits);
-        static_assert(kBlockSize == 2 * kThreads || kBlockSize == 4 * kThreads);
-        constexpr index_t kRowGroups = 2; // of the wave32 block
+        constexpr index_t kDims    = 16 / sizeof(FinalODataType);
+        constexpr index_t kThreads = 16; // per row
+        constexpr index_t kM0      = FmhaPipeline::kM0;
+        static_assert(kM0 <= kMaxClusterSplits && kBlockSize % kThreads == 0);
+        // rows the wave32 block takes at once, and the most a split has with the split counts
+        // this serves, (kSplits / 2, kSplits]
+        constexpr index_t kRowSlots = kBlockSize / 2 / kThreads;
+        constexpr index_t kMaxRowsPer =
+            kSplits == 2 ? kM0 : (kM0 + kSplits / 2) / (kSplits / 2 + 1);
+        constexpr index_t kRows = (kMaxRowsPer + kRowSlots - 1) / kRowSlots;
 
         const index_t num_splits  = kargs.num_splits;
         const index_t i_head0     = i_nhead * kargs.nhead_ratio_qk;
@@ -1456,23 +1462,22 @@ struct FmhaFwdSplitKVKernel
                             static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o;
 
         // rows [row0, row_end) of the tile are this split's
-        const index_t num_rows = min(kargs.nhead_ratio_qk - i_m0, FmhaPipeline::kM0);
-        const index_t rows_per = (FmhaPipeline::kM0 + num_splits - 1) / num_splits;
+        const index_t num_rows = min(kargs.nhead_ratio_qk - i_m0, kM0);
+        const index_t rows_per = (kM0 + num_splits - 1) / num_splits;
         const index_t row0     = i_split * rows_per;
         const index_t row_end  = min(row0 + rows_per, num_rows);
-        const index_t i_group  = threadIdx.x / kThreads;
-        const index_t i_d      = (threadIdx.x % kThreads) * 2;
-        if(i_d >= kargs.hdim_v || row0 + i_group >= row_end)
+        const index_t i_slot   = threadIdx.x / kThreads;
+        const index_t i_d      = (threadIdx.x % kThreads) * kDims;
+        if(i_d >= kargs.hdim_v || row0 + i_slot >= row_end)
             return;
 
-        // the two head dims of a thread as one load
-        using OaccPair = ext_vector_t<OaccDataType, 2>;
+        using OaccVec = ext_vector_t<OaccDataType, kDims>;
         LSEDataType lse[kRows][kSplits];
-        OaccPair part[kRows][kSplits];
+        OaccVec part[kRows][kSplits];
         for(index_t j = 0; j < kRows; ++j)
         {
             // rows past the share read its last row again and are not stored
-            const index_t i_row = i_m0 + min(row0 + j * kRowGroups + i_group, row_end - 1);
+            const index_t i_row = i_m0 + min(row0 + j * kRowSlots + i_slot, row_end - 1);
             for(index_t s = 0; s < kSplits; ++s)
             {
                 const index_t i_s = min(s, num_splits - 1);
@@ -1481,14 +1486,14 @@ struct FmhaFwdSplitKVKernel
                 const OaccDataType* src =
                     o_acc + static_cast<long_index_t>(i_s) * kargs.split_stride_o_acc +
                     static_cast<long_index_t>(i_row) * kargs.nhead_stride_o_acc + i_d;
-                __builtin_memcpy(&part[j][s], src, sizeof(OaccPair));
+                __builtin_memcpy(&part[j][s], src, sizeof(OaccVec));
             }
         }
         __builtin_amdgcn_sched_barrier(0);
 
         for(index_t j = 0; j < kRows; ++j)
         {
-            const index_t row = row0 + j * kRowGroups + i_group;
+            const index_t row = row0 + j * kRowSlots + i_slot;
             if(row >= row_end)
                 break;
             const index_t i_row = i_m0 + row;
@@ -1502,23 +1507,24 @@ struct FmhaFwdSplitKVKernel
             // a row without keys in any split is all zeros
             const bool empty = lse_max == -numeric<LSEDataType>::infinity();
             LSEDataType sum  = 0;
-            OaccDataType o0  = 0;
-            OaccDataType o1  = 0;
+            OaccVec acc      = {};
             for(index_t s = 0; s < kSplits; ++s)
             {
                 const LSEDataType w =
                     empty ? LSEDataType(0)
                           : ck_tile::exp2((lse[j][s] - lse_max) * log2e_v<LSEDataType>);
                 sum += w;
-                o0 += w * part[j][s][0];
-                o1 += w * part[j][s][1];
+                acc += w * part[j][s];
             }
             const LSEDataType rcp = empty ? LSEDataType(0) : LSEDataType(1) / sum;
 
-            FinalODataType* dst =
-                o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o + i_d;
-            dst[0] = type_convert<FinalODataType>(o0 * rcp);
-            dst[1] = type_convert<FinalODataType>(o1 * rcp);
+            FinalODataType out[kDims];
+            for(index_t d = 0; d < kDims; ++d)
+                out[d] = type_convert<FinalODataType>(acc[d] * rcp);
+            __builtin_memcpy(o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o +
+                                 i_d,
+                             out,
+                             sizeof(out));
 
             if(kargs.combine.lse_ptr != nullptr && i_d == 0)
             {
