@@ -8,6 +8,7 @@
 #include "ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp"
 #include "ck_tile/ops/fmha/block/block_masking.hpp"
 #include "ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_tdm_pingpong.hpp"
+#include "ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_tdm_decode_pagedkv.hpp"
 #include "ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_tdm_policy.hpp"
 #include "ck_tile/ops/reduce/block/block_reduce.hpp"
 
@@ -1213,7 +1214,9 @@ struct BlockFmhaFwdSplitKVPipelineQRKSVSTdmPingPong
         {
             // the K / V windows start on a page; the pipeline turns the pages
             using Nav = remove_cvref_t<KPageBlockNavigator>;
-            return Base::operator()(
+            return BlockFmhaPipelineQRKSVSTdmDecodePagedKV<
+                BlockFmhaFwdSplitKVPingPongProblem<Problem_>,
+                Policy_>{}(
                 q_dram_block_window_tmp,
                 make_tile_window(
                     k_page_block_navigator.make_k_page_view(0), Nav::k_page_lengths(), {0, 0}),

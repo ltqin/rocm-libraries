@@ -433,6 +433,20 @@ struct Paged5DTileNavigator
                                                  number<1>{});
     }
 
+    // K of the keys [key0, key0 + kKeys) of a page, as (d / X, key * X)
+    template <index_t kKeys>
+    CK_TILE_HOST_DEVICE auto
+    make_k_keys_view(long_index_t page_off, index_t key0, number<kKeys>) const
+    {
+        return make_naive_tensor_view<address_space_enum::global,
+                                      memory_operation_enum::set,
+                                      Coherence>(k_page_at(page_off) + key0 * kX,
+                                                 make_tuple(number<kKRows>{}, number<kKeys * kX>{}),
+                                                 make_tuple(number<kPageSize * kX>{}, number<1>{}),
+                                                 number<kX>{},
+                                                 number<1>{});
+    }
+
     CK_TILE_HOST_DEVICE auto make_v_page_view(long_index_t page_off) const
     {
         return make_naive_tensor_view<address_space_enum::global,

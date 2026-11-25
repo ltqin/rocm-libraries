@@ -108,7 +108,11 @@ struct QrTdmPingPongPadding<Problem, true>
 // be issued right behind Q's. S only takes space with the gemm_0 warps on N. d128
 // fp16/bf16, padded: K0=0, K1=17408, Q/V0=34816, end=53248 (warps on M, M=64); the
 // 16-row short-query tile: S=34800, Q/V0=39168, end=57600.
-template <typename Problem, typename QPadding, typename KPadding, typename VPadding>
+template <typename Problem,
+          typename QPadding,
+          typename KPadding,
+          typename VPadding,
+          bool kDoubleV = false>
 struct QrTdmPingPongLdsArenaLayout
 {
     using Shape = typename Problem::BlockFmhaShape;
@@ -149,9 +153,12 @@ struct QrTdmPingPongLdsArenaLayout
     static constexpr index_t kSOffset = integer_least_multiple(kK1Offset + kKBytes, kSAlignment);
     static constexpr index_t kV0Offset =
         integer_least_multiple(kSOffset + kSBytes, kRegionAlignment);
+    // a second V buffer with kDoubleV
+    static constexpr index_t kV1Offset =
+        kDoubleV ? integer_least_multiple(kV0Offset + kVBytes, kRegionAlignment) : kV0Offset;
     static constexpr index_t kQOffset = kV0Offset;
     static constexpr index_t kArenaBytes =
-        integer_least_multiple(max(kQOffset + kQBytes, kV0Offset + kVBytes), kArenaAlignment);
+        integer_least_multiple(max(kQOffset + kQBytes, kV1Offset + kVBytes), kArenaAlignment);
 
     static_assert(!KPadding::kEnabled || (kK1Offset - kK0Offset) % KPadding::kIntervalBytes == 0);
     static_assert(kArenaBytes <= 128 * 1024);
@@ -291,12 +298,74 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
               typename KPadding = LdsPaddingConfigK<Problem>,
               typename VPadding = LdsPaddingConfigV<Problem>>
     using LdsArenaLayout =
-        detail::QrTdmPingPongLdsArenaLayout<Problem, QPadding, KPadding, VPadding>;
+        detail::QrTdmPingPongLdsArenaLayout<Problem, QPadding, KPadding, VPadding, true>;
 
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr index_t GetSmemSize()
     {
         return LdsArenaLayout<Problem>::kArenaBytes;
+    }
+
+    // The keys of a page a gemm_0 warp reads, (d / X, key * X): every warp copies its own with
+    // one TDM box (see Paged5DTileNavigator::make_k_keys_view) into a block of its own, so
+    // K takes no barrier.
+    template <typename Problem>
+    static constexpr index_t kKeysPerWarp =
+        Page<Problem>::kPageSize / (Problem::kBlockSize / get_warp_size());
+
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeKWarpKeysDramTileDistribution()
+    {
+        using P                   = Page<Problem>;
+        constexpr index_t warpNum = Problem::kBlockSize / get_warp_size();
+        static_assert(Problem::BlockFmhaShape::Gemm0BlockWarps::at(number<1>{}) == warpNum);
+
+        // the same box in every warp; the warps differ in the view they copy
+        return make_static_tile_distribution(
+            tile_distribution_encoding<
+                sequence<warpNum>,
+                tuple<sequence<P::kKRows>, sequence<kKeysPerWarp<Problem> * P::kX>>,
+                tuple<sequence<0>>,
+                tuple<sequence<0>>,
+                sequence<1, 2>,
+                sequence<0, 0>>{},
+            bool_constant<true>{});
+    }
+
+    // a warp's block
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeKWarpKeysLdsBlockDescriptor()
+    {
+        using P = Page<Problem>;
+        return MakeDenseLdsDescriptor<typename Problem::KDataType,
+                                      P::kKRows,
+                                      kKeysPerWarp<Problem> * P::kX>();
+    }
+
+    // the blocks of all warps, [warp][d / X][key of the warp][X], as K (key, d)
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeKWarpKeysLdsReadDescriptor()
+    {
+        using P                   = Page<Problem>;
+        constexpr index_t warpNum = Problem::kBlockSize / get_warp_size();
+        constexpr index_t kKeys   = P::kPageSize / warpNum;
+
+        constexpr auto desc = make_naive_tensor_descriptor(
+            make_tuple(number<warpNum>{}, number<P::kKRows>{}, number<kKeys>{}, number<P::kX>{}),
+            make_tuple(number<P::kKRows * kKeys * P::kX>{},
+                       number<kKeys * P::kX>{},
+                       number<P::kX>{},
+                       number<1>{}),
+            number<P::kX>{},
+            number<1>{});
+        return transform_tensor_descriptor(
+            desc,
+            make_tuple(make_merge_transform_v3_division_mod(
+                           make_tuple(number<warpNum>{}, number<kKeys>{})),
+                       make_merge_transform_v3_division_mod(
+                           make_tuple(number<P::kKRows>{}, number<P::kX>{}))),
+            make_tuple(sequence<0, 2>{}, sequence<1, 3>{}),
+            make_tuple(sequence<0>{}, sequence<1>{}));
     }
 
     // Rows x Cols, each warp taking whole rows: one TDM box per warp
@@ -421,6 +490,78 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
         using PVBlockGemm = remove_cvref_t<decltype(GetPVBlockGemm<Problem>())>;
         return make_static_tile_distribution(
             decltype(PVBlockGemm::MakeBBlockDistributionEncode()){});
+    }
+
+    // P (kM0 x kN0) for BlockFmhaPipelineQRKSVSTdmDecodePagedKV: 16-byte packs of a row, a pack of
+    // every row after another with one row of padding, so that the 16 rows a wave reads at
+    // once fall on different LDS banks.
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakePLdsBlockDescriptor()
+    {
+        constexpr index_t kMPerBlock = Problem::BlockFmhaShape::kM0;
+        constexpr index_t kNPerBlock = Problem::BlockFmhaShape::kN0;
+        constexpr index_t kNPack     = 16 / sizeof(typename Problem::PDataType);
+
+        constexpr auto p_lds_block_desc_0 = make_naive_tensor_descriptor(
+            make_tuple(number<kNPerBlock / kNPack>{}, number<kMPerBlock>{}, number<kNPack>{}),
+            make_tuple(number<(kMPerBlock + 1) * kNPack>{}, number<kNPack>{}, number<1>{}),
+            number<kNPack>{},
+            number<1>{});
+
+        return transform_tensor_descriptor(
+            p_lds_block_desc_0,
+            make_tuple(
+                make_pass_through_transform(number<kMPerBlock>{}),
+                make_merge_transform(make_tuple(number<kNPerBlock / kNPack>{}, number<kNPack>{}))),
+            make_tuple(sequence<1>{}, sequence<0, 2>{}),
+            make_tuple(sequence<0>{}, sequence<1>{}));
+    }
+
+    // The row statistics the gemm_0 warps exchange: (warp, row).
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeRowPartialLdsDescriptor()
+    {
+        constexpr index_t kNWarp = Problem::BlockFmhaShape::Gemm0BlockWarps::at(number<1>{});
+        constexpr index_t kM0    = Problem::BlockFmhaShape::kM0;
+        return make_naive_tensor_descriptor(make_tuple(number<kNWarp>{}, number<kM0>{}),
+                                            make_tuple(number<kM0>{}, number<1>{}),
+                                            number<1>{},
+                                            number<1>{});
+    }
+
+    // A warp's own row of MakeRowPartialLdsDescriptor: lane = row, as in gemm_0's result, and
+    // the two halves of a wave hold the same value.
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeRowPartialRegDistribution()
+    {
+        constexpr index_t kNWarp = Problem::BlockFmhaShape::Gemm0BlockWarps::at(number<1>{});
+        constexpr index_t kM0    = Problem::BlockFmhaShape::kM0;
+        static_assert(get_warp_size() == 2 * kM0);
+
+        return make_static_tile_distribution(
+            tile_distribution_encoding<sequence<2>,
+                                       tuple<sequence<kNWarp>, sequence<kM0, 1>>,
+                                       tuple<sequence<1>, sequence<0, 2>>,
+                                       tuple<sequence<0>, sequence<0, 0>>,
+                                       sequence<2>,
+                                       sequence<1>>{});
+    }
+
+    // Every warp's value of a lane's row.
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeRowPartialsRegDistribution()
+    {
+        constexpr index_t kNWarp = Problem::BlockFmhaShape::Gemm0BlockWarps::at(number<1>{});
+        constexpr index_t kM0    = Problem::BlockFmhaShape::kM0;
+        static_assert(get_warp_size() == 2 * kM0);
+
+        return make_static_tile_distribution(
+            tile_distribution_encoding<sequence<kNWarp, 2>,
+                                       tuple<sequence<kNWarp>, sequence<kM0>>,
+                                       tuple<sequence<0>, sequence<0, 2>>,
+                                       tuple<sequence<0>, sequence<1, 0>>,
+                                       sequence<1>,
+                                       sequence<0>>{});
     }
 };
 

@@ -149,7 +149,8 @@ auto create_args(int argc, char* argv[])
         .insert("vec5d_host_sk", "-1", "kv_layout=vec5d: args.seqlen_k, -1 = the longest s_k")
         .insert("vec5d_diff",
                 "0",
-                "kv_layout=vec5d, v=1: rerun on linear K/V, O and LSE must be bitwise equal")
+                "kv_layout=vec5d, v=1: rerun on linear K/V, O and LSE must be equal up to the "
+                "last place")
         .insert("rerun",
                 "0",
                 "v=1: rerun this many times on NaN outputs and split-kv workspace, each run "

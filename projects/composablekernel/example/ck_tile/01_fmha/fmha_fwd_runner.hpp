@@ -2863,6 +2863,33 @@ fwd_result fmha_fwd_run(mode_enum mode,
                                         lse_host.get_element_space_size_in_bytes()) == 0;
                 same        = same_o && same_lse;
                 diff_result = same ? "same" : "differ";
+                // The paged and the linear instances may take different pipelines, which sum
+                // a row's P in different orders: the row sum, and so O and the LSE, may then
+                // differ in the last place, and no further.
+                if(!same)
+                {
+                    const auto close = [](const auto& x, const auto& y, double rel) {
+                        bool ok = true;
+                        for(std::size_t i = 0; i < x.mData.size(); ++i)
+                        {
+                            const double a = ck_tile::type_convert<float>(x.mData[i]);
+                            const double b = ck_tile::type_convert<float>(y.mData[i]);
+                            ok &= a == b ||
+                                  std::abs(a - b) <= rel * std::max(std::abs(a), std::abs(b));
+                        }
+                        return ok;
+                    };
+                    // one unit in the last place of O (bf16 keeps 8 significand bits, fp16
+                    // 11), and a few of the fp32 LSE
+                    const double o_rel =
+                        std::ldexp(1.0, std::is_same_v<ODataType, ck_tile::bf16_t> ? -7 : -10);
+                    if(close(o_linear, o_host, o_rel) &&
+                       (!lse || close(lse_linear, lse_host, 1e-5)))
+                    {
+                        same        = true;
+                        diff_result = "close";
+                    }
+                }
             }
             std::cout << ", vec5d_diff:" << diff_result << std::flush;
             pass &= same;
