@@ -1178,7 +1178,9 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // holds, a power of two:
         // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
         // - long ranges, where the paged instances run every warp on tiles of its own
-        //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups.
+        //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups;
+        // - very long ranges of a few sequences leave most of that grid idle: there the paged
+        //   instances take several clusters a tile, whose partials a second launch combines.
         // The linear instances have the cooperative loop of qr_tdm_pingpong only: they take
         // the first rule up to a cluster of splits, and on longer ranges keep the split count
         // above and the combine kernel.
@@ -1191,6 +1193,8 @@ fwd_result fmha_fwd_run(mode_enum mode,
             constexpr int kMaxWorkgroup  = 512;
             constexpr int kLongWorkgroup = 256;
             constexpr int kLongTiles     = 12; // a split
+            constexpr int kGroupedTiles  = 512;
+            constexpr int kMaxClusters   = 8; // a tile
             const int num_kv_tiles       = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
             const int num_m_blocks       = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
             const int num_heads          = batch * nhead_merged * num_m_blocks;
@@ -1203,7 +1207,12 @@ fwd_result fmha_fwd_run(mode_enum mode,
             const int long_splits = power_of_two(std::min(max_cluster, kLongWorkgroup / num_heads));
             const int short_splits =
                 power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
-            if(kv_vec5d)
+            const int clusters =
+                power_of_two(std::min(kMaxClusters, kLongWorkgroup / (num_heads * max_cluster)));
+            // two clusters shorten a split the least: they need a range twice as long
+            if(kv_vec5d && 1 < clusters && (clusters == 2 ? 2 : 1) * kGroupedTiles <= num_kv_tiles)
+                num_splits = clusters * max_cluster;
+            else if(kv_vec5d)
                 num_splits = kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
             else if(num_splits <= max_cluster)
                 num_splits = std::max(num_splits, short_splits);

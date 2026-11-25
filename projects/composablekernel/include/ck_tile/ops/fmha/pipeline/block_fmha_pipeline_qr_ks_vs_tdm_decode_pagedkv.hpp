@@ -185,7 +185,14 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             reinterpret_cast<VDataType*>(block + Layout::kWaveStages * Layout::kKStride);
         constexpr index_t kKStride = Layout::kKStride / sizeof(KDataType);
         constexpr index_t kVStride = Layout::kVStride / sizeof(VDataType);
-        static_assert(Layout::kWaveStages == 2);
+        constexpr index_t kStages  = Layout::kWaveStages;
+        // waits until at most `count` of the warp's transfers are in flight
+        const auto wait_transfers = [](index_t count) {
+            static_for<0, 2 * Layout::kWaveStages, 1>{}([&](auto i) {
+                if(count == i)
+                    s_wait_tensorcnt<i>();
+            });
+        };
 
         TDMConfig tdm_config_k =
             Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigK<Problem>>();
@@ -245,16 +252,24 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
         };
 
-        // the pages of the warp's first two tiles; their users stay behind the Q transfer
-        index_t page_id      = page_nav.page_id(i_page_start + i_warp);
-        index_t page_id_next = page_nav.page_id(i_page_start + i_warp + kNumWarps);
+        // A tile is staged kStages - 1 trips ahead of the trip that reads it, into the buffers
+        // of stage (trip % kStages). The pages of the warp's first kStages tiles: all but the
+        // last are issued here, K then V of each as in every trip, and the last in the first
+        // trip. Their users stay behind the Q transfer.
+        index_t page_ids[kStages];
+        for(index_t i = 0; i < kStages; ++i)
+            page_ids[i] = page_nav.page_id(i_page_start + i_warp + i * kNumWarps);
         __builtin_amdgcn_sched_barrier(0);
-        asm volatile("" : "+s"(page_id));
-        asm volatile("" : "+s"(page_id_next));
-        issue_tile(page_id, 0);
+        for(index_t i = 0; i < kStages; ++i)
+            asm volatile("" : "+s"(page_ids[i]));
+        for(index_t i = 0; i + 1 < kStages; ++i)
+            if(i < num_trips)
+                issue_tile(page_ids[i], i);
+        index_t page_id_ahead = page_ids[kStages - 1];
 
-        // retire Q only; the tile, issued after it, stays in flight
-        s_wait_tensorcnt_barrier<2>();
+        // retire Q only; the tiles, issued after it, stay in flight
+        wait_transfers(2 * min(num_trips, kStages - 1));
+        block_sync_lds();
         auto q_lds_read_window =
             make_tile_window(q_lds_view,
                              Policy::template MakeQLdsBlockDescriptor<Problem>().get_lengths(),
@@ -272,23 +287,21 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         SMPLComputeDataType m_base_w = -numeric<SMPLComputeDataType>::infinity();
         SMPLComputeDataType l_w      = 0;
 
+        index_t stage = 0;
         for(index_t i_trip = 0; i_trip < num_trips; ++i_trip)
         {
-            const index_t stage  = i_trip & 1;
-            const index_t i_tile = i_trip * kNumWarps + i_warp;
-            const bool has_next  = i_trip + 1 < num_trips;
+            const index_t stage_ahead = stage == 0 ? kStages - 1 : stage - 1;
+            const index_t i_tile      = i_trip * kNumWarps + i_warp;
+            // this trip's tile and the ones staged behind it
+            const index_t tiles_in_flight = min(num_trips - i_trip, kStages);
 
-            // The next tile goes into the buffers the last trip read. In flight then: this
-            // trip's K and V, and the next tile's.
-            if(has_next)
-            {
-                issue_tile(page_id_next, stage ^ 1);
-                s_wait_tensorcnt<3>();
-            }
-            else
-                s_wait_tensorcnt<1>();
-            // the page of the tile after the next, read under the gemm
-            page_id_next = page_nav.page_id(i_page_start + i_tile + 2 * kNumWarps);
+            // The tile kStages - 1 ahead goes into the buffers the last trip read. This
+            // trip's K is the first of the transfers in flight.
+            if(i_trip + kStages - 1 < num_trips)
+                issue_tile(page_id_ahead, stage_ahead);
+            wait_transfers(2 * tiles_in_flight - 1);
+            // the page of the tile the next trip stages, read under the gemm
+            page_id_ahead = page_nav.page_id(i_page_start + i_tile + kStages * kNumWarps);
 
             const index_t kv_tile_start = seqlen_k_start + i_tile * kN0;
 
@@ -359,10 +372,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 [&](auto i) { p_tile.get_thread_buffer()(i) = p_fp8.get_thread_buffer()[i]; });
 
             // retire this trip's V
-            if(has_next)
-                s_wait_tensorcnt<2>();
-            else
-                s_wait_tensorcnt<0>();
+            wait_transfers(2 * tiles_in_flight - 2);
 
             // The tokens of the page past the range may hold anything (P is 0 there, but
             // 0 * NaN is not): clear them on the tile the range ends in.
@@ -382,6 +392,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             // STAGE 4, PV gemm
             v_lds_read_window.set_bottom_tensor_view_data_ptr(v_buf0 + stage * kVStride);
             gemm_1(o_w, p_tile, load_tile(v_lds_read_window));
+            stage = stage + 1 == kStages ? 0 : stage + 1;
         }
 
         // The merge. A warp's O goes to the head of its block, whose transfers and reads are

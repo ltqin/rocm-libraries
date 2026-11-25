@@ -331,6 +331,10 @@ struct FmhaFwdSplitKVKernel
         ck_tile::index_t batch_stride_o   = 0;
         ck_tile::index_t nhead_stride_lse = 0;
         ck_tile::index_t batch_stride_lse = 0;
+        // Splits of a cluster when the tile has several of them (num_splits is then a multiple
+        // of it): a cluster combines its own splits into the workspace slot of its first one,
+        // for the combine kernel to finish. 0: one cluster, which writes o_ptr.
+        ck_tile::index_t group_splits = 0;
     };
 
     struct BatchModeKargs
@@ -1387,54 +1391,85 @@ struct FmhaFwdSplitKVKernel
 
         if constexpr(kClusterCombine)
         {
-            if(kargs.combine.o_ptr != nullptr)
-                ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch);
+            if(kargs.combine.o_ptr != nullptr || kargs.combine.group_splits > 0)
+                ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch, /*published=*/false);
         }
     }
 
-    // Combines the splits of this tile into the final output. The num_splits workgroups of the
-    // tile must be one workgroup cluster (launch with cluster x = num_splits <=
-    // kMaxClusterSplits) and seqlen_q must be 1, so that a row is a Q head. After the cluster
-    // barrier every split's o_acc / lse_acc is visible, and each workgroup combines its share
-    // of the rows.
+    // Kernel entry that only combines: the num_splits (<= kMaxClusterSplits) workspace slots of
+    // a tile hold partials an earlier launch has written, combine.o_ptr is set and
+    // combine.group_splits is 0. Same grid as the split kernel of these kargs.
+    struct CombineOnly
+    {
+        static constexpr index_t kBlockSize = FmhaFwdSplitKVKernel::kBlockSize;
+
+        CK_TILE_DEVICE void operator()(Kargs kargs) const
+        {
+            const auto [i_tile_m, i_tile_n, i_split, i_nhead, i_batch] = GetTileIndex(kargs);
+            const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * FmhaPipeline::kM0);
+            ignore             = i_tile_n;
+            ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch, /*published=*/true);
+        }
+    };
+
+    // Combines splits of this tile. The workgroups of the splits must be one workgroup cluster
+    // (launch with cluster x = their count <= kMaxClusterSplits) and seqlen_q must be 1, so
+    // that a row is a Q head. After the cluster barrier (not taken when the partials are
+    // published already) the o_acc / lse_acc of the cluster's splits are visible, and each
+    // workgroup combines its share of the rows: into the final
+    // output when the cluster holds all num_splits splits of the tile, else (group_splits)
+    // into the workspace slot of the cluster's first split.
     template <bool Cond = kClusterCombine>
-    CK_TILE_DEVICE static std::enable_if_t<Cond> ClusterCombine(
-        const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
+    CK_TILE_DEVICE static std::enable_if_t<Cond> ClusterCombine(const Kargs& kargs,
+                                                                index_t i_m0,
+                                                                index_t i_split,
+                                                                index_t i_nhead,
+                                                                index_t i_batch,
+                                                                bool published)
     {
 #if defined(__gfx125__)
-        const index_t num_splits = kargs.num_splits;
-        if(num_splits > 1)
+        const bool grouped    = kargs.combine.group_splits > 0;
+        const index_t count   = grouped ? kargs.combine.group_splits : kargs.num_splits;
+        const index_t i_first = grouped ? i_split - i_split % count : 0;
+        const index_t i_local = i_split - i_first;
+        if(count > 1 && !published)
         {
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
             cluster_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
         }
         // the splits padded to a power of two, so that a thread's loads are a constant count
-        if(num_splits <= 2)
-            CombineRows<2>(kargs, i_m0, i_split, i_nhead, i_batch);
-        else if(num_splits <= 4)
-            CombineRows<4>(kargs, i_m0, i_split, i_nhead, i_batch);
-        else if(num_splits <= 8)
-            CombineRows<8>(kargs, i_m0, i_split, i_nhead, i_batch);
+        if(count <= 2)
+            CombineRows<2>(kargs, i_m0, i_first, i_local, count, i_nhead, i_batch);
+        else if(count <= 4)
+            CombineRows<4>(kargs, i_m0, i_first, i_local, count, i_nhead, i_batch);
+        else if(count <= 8)
+            CombineRows<8>(kargs, i_m0, i_first, i_local, count, i_nhead, i_batch);
         else
-            CombineRows<16>(kargs, i_m0, i_split, i_nhead, i_batch);
+            CombineRows<16>(kargs, i_m0, i_first, i_local, count, i_nhead, i_batch);
 #else
         ignore = kargs;
         ignore = i_m0;
         ignore = i_split;
         ignore = i_nhead;
         ignore = i_batch;
+        ignore = published;
 #endif
     }
 
 #if defined(__gfx125__)
-    // The rows of split i_split, for num_splits <= kSplits: kThreads threads per row with kDims
-    // head dims each (hdim_v is a multiple of kDims), a 16-byte store of the output. A thread
-    // issues all its loads before it uses one; splits past num_splits read the last one again
-    // and weigh nothing.
+    // The rows of the i_split-th of the num_splits <= kSplits splits from i_first on:
+    // kThreads threads per row with kDims head dims each (hdim_v is a multiple of kDims), a
+    // 16-byte store of the output. A thread issues all its loads before it uses one; splits
+    // past num_splits read the last one again and weigh nothing.
     template <index_t kSplits, bool Cond = kClusterCombine>
-    CK_TILE_DEVICE static std::enable_if_t<Cond>
-    CombineRows(const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
+    CK_TILE_DEVICE static std::enable_if_t<Cond> CombineRows(const Kargs& kargs,
+                                                             index_t i_m0,
+                                                             index_t i_first,
+                                                             index_t i_split,
+                                                             index_t num_splits,
+                                                             index_t i_nhead,
+                                                             index_t i_batch)
     {
         using FinalODataType       = FinalODataType_;
         constexpr index_t kDims    = 16 / sizeof(FinalODataType);
@@ -1448,16 +1483,18 @@ struct FmhaFwdSplitKVKernel
             kSplits == 2 ? kM0 : (kM0 + kSplits / 2) / (kSplits / 2 + 1);
         constexpr index_t kRows = (kMaxRowsPer + kRowSlots - 1) / kRowSlots;
 
-        const index_t num_splits  = kargs.num_splits;
-        const index_t i_head0     = i_nhead * kargs.nhead_ratio_qk;
-        const OaccDataType* o_acc = reinterpret_cast<const OaccDataType*>(kargs.o_acc_ptr) +
-                                    static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
-                                    static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc;
-        const LSEDataType* lse_acc =
-            reinterpret_cast<const LSEDataType*>(kargs.lse_acc_ptr) +
-            static_cast<long_index_t>(i_head0) * kargs.nhead_stride_lse_acc +
-            static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc;
-        FinalODataType* o = reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
+        // the workspace from the slot of split i_first on
+        const index_t i_head0 = i_nhead * kargs.nhead_ratio_qk;
+        OaccDataType* o_acc   = reinterpret_cast<OaccDataType*>(kargs.o_acc_ptr) +
+                              static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
+                              static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc +
+                              static_cast<long_index_t>(i_first) * kargs.split_stride_o_acc;
+        LSEDataType* lse_acc = reinterpret_cast<LSEDataType*>(kargs.lse_acc_ptr) +
+                               static_cast<long_index_t>(i_head0) * kargs.nhead_stride_lse_acc +
+                               static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc +
+                               static_cast<long_index_t>(i_first) * kargs.split_stride_lse_acc;
+        const bool final_output = kargs.combine.o_ptr != nullptr;
+        FinalODataType* o       = reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
                             static_cast<long_index_t>(i_head0) * kargs.combine.nhead_stride_o +
                             static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o;
 
@@ -1518,21 +1555,38 @@ struct FmhaFwdSplitKVKernel
             }
             const LSEDataType rcp = empty ? LSEDataType(0) : LSEDataType(1) / sum;
 
-            FinalODataType out[kDims];
-            for(index_t d = 0; d < kDims; ++d)
-                out[d] = type_convert<FinalODataType>(acc[d] * rcp);
-            __builtin_memcpy(o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o +
-                                 i_d,
-                             out,
-                             sizeof(out));
-
-            if(kargs.combine.lse_ptr != nullptr && i_d == 0)
+            if(final_output)
             {
-                LSEDataType* lse_out =
-                    reinterpret_cast<LSEDataType*>(kargs.combine.lse_ptr) +
-                    static_cast<long_index_t>(i_head0 + i_row) * kargs.combine.nhead_stride_lse +
-                    static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_lse;
-                *lse_out = empty ? lse_max : ck_tile::log(sum) + lse_max;
+                FinalODataType out[kDims];
+                for(index_t d = 0; d < kDims; ++d)
+                    out[d] = type_convert<FinalODataType>(acc[d] * rcp);
+                __builtin_memcpy(
+                    o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o + i_d,
+                    out,
+                    sizeof(out));
+
+                if(kargs.combine.lse_ptr != nullptr && i_d == 0)
+                {
+                    LSEDataType* lse_out =
+                        reinterpret_cast<LSEDataType*>(kargs.combine.lse_ptr) +
+                        static_cast<long_index_t>(i_head0 + i_row) *
+                            kargs.combine.nhead_stride_lse +
+                        static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_lse;
+                    *lse_out = empty ? lse_max : ck_tile::log(sum) + lse_max;
+                }
+            }
+            else
+            {
+                // The cluster's result takes the slot of its first split. Only this workgroup
+                // reads the rows it writes there, and it has issued those loads.
+                const OaccVec out = acc * rcp;
+                __builtin_memcpy(
+                    o_acc + static_cast<long_index_t>(i_row) * kargs.nhead_stride_o_acc + i_d,
+                    &out,
+                    sizeof(out));
+                if(i_d == 0)
+                    lse_acc[static_cast<long_index_t>(i_row) * kargs.nhead_stride_lse_acc] =
+                        empty ? lse_max : ck_tile::log(sum) + lse_max;
             }
         }
     }

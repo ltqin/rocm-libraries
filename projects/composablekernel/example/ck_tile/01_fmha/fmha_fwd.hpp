@@ -1750,9 +1750,10 @@ void fmha_fwd_splitkv_oneshot_(const ck_tile::stream_config&, fmha_fwd_splitkv_a
 template <typename Traits_, typename Arch = void>
 std::string fmha_fwd_splitkv_get_name_();
 
-// whether fmha_fwd_splitkv_oneshot_ writes the final output itself (no combine kernel needed)
+// Splits of a workgroup cluster of fmha_fwd_splitkv_oneshot_, which then writes the final output
+// itself (no combine kernel needed), or 0.
 template <typename Traits_, typename Arch = void>
-bool fmha_fwd_splitkv_combines_(const fmha_fwd_splitkv_args&);
+int fmha_fwd_splitkv_cluster_splits_(const fmha_fwd_splitkv_args&);
 
 template <ck_tile::index_t HDim_,
           typename DataType_,
