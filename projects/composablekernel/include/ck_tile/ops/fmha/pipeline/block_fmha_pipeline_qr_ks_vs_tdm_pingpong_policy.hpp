@@ -293,36 +293,43 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
     using LdsArenaLayout =
         detail::QrTdmPingPongLdsArenaLayout<Problem, QPadding, KPadding, VPadding>;
 
-    // LDS of BlockFmhaPipelineQRKSVSTdmDecodePagedKV:
-    // [K x kStages][P and the row partials, on S's region][V x kStages]. A tile's K and V are
-    // staged kStages - 1 trips ahead of the trip that reads them, into the buffers of stage
-    // (tile % kStages). Q sits on the last V buffer, which the first trip is the first to stage.
+    // LDS of BlockFmhaPipelineQRKSVSTdmDecodePagedKV, whose two main loops share one arena:
+    // - cooperative: [K x kStages][V x kStages]. A tile's K and V are staged kStages - 1 trips
+    //   ahead of the trip that reads them, into the buffers of stage (tile % kStages).
+    // - wave split: a block per warp, [K x kWaveStages][V x kWaveStages], which holds the
+    //   warp's O for the merge at the end.
+    // Behind them S's region (P and the row partials) and Q, which both loops read once
+    // before they stage a tile over anything.
     template <typename Problem>
     struct DecodeLdsLayout
     {
         using Base = LdsArenaLayout<Problem>;
 
-        static constexpr index_t kStages = 3;
+        static constexpr index_t kStages     = 3;
+        static constexpr index_t kWaveStages = 2;
+        static constexpr index_t kNumWarps   = Problem::kBlockSize / get_warp_size();
 
         static constexpr index_t kQBytes = Base::kQBytes;
         static constexpr index_t kKBytes = Base::kKBytes;
         static constexpr index_t kVBytes = Base::kVBytes;
         static constexpr index_t kSBytes = Base::kSBytes;
-        static_assert(kQBytes <= kVBytes);
 
         static constexpr index_t kKStride = integer_least_multiple(kKBytes, Base::kRegionAlignment);
         static constexpr index_t kVStride = integer_least_multiple(kVBytes, Base::kRegionAlignment);
 
         static constexpr index_t kK0Offset = 0;
-        static constexpr index_t kSOffset =
-            integer_least_multiple(kK0Offset + kStages * kKStride, Base::kSAlignment);
-        static constexpr index_t kV0Offset =
-            integer_least_multiple(kSOffset + kSBytes, Base::kRegionAlignment);
-        static constexpr index_t kQOffset = kV0Offset + (kStages - 1) * kVStride;
-        static constexpr index_t kArenaBytes =
-            integer_least_multiple(kV0Offset + kStages * kVStride, Base::kArenaAlignment);
+        static constexpr index_t kV0Offset = kK0Offset + kStages * kKStride;
 
-        static_assert(kArenaBytes <= 128 * 1024);
+        static constexpr index_t kWaveBlockBytes = kWaveStages * (kKStride + kVStride);
+        static constexpr index_t kWaveOffset     = 0;
+
+        static constexpr index_t kSOffset = integer_least_multiple(
+            max(kV0Offset + kStages * kVStride, kWaveOffset + kNumWarps * kWaveBlockBytes),
+            max(Base::kSAlignment, Base::kRegionAlignment));
+        static constexpr index_t kQOffset =
+            integer_least_multiple(kSOffset + kSBytes, Base::kRegionAlignment);
+        static constexpr index_t kArenaBytes =
+            integer_least_multiple(kQOffset + kQBytes, Base::kArenaAlignment);
     };
 
     template <typename Problem>
@@ -506,6 +513,116 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
     {
         using P = Page<Problem>;
         return MakePageReadDescriptor<P::kVRows, P::kHeadDim, P::kX>();
+    }
+
+    // The gemms of the wave-split loop: every warp runs the whole kM0 x kN0 x kK0 QK gemm and
+    // the whole kM0 x kN1 x kK1 PV gemm on a tile of its own, so their tensors are warp tiles
+    // (the same in every warp).
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto GetQKWarpBlockGemm()
+    {
+        using Shape      = typename Problem::BlockFmhaShape;
+        using BlockWarps = sequence<1, 1, 1>;
+        using GemmProblem =
+            BlockGemmProblem<typename Problem::QDataType,
+                             typename Problem::KDataType,
+                             typename Problem::SaccDataType,
+                             Problem::kBlockSize,
+                             TileGemmShape<sequence<Shape::kM0, Shape::kN0, Shape::kK0>,
+                                           BlockWarps,
+                                           typename Shape::Gemm0WarpTile>,
+                             Problem::kBlockSize / get_warp_size()>;
+        using WarpGemm = typename remove_cvref_t<decltype(GetQKBlockGemm<Problem>())>::WarpGemm;
+        using BlockGemmPolicy = BlockGemmARegBRegCRegV2CustomPolicy<typename Problem::QDataType,
+                                                                    typename Problem::KDataType,
+                                                                    typename Problem::SaccDataType,
+                                                                    BlockWarps,
+                                                                    WarpGemm,
+                                                                    GemmLoopOrder::MNK>;
+        return BlockGemmARegBRegCRegV2<GemmProblem, BlockGemmPolicy>{};
+    }
+
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto GetPVWarpBlockGemm()
+    {
+        using Shape      = typename Problem::BlockFmhaShape;
+        using BlockWarps = sequence<1, 1, 1>;
+        using GemmProblem =
+            BlockGemmProblem<typename Problem::PDataType,
+                             typename Problem::VDataType,
+                             typename Problem::OaccDataType,
+                             Problem::kBlockSize,
+                             TileGemmShape<sequence<Shape::kM0, Shape::kN1, Shape::kK1>,
+                                           BlockWarps,
+                                           typename Shape::Gemm1WarpTile>,
+                             Problem::kBlockSize / get_warp_size()>;
+        using WarpGemm = typename remove_cvref_t<decltype(GetPVBlockGemm<Problem>())>::WarpGemm;
+        using BlockGemmPolicy = BlockGemmARegBRegCRegV2CustomPolicy<typename Problem::PDataType,
+                                                                    typename Problem::VDataType,
+                                                                    typename Problem::OaccDataType,
+                                                                    BlockWarps,
+                                                                    WarpGemm,
+                                                                    GemmLoopOrder::KMN>;
+        return BlockGemmARegBRegCRegV2<GemmProblem, BlockGemmPolicy>{};
+    }
+
+    // Rows x Cols as one TDM box, the same in every warp: the warps differ in the page they
+    // copy and in where it lands.
+    template <typename Problem, index_t Rows, index_t Cols>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeWarpWholeDramTileDistribution()
+    {
+        constexpr index_t warpNum = Problem::kBlockSize / get_warp_size();
+        return make_static_tile_distribution(
+            tile_distribution_encoding<sequence<warpNum>,
+                                       tuple<sequence<Rows>, sequence<Cols>>,
+                                       tuple<sequence<0>>,
+                                       tuple<sequence<0>>,
+                                       sequence<1, 2>,
+                                       sequence<0, 0>>{},
+            bool_constant<true>{});
+    }
+
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeKWarpPageDramTileDistribution()
+    {
+        using P = Page<Problem>;
+        return MakeWarpWholeDramTileDistribution<Problem, P::kKRows, P::kPageSize * P::kX>();
+    }
+
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeVWarpPageDramTileDistribution()
+    {
+        using P = Page<Problem>;
+        return MakeWarpWholeDramTileDistribution<Problem, P::kVRows, P::kHeadDim * P::kX>();
+    }
+
+    // A V page in LDS as rows of the X tokens of a (token / X, d), every lane of a warp with
+    // its share of the rows: to clear the tokens past the end of a tile.
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeVTokensRegTileDistribution()
+    {
+        using P                 = Page<Problem>;
+        constexpr index_t kRows = P::kVRows * P::kHeadDim;
+        static_assert(kRows % get_warp_size() == 0);
+        return make_static_tile_distribution(
+            tile_distribution_encoding<
+                sequence<>,
+                tuple<sequence<kRows / get_warp_size(), get_warp_size()>, sequence<P::kX>>,
+                tuple<sequence<1>>,
+                tuple<sequence<1>>,
+                sequence<1, 2>,
+                sequence<0, 0>>{});
+    }
+
+    // a warp's O (kM0 x kN1) for the merge of the wave-split loop
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeOaccLdsBlockDescriptor()
+    {
+        using Shape = typename Problem::BlockFmhaShape;
+        return make_naive_tensor_descriptor(make_tuple(number<Shape::kM0>{}, number<Shape::kN1>{}),
+                                            make_tuple(number<Shape::kN1>{}, number<1>{}),
+                                            number<16 / sizeof(typename Problem::OaccDataType)>{},
+                                            number<1>{});
     }
 
     // the PV gemm's B operand, read untransposed

@@ -1170,35 +1170,34 @@ fwd_result fmha_fwd_run(mode_enum mode,
                                                       p_drop,
                                                       num_splits);
         // The fp8bf16 d128 decode instances combine up to a cluster of splits themselves
-        // (FmhaFwdSplitKVKernel::ClusterCombine), which makes short splits pay: a power of
-        // two with two tiles or more each, on a grid of at most 512 workgroups. More splits
-        // than a cluster holds need the combine kernel; they are worth it only for long ranges
-        // that leave room on that grid.
+        // (FmhaFwdSplitKVKernel::ClusterCombine), so they take no more splits than a cluster
+        // holds, a power of two:
+        // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
+        // - long ranges, where the paged instances run every warp on tiles of its own
+        //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups.
         const int max_cluster = ck_tile::get_max_cluster_size();
         if(tdm && data_type == "fp8bf16" && hdim_q == 128 && hdim_v == 128 &&
            mode == mode_enum::batch && (qscale.type == quant_scale_enum::pertensor || dynamic_q) &&
            nhead_merged < nhead && p_drop == 0.0f && 1 < max_cluster)
         {
-            constexpr int kN0           = 64;
-            constexpr int kMaxWorkgroup = 512;
-            constexpr int kMaxSplits    = 64;
-            constexpr int kMinSplits    = 24;  // of a two-kernel launch
-            constexpr int kMinTiles     = 768; // of a two-kernel launch
-            const int num_kv_tiles      = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
-            const int num_m_blocks      = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
-            const int max_grid_splits   = kMaxWorkgroup / (batch * nhead_merged * num_m_blocks);
-            const int limit    = std::min({max_cluster, num_kv_tiles / 2, max_grid_splits});
-            int cluster_splits = 1;
-            while(2 * cluster_splits <= limit)
-                cluster_splits *= 2;
-            const int two_kernel_splits = std::min({num_splits, kMaxSplits, max_grid_splits});
-            if(max_cluster < two_kernel_splits && kMinSplits <= two_kernel_splits &&
-               kMinTiles <= num_kv_tiles)
-                num_splits = two_kernel_splits;
-            else if(num_splits <= max_cluster)
-                num_splits = std::max(num_splits, cluster_splits);
-            else
-                num_splits = cluster_splits;
+            constexpr int kN0            = 64;
+            constexpr int kMaxWorkgroup  = 512;
+            constexpr int kLongWorkgroup = 256;
+            constexpr int kLongTiles     = 12; // a split
+            const int num_kv_tiles       = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
+            const int num_m_blocks       = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
+            const int num_heads          = batch * nhead_merged * num_m_blocks;
+            const auto power_of_two      = [](int limit) {
+                int n = 1;
+                while(2 * n <= limit)
+                    n *= 2;
+                return n;
+            };
+            const int long_splits = power_of_two(std::min(max_cluster, kLongWorkgroup / num_heads));
+            const int short_splits =
+                power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
+            num_splits =
+                kv_vec5d && kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
         }
     }
     if(128 < num_splits)
@@ -2873,28 +2872,28 @@ fwd_result fmha_fwd_run(mode_enum mode,
                                         lse_host.get_element_space_size_in_bytes()) == 0;
                 same        = same_o && same_lse;
                 diff_result = same ? "same" : "differ";
-                // The paged and the linear instances may take different pipelines, which sum
-                // a row's P in different orders: the row sum, and so O and the LSE, may then
-                // differ in the last place, and no further.
+                // The paged and the linear instances take different pipelines. Both round P to
+                // fp8, the paged one against the row max of a share of the keys (its warps run
+                // tiles of their own on long ranges), so the two outputs differ by that
+                // rounding: a small part of the largest output, where keys read from a wrong
+                // page would change it whole.
                 if(!same)
                 {
-                    const auto close = [](const auto& x, const auto& y, double rel) {
+                    const auto close = [](const auto& x, const auto& y, double part) {
+                        double largest = 0;
+                        for(std::size_t i = 0; i < x.mData.size(); ++i)
+                            largest = std::max<double>(
+                                largest, std::abs(ck_tile::type_convert<float>(x.mData[i])));
                         bool ok = true;
                         for(std::size_t i = 0; i < x.mData.size(); ++i)
                         {
                             const double a = ck_tile::type_convert<float>(x.mData[i]);
                             const double b = ck_tile::type_convert<float>(y.mData[i]);
-                            ok &= a == b ||
-                                  std::abs(a - b) <= rel * std::max(std::abs(a), std::abs(b));
+                            ok &= a == b || std::abs(a - b) <= part * largest;
                         }
                         return ok;
                     };
-                    // one unit in the last place of O (bf16 keeps 8 significand bits, fp16
-                    // 11), and a few of the fp32 LSE
-                    const double o_rel =
-                        std::ldexp(1.0, std::is_same_v<ODataType, ck_tile::bf16_t> ? -7 : -10);
-                    if(close(o_linear, o_host, o_rel) &&
-                       (!lse || close(lse_linear, lse_host, 1e-5)))
+                    if(close(o_linear, o_host, 2e-2) && (!lse || close(lse_linear, lse_host, 1e-3)))
                     {
                         same        = true;
                         diff_result = "close";
