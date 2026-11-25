@@ -142,10 +142,10 @@ using fmha_epilogue =
 using fmha_kernel =
     ck_tile::FmhaFwdSplitKVKernel<fmha_pipeline, fmha_epilogue{F_final_o}>;
 
-// Splits run() puts into one workgroup cluster, which combines them itself (decode: one query
-// token). num_splits: one cluster a tile, which writes the output. A divisor of num_splits:
-// several clusters a tile, and run() launches the kernel once more to combine their partials.
-// 0: no cluster, the combine kernel takes every split.
+// Splits run() puts into one workgroup cluster (decode: one query token); the kernel then
+// writes the output itself. num_splits: one cluster a tile. A divisor of num_splits: several
+// clusters a tile, which takes a.split_counters_ptr. 0: no cluster, the combine kernel takes
+// every split.
 static int cluster_splits(const fmha_fwd_splitkv_args& a)
 {{
     using k_ = fmha_kernel;
@@ -154,7 +154,8 @@ static int cluster_splits(const fmha_fwd_splitkv_args& a)
     const int max_cluster = std::min<int>(ck_tile::get_max_cluster_size(), k_::kMaxClusterSplits);
     if(a.num_splits <= max_cluster)
         return a.num_splits;
-    return 1 < max_cluster && a.num_splits % max_cluster == 0 &&
+    return a.split_counters_ptr != nullptr && max_cluster == k_::kMaxClusterSplits &&
+                   a.num_splits % max_cluster == 0 &&
                    a.num_splits / max_cluster <= k_::kMaxClusterSplits
                ? max_cluster
                : 0;
@@ -171,34 +172,25 @@ static void run(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a)
 #if CK_TILE_ENABLE_CLUSTER_LAUNCH
     if constexpr(k_::kClusterCombine) {{
         const int cluster = cluster_splits(a);
-        if(cluster == a.num_splits) {{
+        if(0 < cluster) {{
             kargs.combine.o_ptr            = a.o_ptr;
             kargs.combine.lse_ptr          = a.lse_ptr;
             kargs.combine.nhead_stride_o   = a.nhead_stride_o;
             kargs.combine.batch_stride_o   = a.batch_stride_o;
             kargs.combine.nhead_stride_lse = a.nhead_stride_lse;
             kargs.combine.batch_stride_lse = a.batch_stride_lse;
-        }} else if(0 < cluster) {{
-            kargs.combine.group_splits = cluster;
+        }}
+        if(0 < cluster && cluster != a.num_splits) {{
+            kargs.combine.group_splits  = cluster;
+            kargs.combine.counters_ptr  = static_cast<int32_t*>(a.split_counters_ptr);
+            kargs.combine.counter_heads = grids.y;
+            ck_tile::make_cluster_kernel<kBlockPerCu, attr_>(
+                typename k_::SeveralClusters{{}}, dim3(cluster, 1, 1), grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
+            return;
         }}
         if(1 < cluster) {{
             ck_tile::make_cluster_kernel<kBlockPerCu, attr_>(
                 k_{{}}, dim3(cluster, 1, 1), grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
-            if(cluster != a.num_splits) {{
-                // the partial of a cluster is in the workspace slot of its first split
-                fmha_fwd_splitkv_args c = a;
-                c.num_splits           = a.num_splits / cluster;
-                c.split_stride_lse_acc = a.split_stride_lse_acc * cluster;
-                c.split_stride_o_acc   = a.split_stride_o_acc * cluster;
-                auto [ckargs, cgrids] = fmha_fwd_splitkv_create_kargs_and_grids<k_>(c);
-                ckargs.combine.o_ptr            = a.o_ptr;
-                ckargs.combine.lse_ptr          = a.lse_ptr;
-                ckargs.combine.nhead_stride_o   = a.nhead_stride_o;
-                ckargs.combine.batch_stride_o   = a.batch_stride_o;
-                ckargs.combine.nhead_stride_lse = a.nhead_stride_lse;
-                ckargs.combine.batch_stride_lse = a.batch_stride_lse;
-                ck_tile::make_kernel<kBlockPerCu, attr_>(typename k_::CombineOnly{{}}, cgrids, blocks, 0, ckargs)(ck_tile::stream_config{{s.stream_id_}});
-            }}
             return;
         }}
     }}

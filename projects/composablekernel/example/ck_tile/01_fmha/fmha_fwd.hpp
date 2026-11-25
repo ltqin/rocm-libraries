@@ -537,6 +537,11 @@ struct fmha_fwd_splitkv_args
     const void* q_descale_ptr = nullptr;
     const void* k_descale_ptr = nullptr;
     const void* v_descale_ptr = nullptr;
+
+    // Optional, for decode over very long ranges on gfx1250 (several workgroup clusters per
+    // tile): batch * nhead_q * 16 int32 on the device, zero before the first launch. Every
+    // launch leaves them zero; launches that share them must not overlap.
+    void* split_counters_ptr = nullptr;
 };
 
 struct fmha_fwd_appendkv_args

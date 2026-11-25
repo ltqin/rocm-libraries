@@ -1180,7 +1180,7 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // - long ranges, where the paged instances run every warp on tiles of its own
         //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups;
         // - very long ranges of a few sequences leave most of that grid idle: there the paged
-        //   instances take several clusters a tile, whose partials a second launch combines.
+        //   instances take several clusters a tile.
         // The linear instances have the cooperative loop of qr_tdm_pingpong only: they take
         // the first rule up to a cluster of splits, and on longer ranges keep the split count
         // above and the combine kernel.
@@ -1193,7 +1193,7 @@ fwd_result fmha_fwd_run(mode_enum mode,
             constexpr int kMaxWorkgroup  = 512;
             constexpr int kLongWorkgroup = 256;
             constexpr int kLongTiles     = 12; // a split
-            constexpr int kGroupedTiles  = 512;
+            constexpr int kGroupedTiles  = 256;
             constexpr int kMaxClusters   = 8; // a tile
             const int num_kv_tiles       = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
             const int num_m_blocks       = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
@@ -1209,8 +1209,7 @@ fwd_result fmha_fwd_run(mode_enum mode,
                 power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
             const int clusters =
                 power_of_two(std::min(kMaxClusters, kLongWorkgroup / (num_heads * max_cluster)));
-            // two clusters shorten a split the least: they need a range twice as long
-            if(kv_vec5d && 1 < clusters && (clusters == 2 ? 2 : 1) * kGroupedTiles <= num_kv_tiles)
+            if(kv_vec5d && 1 < clusters && kGroupedTiles <= num_kv_tiles)
                 num_splits = clusters * max_cluster;
             else if(kv_vec5d)
                 num_splits = kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
@@ -1799,6 +1798,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
     ck_tile::DeviceMem scale_seqstart_v_buf(seqstart_v_scale_host.size() * sizeof(int32_t));
     ck_tile::DeviceMem lse_acc_buf(lse_acc_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem o_acc_buf(o_acc_host.get_element_space_size_in_bytes());
+    // fmha_fwd_splitkv_args::split_counters_ptr
+    ck_tile::DeviceMem split_counters_buf(static_cast<std::size_t>(batch) * nhead * 16 *
+                                          sizeof(int32_t));
+    split_counters_buf.SetZero();
     ck_tile::DeviceMem lse_buf(lse_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem o_buf(o_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem seqstart_q_buf(seqstart_q_host.size() * sizeof(int32_t));
@@ -2362,8 +2365,9 @@ fwd_result fmha_fwd_run(mode_enum mode,
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {
-                args.lse_acc_ptr = lse_acc_buf.GetDeviceBuffer();
-                args.o_acc_ptr   = o_acc_buf.GetDeviceBuffer();
+                args.lse_acc_ptr        = lse_acc_buf.GetDeviceBuffer();
+                args.o_acc_ptr          = o_acc_buf.GetDeviceBuffer();
+                args.split_counters_ptr = split_counters_buf.GetDeviceBuffer();
 
                 args.block_table_ptr =
                     (0 < page_block_size ? block_table_buf.GetDeviceBuffer() : nullptr);
