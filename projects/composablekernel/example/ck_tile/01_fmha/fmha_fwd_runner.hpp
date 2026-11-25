@@ -1175,6 +1175,9 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
         // - long ranges, where the paged instances run every warp on tiles of its own
         //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups.
+        // The linear instances have the cooperative loop of qr_tdm_pingpong only: they take
+        // the first rule up to a cluster of splits, and on longer ranges keep the split count
+        // above and the combine kernel.
         const int max_cluster = ck_tile::get_max_cluster_size();
         if(tdm && data_type == "fp8bf16" && hdim_q == 128 && hdim_v == 128 &&
            mode == mode_enum::batch && (qscale.type == quant_scale_enum::pertensor || dynamic_q) &&
@@ -1196,8 +1199,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
             const int long_splits = power_of_two(std::min(max_cluster, kLongWorkgroup / num_heads));
             const int short_splits =
                 power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
-            num_splits =
-                kv_vec5d && kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
+            if(kv_vec5d)
+                num_splits = kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
+            else if(num_splits <= max_cluster)
+                num_splits = std::max(num_splits, short_splits);
         }
     }
     if(128 < num_splits)
