@@ -142,13 +142,22 @@ using fmha_epilogue =
 using fmha_kernel =
     ck_tile::FmhaFwdSplitKVKernel<fmha_pipeline, fmha_epilogue{F_final_o}>;
 
-// The launch combines the splits itself, without the combine kernel: decode (one query token)
-// with the splits of a tile as one workgroup cluster.
-static bool combines(const fmha_fwd_splitkv_args& a)
+// Splits run() puts into one workgroup cluster, which combines them itself (decode: one query
+// token). num_splits: one cluster a tile, which writes the output. A divisor of num_splits:
+// several clusters a tile, and run() launches the kernel once more to combine their partials.
+// 0: no cluster, the combine kernel takes every split.
+static int cluster_splits(const fmha_fwd_splitkv_args& a)
 {{
     using k_ = fmha_kernel;
-    return k_::kClusterCombine && a.max_seqlen_q == 1 && a.o_ptr != nullptr &&
-           a.num_splits <= std::min<int>(ck_tile::get_max_cluster_size(), k_::kMaxClusterSplits);
+    if(!k_::kClusterCombine || a.max_seqlen_q != 1 || a.o_ptr == nullptr)
+        return 0;
+    const int max_cluster = std::min<int>(ck_tile::get_max_cluster_size(), k_::kMaxClusterSplits);
+    if(a.num_splits <= max_cluster)
+        return a.num_splits;
+    return 1 < max_cluster && a.num_splits % max_cluster == 0 &&
+                   a.num_splits / max_cluster <= k_::kMaxClusterSplits
+               ? max_cluster
+               : 0;
 }}
 
 static void run(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a)
@@ -161,18 +170,36 @@ static void run(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a)
         ck_tile::kernel_attr_for<{F_arch.tag}, ck_tile::kernel_attr_max_waves_per_eu<k_::kMaxWavesPerEu>>>;
 #if CK_TILE_ENABLE_CLUSTER_LAUNCH
     if constexpr(k_::kClusterCombine) {{
-        if(combines(a)) {{
+        const int cluster = cluster_splits(a);
+        if(cluster == a.num_splits) {{
             kargs.combine.o_ptr            = a.o_ptr;
             kargs.combine.lse_ptr          = a.lse_ptr;
             kargs.combine.nhead_stride_o   = a.nhead_stride_o;
             kargs.combine.batch_stride_o   = a.batch_stride_o;
             kargs.combine.nhead_stride_lse = a.nhead_stride_lse;
             kargs.combine.batch_stride_lse = a.batch_stride_lse;
-            if(a.num_splits > 1) {{
-                ck_tile::make_cluster_kernel<kBlockPerCu, attr_>(
-                    k_{{}}, dim3(a.num_splits, 1, 1), grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
-                return;
+        }} else if(0 < cluster) {{
+            kargs.combine.group_splits = cluster;
+        }}
+        if(1 < cluster) {{
+            ck_tile::make_cluster_kernel<kBlockPerCu, attr_>(
+                k_{{}}, dim3(cluster, 1, 1), grids, blocks, 0, kargs)(ck_tile::stream_config{{s.stream_id_}});
+            if(cluster != a.num_splits) {{
+                // the partial of a cluster is in the workspace slot of its first split
+                fmha_fwd_splitkv_args c = a;
+                c.num_splits           = a.num_splits / cluster;
+                c.split_stride_lse_acc = a.split_stride_lse_acc * cluster;
+                c.split_stride_o_acc   = a.split_stride_o_acc * cluster;
+                auto [ckargs, cgrids] = fmha_fwd_splitkv_create_kargs_and_grids<k_>(c);
+                ckargs.combine.o_ptr            = a.o_ptr;
+                ckargs.combine.lse_ptr          = a.lse_ptr;
+                ckargs.combine.nhead_stride_o   = a.nhead_stride_o;
+                ckargs.combine.batch_stride_o   = a.batch_stride_o;
+                ckargs.combine.nhead_stride_lse = a.nhead_stride_lse;
+                ckargs.combine.batch_stride_lse = a.batch_stride_lse;
+                ck_tile::make_kernel<kBlockPerCu, attr_>(typename k_::CombineOnly{{}}, cgrids, blocks, 0, ckargs)(ck_tile::stream_config{{s.stream_id_}});
             }}
+            return;
         }}
     }}
 #endif
@@ -207,16 +234,16 @@ void run_instance(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a) {{
 }} // anonymous namespace
 
 namespace {{
-// combines() of the instance run_instance launches
+// cluster_splits() of the instance run_instance launches
 template <typename = void>
-bool instance_combines(const fmha_fwd_splitkv_args& a) {{
+int instance_cluster_splits(const fmha_fwd_splitkv_args& a) {{
     if constexpr ({F_bias} == ck_tile::BlockAttentionBiasEnum::NO_BIAS && (!{F_sink} || {F_merge_sink})
                   && (std::is_same_v<{F_mask}, ck_tile::SimplifiedGenericAttentionMask<false>>
                       || std::is_same_v<{F_mask}, FmhaMasks::NoMask> || {F_merge_masked})) {{
         if (a.max_seqlen_q == 1 && a.nhead_k < a.nhead_q)
-            return instance</*kHasUnevenSplits=*/true, /*kMergeNumHeadGroupsSeqLenQ=*/true>::combines(a);
+            return instance</*kHasUnevenSplits=*/true, /*kMergeNumHeadGroupsSeqLenQ=*/true>::cluster_splits(a);
     }}
-    return false;
+    return 0;
 }}
 }} // anonymous namespace
 
@@ -243,9 +270,9 @@ void fmha_fwd_splitkv_oneshot_<trait_{F_idx}, {F_arch.tag}>(const ck_tile::strea
 }}
 
 template<>
-bool fmha_fwd_splitkv_combines_<trait_{F_idx}, {F_arch.tag}>(const fmha_fwd_splitkv_args& a)
+int fmha_fwd_splitkv_cluster_splits_<trait_{F_idx}, {F_arch.tag}>(const fmha_fwd_splitkv_args& a)
 {{
-    return instance_combines<>(a);
+    return instance_cluster_splits<>(a);
 }}
 
 template<>
@@ -351,7 +378,7 @@ float fmha_fwd_splitkv_(const ck_tile::stream_config& s, fmha_fwd_splitkv_args a
             << std::flush;
 
     // the split kernel writes the output itself
-    if(fmha_fwd_splitkv_combines_<fmha_fwd_splitkv_traits_, Arch>(a))
+    if(0 < fmha_fwd_splitkv_cluster_splits_<fmha_fwd_splitkv_traits_, Arch>(a))
         return ck_tile::launch_kernel(s,
             [=](const ck_tile::stream_config& s_){{ fmha_fwd_splitkv_oneshot_<fmha_fwd_splitkv_traits_, Arch>(s_, a); }});
 
