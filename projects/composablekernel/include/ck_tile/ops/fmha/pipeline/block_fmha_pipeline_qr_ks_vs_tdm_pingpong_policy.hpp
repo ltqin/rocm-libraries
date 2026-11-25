@@ -108,11 +108,7 @@ struct QrTdmPingPongPadding<Problem, true>
 // be issued right behind Q's. S only takes space with the gemm_0 warps on N. d128
 // fp16/bf16, padded: K0=0, K1=17408, Q/V0=34816, end=53248 (warps on M, M=64); the
 // 16-row short-query tile: S=34800, Q/V0=39168, end=57600.
-template <typename Problem,
-          typename QPadding,
-          typename KPadding,
-          typename VPadding,
-          bool kDoubleV = false>
+template <typename Problem, typename QPadding, typename KPadding, typename VPadding>
 struct QrTdmPingPongLdsArenaLayout
 {
     using Shape = typename Problem::BlockFmhaShape;
@@ -153,12 +149,9 @@ struct QrTdmPingPongLdsArenaLayout
     static constexpr index_t kSOffset = integer_least_multiple(kK1Offset + kKBytes, kSAlignment);
     static constexpr index_t kV0Offset =
         integer_least_multiple(kSOffset + kSBytes, kRegionAlignment);
-    // a second V buffer with kDoubleV
-    static constexpr index_t kV1Offset =
-        kDoubleV ? integer_least_multiple(kV0Offset + kVBytes, kRegionAlignment) : kV0Offset;
     static constexpr index_t kQOffset = kV0Offset;
     static constexpr index_t kArenaBytes =
-        integer_least_multiple(max(kQOffset + kQBytes, kV1Offset + kVBytes), kArenaAlignment);
+        integer_least_multiple(max(kQOffset + kQBytes, kV0Offset + kVBytes), kArenaAlignment);
 
     static_assert(!KPadding::kEnabled || (kK1Offset - kK0Offset) % KPadding::kIntervalBytes == 0);
     static_assert(kArenaBytes <= 128 * 1024);
@@ -298,12 +291,44 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
               typename KPadding = LdsPaddingConfigK<Problem>,
               typename VPadding = LdsPaddingConfigV<Problem>>
     using LdsArenaLayout =
-        detail::QrTdmPingPongLdsArenaLayout<Problem, QPadding, KPadding, VPadding, true>;
+        detail::QrTdmPingPongLdsArenaLayout<Problem, QPadding, KPadding, VPadding>;
+
+    // LDS of BlockFmhaPipelineQRKSVSTdmDecodePagedKV:
+    // [K x kStages][P and the row partials, on S's region][V x kStages]. A tile's K and V are
+    // staged kStages - 1 trips ahead of the trip that reads them, into the buffers of stage
+    // (tile % kStages). Q sits on the last V buffer, which the first trip is the first to stage.
+    template <typename Problem>
+    struct DecodeLdsLayout
+    {
+        using Base = LdsArenaLayout<Problem>;
+
+        static constexpr index_t kStages = 3;
+
+        static constexpr index_t kQBytes = Base::kQBytes;
+        static constexpr index_t kKBytes = Base::kKBytes;
+        static constexpr index_t kVBytes = Base::kVBytes;
+        static constexpr index_t kSBytes = Base::kSBytes;
+        static_assert(kQBytes <= kVBytes);
+
+        static constexpr index_t kKStride = integer_least_multiple(kKBytes, Base::kRegionAlignment);
+        static constexpr index_t kVStride = integer_least_multiple(kVBytes, Base::kRegionAlignment);
+
+        static constexpr index_t kK0Offset = 0;
+        static constexpr index_t kSOffset =
+            integer_least_multiple(kK0Offset + kStages * kKStride, Base::kSAlignment);
+        static constexpr index_t kV0Offset =
+            integer_least_multiple(kSOffset + kSBytes, Base::kRegionAlignment);
+        static constexpr index_t kQOffset = kV0Offset + (kStages - 1) * kVStride;
+        static constexpr index_t kArenaBytes =
+            integer_least_multiple(kV0Offset + kStages * kVStride, Base::kArenaAlignment);
+
+        static_assert(kArenaBytes <= 128 * 1024);
+    };
 
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr index_t GetSmemSize()
     {
-        return LdsArenaLayout<Problem>::kArenaBytes;
+        return DecodeLdsLayout<Problem>::kArenaBytes;
     }
 
     // The keys of a page a gemm_0 warp reads, (d / X, key * X): every warp copies its own with

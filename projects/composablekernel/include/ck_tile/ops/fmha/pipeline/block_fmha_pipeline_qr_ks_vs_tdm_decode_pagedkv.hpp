@@ -13,8 +13,9 @@ namespace ck_tile {
 // - The softmax runs on gemm_0's result as it is: a warp holds 16 keys of every row, so it
 //   computes P for its own keys only. The warps exchange the row max and the row sum of the
 //   tile through LDS, and P reaches gemm_1 as fp8 (the scores themselves never go to LDS).
-// - A warp copies the K of its own keys, so K takes no barrier, and V is double buffered as
-//   K is, so the K and V of a tile are in flight a trip ahead of the gemms that read them.
+// - A warp copies the K of its own keys, so K takes no barrier. K and V have three LDS
+//   buffers each: a tile's transfers are issued two trips ahead of the gemms that read it,
+//   which covers their latency.
 template <typename Problem_, typename Policy_ = BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy>
 struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
     : BlockFmhaPipelineQRKSVSTdmPingPong<Problem_, Policy_>
@@ -56,6 +57,11 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
     static_assert(
         kPaged5D && kFp8P && kNWarp > 1 && kK0 == kQKHeaddim && kK1 == kN0,
         "qr_tdm decode pagedkv: fp8 P, the gemm_0 warps on N, one WMMA per warp and gemm");
+
+    CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSize()
+    {
+        return Policy::template DecodeLdsLayout<Problem>::kArenaBytes;
+    }
 
     // gemm_0's Q operand. Dynamic Q quantizes it and sets row_scale to scale_s times each row's
     // dequant scale.
@@ -106,7 +112,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                                         float sink_v,
                                         const PageNavigator& page_nav) const
     {
-        using Layout = typename Policy::template LdsArenaLayout<Problem>;
+        using Layout = typename Policy::template DecodeLdsLayout<Problem>;
         using Nav    = remove_cvref_t<PageNavigator>;
 
         static_assert(
@@ -186,20 +192,23 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         // behind the empty-range exit (an empty sequence has no page).
         const index_t i_page_start = logical_seqlen_k_start / kN0;
         index_t page_id            = page_nav.page_id(i_page_start);
+        // a tile is staged Layout::kStages - 1 = 2 trips ahead: the second tile's id too
+        static_assert(Layout::kStages == 3);
+        index_t page_id_1 = page_nav.page_id(i_page_start + 1);
 
         TDMConfig tdm_config_k =
             Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigK<Problem>>();
         TDMConfig tdm_config_v =
             Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigV<Problem>>();
 
-        // Q through LDS, on V's second buffer: its reads are done before the first trip
-        // stages a V tile there. Issued next to the page id: neither depends on the other.
+        // Q through LDS, on V's last buffer: its reads are done before the first trip stages
+        // a V tile there. Issued next to the page ids: neither depends on the other.
         TDMConfig tdm_config_q =
             Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigQ<Problem>>();
         auto q_dram_window = make_tile_window(
             q_dram_block_window_tmp, Policy::template MakeQDramTileDistribution<Problem>());
         auto q_lds_view = make_tensor_view<address_space_enum::lds>(
-            reinterpret_cast<QInputDataType*>(static_cast<char*>(smem_arena) + Layout::kV1Offset),
+            reinterpret_cast<QInputDataType*>(static_cast<char*>(smem_arena) + Layout::kQOffset),
             Policy::template MakeQLdsBlockDescriptor<Problem>());
         auto q_lds_store_window = make_tile_window(
             q_lds_view, Policy::template MakeQLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
@@ -214,8 +223,9 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         // the page id's users, and so its wait, stay behind the Q transfer
         __builtin_amdgcn_sched_barrier(0);
         asm volatile("" : "+s"(page_id));
-        // page id * page stride of the tile in flight, shared by its K and V
-        long_index_t page_off = page_nav.page_offset(page_id);
+        asm volatile("" : "+s"(page_id_1));
+        // page id * page stride of the first tile, shared by its K and V
+        const long_index_t page_off = page_nav.page_offset(page_id);
 
         const index_t physical_seqlen_k_start = logical_seqlen_k_start;
         const index_t physical_seqlen_k_end   = logical_seqlen_k_end;
@@ -227,8 +237,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                              {bias_origin.at(number<0>{}), 0},
                              gemm_0.MakeCBlockTile().get_tile_distribution());
 
-        // K is double buffered: the next tile goes into the buffer this trip does not read.
-        // A warp copies the keys it reads itself, into a block of its own, so K takes no
+        // K: a warp copies the keys it reads itself, into a block of its own, so K takes no
         // barrier.
         ignore                         = k_dram_block_window_tmp; // its page is split here
         constexpr index_t kKeysPerWarp = Policy::template kKeysPerWarp<Problem>;
@@ -243,8 +252,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
 
         KDataType* const k_smem_buf0 =
             reinterpret_cast<KDataType*>(static_cast<char*>(smem_arena) + Layout::kK0Offset);
-        KDataType* const k_smem_buf1 =
-            reinterpret_cast<KDataType*>(static_cast<char*>(smem_arena) + Layout::kK1Offset);
+        constexpr index_t kKStride = Layout::kKStride / sizeof(KDataType);
         // the warp's block of a buffer
         const index_t k_block_offset = get_warp_id() * (Nav::kKRows * kKeysPerWarp * Nav::kX);
 
@@ -262,8 +270,13 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             {0, 0},
             Policy::template MakeKRegTileDistribution<Problem>());
 
-        // issued while Q is still in flight
-        load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
+        // the K transfer of the tile whose page is at page_off_, into the warp's block of k_buf
+        const auto issue_k = [&](long_index_t page_off_, KDataType* k_buf) {
+            k_dram_window.set_bottom_tensor_view_data_ptr(page_nav.k_page_at(page_off_) +
+                                                          i_warp_key * Nav::kX);
+            k_lds_write_window.set_bottom_tensor_view_data_ptr(k_buf + k_block_offset);
+            load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
+        };
 
         // P in LDS: written in gemm_0's result layout, read as gemm_1's A operand
         PDataType* const p_smem =
@@ -305,16 +318,14 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         static_assert(RowPartialTile::get_thread_buffer_size() == 1 &&
                       RowPartialsTile::get_thread_buffer_size() == kNWarp);
 
-        // V in LDS, double buffered as K: written by the TDM, each warp whole rows of the
-        // page, and read back through the page layout behind the barrier ahead of gemm_1
+        // V in LDS: written by the TDM, each warp whole rows of the page, and read back
+        // through the page layout behind the barrier ahead of gemm_1
         auto v_dram_window = make_tile_window(
             v_dram_block_window_tmp, {0, 0}, Policy::template MakeVDramTileDistribution<Problem>());
         VDataType* const v_smem_buf0 =
             reinterpret_cast<VDataType*>(static_cast<char*>(smem_arena) + Layout::kV0Offset);
-        VDataType* const v_smem_buf1 =
-            reinterpret_cast<VDataType*>(static_cast<char*>(smem_arena) + Layout::kV1Offset);
-        static_assert(Layout::kV1Offset != Layout::kV0Offset);
-        auto v_lds_view = make_tensor_view<address_space_enum::lds>(
+        constexpr index_t kVStride = Layout::kVStride / sizeof(VDataType);
+        auto v_lds_view            = make_tensor_view<address_space_enum::lds>(
             v_smem_buf0, Policy::template MakeVLdsBlockDescriptor<Problem>());
         auto v_lds_write_window = make_tile_window(
             v_lds_view, Policy::template MakeVLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
@@ -362,30 +373,47 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
             }
         };
-        // behind K on the transfer counter, as in every trip
+        // The first two tiles, K then V of each as in every trip: the waits count on that
+        // order. They are issued while Q is in flight, and stay in flight when Q is retired.
+        issue_k(page_off, k_smem_buf0);
         issue_v(0, page_off, v_smem_buf0);
-
-        // retire Q only; K and V, issued after it, stay in flight
-        s_wait_tensorcnt_barrier<2>();
+        if(1 < num_total_loop)
+        {
+            const long_index_t page_off_1 = page_nav.page_offset(page_id_1);
+            issue_k(page_off_1, k_smem_buf0 + kKStride);
+            issue_v(1, page_off_1, v_smem_buf0 + kVStride);
+            s_wait_tensorcnt<4>();
+        }
+        else
+            s_wait_tensorcnt<2>();
+        block_sync_lds();
         const auto q_tile = MakeQTile(load_tile(q_lds_read_window), scale_s, row_scale);
 
         index_t i_total_loops = 0;
+        index_t stage         = 0;
 
         do
         {
-            // trip i reads K buffer (i & 1) and stages trip i+1 into the other
-            const bool k_buf_is_even     = ((i_total_loops & 1) == 0);
-            KDataType* const k_read_ptr  = k_buf_is_even ? k_smem_buf0 : k_smem_buf1;
-            KDataType* const k_write_ptr = k_buf_is_even ? k_smem_buf1 : k_smem_buf0;
+            // trip i reads the buffers of stage (i % kStages) and stages tile i + 2 into those
+            // of stage ((i + 2) % kStages), which trip i - 1 read
+            const index_t stage_ahead    = stage == 0 ? Layout::kStages - 1 : stage - 1;
+            KDataType* const k_read_ptr  = k_smem_buf0 + stage * kKStride;
+            KDataType* const k_write_ptr = k_smem_buf0 + stage_ahead * kKStride;
+            VDataType* const v_read_ptr  = v_smem_buf0 + stage * kVStride;
+            VDataType* const v_write_ptr = v_smem_buf0 + stage_ahead * kVStride;
 
-            VDataType* const v_read_ptr  = k_buf_is_even ? v_smem_buf0 : v_smem_buf1;
-            VDataType* const v_write_ptr = k_buf_is_even ? v_smem_buf1 : v_smem_buf0;
+            // tiles past the range are not staged
+            const bool has_next         = i_total_loops + 1 < num_total_loop;
+            const bool stage_ahead_tile = i_total_loops + 2 < num_total_loop;
 
-            // In flight: this trip's K, then its V. The warp reads only the keys it copied,
-            // so K needs the wait and no barrier. The next tile's page id is read under the
-            // gemm.
-            s_wait_tensorcnt<1>();
-            const index_t page_id_next  = page_nav.page_id(i_page_start + i_total_loops + 1);
+            // In flight: this trip's K and V, then the next tile's. The warp reads only the
+            // keys it copied, so K needs the wait and no barrier. The id of the page to stage
+            // is read under the gemm.
+            if(has_next)
+                s_wait_tensorcnt<3>();
+            else
+                s_wait_tensorcnt<1>();
+            const index_t page_id_ahead = page_nav.page_id(i_page_start + i_total_loops + 2);
             const index_t kv_tile_start = physical_seqlen_k_start + i_total_loops * kN0;
 
             // STAGE 1, QK gemm
@@ -408,13 +436,10 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                              i_total_loops == num_total_loop - 1,
                              physical_seqlen_k_end);
 
-            // Next K, into the buffer this trip does not read. Issued on the last trip too:
-            // the waits count on it.
-            page_off = page_nav.page_offset(page_id_next);
-            k_dram_window.set_bottom_tensor_view_data_ptr(page_nav.k_page_at(page_off) +
-                                                          i_warp_key * Nav::kX);
-            k_lds_write_window.set_bottom_tensor_view_data_ptr(k_write_ptr + k_block_offset);
-            load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
+            // K two tiles ahead
+            const long_index_t page_off_ahead = page_nav.page_offset(page_id_ahead);
+            if(stage_ahead_tile)
+                issue_k(page_off_ahead, k_write_ptr);
 
             // STAGE 3, softmax on the warp's own keys. The row max of the tile first.
             const auto s = cast_tile<SMPLComputeDataType>(s_acc);
@@ -426,9 +451,10 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             }
             store_tile(max_lds_write_window, row_partial);
             block_sync_lds();
-            // Next V, into the buffer the last trip's gemm_1 read: every warp is past those
-            // reads here. This trip's gemm_1 reads the other buffer.
-            issue_v(i_total_loops + 1, page_off, v_write_ptr);
+            // V two tiles ahead, into the buffer the last trip's gemm_1 read: every warp is
+            // past those reads here.
+            if(stage_ahead_tile)
+                issue_v(i_total_loops + 2, page_off_ahead, v_write_ptr);
             {
                 const auto partials        = load_tile(max_lds_read_window);
                 SMPLComputeDataType m_tile = partials.get_thread_buffer()[0];
@@ -476,9 +502,15 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             tile_elementwise_inout([](auto& x) { x *= kPScale; }, p_compute);
             store_tile(p_lds_write_window, cast_tile<PDataType>(p_compute));
 
-            // In flight: V, then the next K and V. <2> retires V and leaves the rest running
-            // under the PV gemm; the barrier publishes V, P and the row sums.
-            s_wait_tensorcnt_barrier<2>();
+            // In flight: V, then the K and V of the tiles ahead. This retires V and leaves
+            // the rest running under the PV gemm; the barrier publishes V, P and the row sums.
+            if(stage_ahead_tile)
+                s_wait_tensorcnt<4>();
+            else if(has_next)
+                s_wait_tensorcnt<2>();
+            else
+                s_wait_tensorcnt<0>();
+            block_sync_lds();
 
             {
                 const auto partials        = load_tile(sum_lds_read_window);
@@ -491,10 +523,8 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             // STAGE 4, PV gemm
             v_lds_read_window.set_bottom_tensor_view_data_ptr(v_read_ptr);
             gemm_1(o_acc, load_tile(p_lds_read_window), load_tile(v_lds_read_window));
+            stage = stage + 1 == Layout::kStages ? 0 : stage + 1;
         } while(++i_total_loops < num_total_loop);
-
-        // retire the tiles issued past the last one consumed
-        s_wait_tensorcnt<0>();
 
         if constexpr(kStoreLSE)
         {

@@ -1181,6 +1181,19 @@ struct BlockFmhaFwdSplitKVPipelineQRKSVSTdmPingPong
                   "qr_tdm_pingpong split-kv supports paged kv only in the 5D layout, and neither "
                   "sink nor fp8 static quant");
 
+    // the paged instances run their own main loop, with its own LDS layout
+    using DecodePagedKV =
+        BlockFmhaPipelineQRKSVSTdmDecodePagedKV<BlockFmhaFwdSplitKVPingPongProblem<Problem_>,
+                                                Policy_>;
+
+    CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSize()
+    {
+        if constexpr(Base::kPaged5D)
+            return DecodePagedKV::GetSmemSize();
+        else
+            return Base::GetSmemSize();
+    }
+
     template <typename QDramBlockWindowTmp,
               typename KDramBlockWindowLengths,
               typename KPageBlockNavigator,
@@ -1214,9 +1227,7 @@ struct BlockFmhaFwdSplitKVPipelineQRKSVSTdmPingPong
         {
             // the K / V windows start on a page; the pipeline turns the pages
             using Nav = remove_cvref_t<KPageBlockNavigator>;
-            return BlockFmhaPipelineQRKSVSTdmDecodePagedKV<
-                BlockFmhaFwdSplitKVPingPongProblem<Problem_>,
-                Policy_>{}(
+            return DecodePagedKV{}(
                 q_dram_block_window_tmp,
                 make_tile_window(
                     k_page_block_navigator.make_k_page_view(0), Nav::k_page_lengths(), {0, 0}),
