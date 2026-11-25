@@ -553,8 +553,7 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
               typename VDramBlockWindowTmp,
               typename BiasDramBlockWindowTmp,
               typename LSEaccDramBlockWindowTmp,
-              typename PositionEncoding,
-              typename Paged5DNavigator = detail::no_paged5d_navigator>
+              typename PositionEncoding>
     CK_TILE_HOST_DEVICE auto operator()(const QDramBlockWindowTmp& q_dram_block_window_tmp,
                                         const KDramBlockWindowTmp& k_dram_block_window_tmp,
                                         const VDramBlockWindowTmp& v_dram_block_window_tmp,
@@ -564,8 +563,7 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
                                         PositionEncoding position_encoding,
                                         float scale_s,
                                         void* smem_arena,
-                                        float sink_v,
-                                        const Paged5DNavigator& paged5d_nav = {}) const
+                                        float sink_v) const
     {
         using Layout = typename Policy::template LdsArenaLayout<Problem>;
         static_assert(!kDynamicQ || Layout::kQBytes <= Layout::kVBytes,
@@ -579,29 +577,18 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
             "wrong!");
 
         // Q, K and V all go through the TDM (box-major LDS write); V is read back with ds_load_tr
-        // (transposed) through a (kN1, kK1) dram window. 5D reads a page untransposed (below).
+        // (transposed) through a (kN1, kK1) dram window.
         static_assert(kM0 == QDramBlockWindowTmp{}.get_window_lengths()[I0] &&
                           kSubQKHeaddim == QDramBlockWindowTmp{}.get_window_lengths()[I1] &&
-                          (kPaged5D || (kN0 == KDramBlockWindowTmp{}.get_window_lengths()[I0] &&
-                                        kK0 == KDramBlockWindowTmp{}.get_window_lengths()[I1] &&
-                                        kN1 == VDramBlockWindowTmp{}.get_window_lengths()[I0] &&
-                                        kK1 == VDramBlockWindowTmp{}.get_window_lengths()[I1])) &&
+                          kN0 == KDramBlockWindowTmp{}.get_window_lengths()[I0] &&
+                          kK0 == KDramBlockWindowTmp{}.get_window_lengths()[I1] &&
+                          kN1 == VDramBlockWindowTmp{}.get_window_lengths()[I0] &&
+                          kK1 == VDramBlockWindowTmp{}.get_window_lengths()[I1] &&
                           kM0 == BiasDramBlockWindowTmp{}.get_window_lengths()[I0] &&
                           kN0 == BiasDramBlockWindowTmp{}.get_window_lengths()[I1],
                       "wrong!");
-        // 5D: the K / V windows are a page (see Paged5DTileNavigator)
-        if constexpr(kPaged5D)
-        {
-            using Nav = remove_cvref_t<Paged5DNavigator>;
-            static_assert(
-                Nav::kPageSize == kN0 && Nav::kHeadDim == kQKHeaddim &&
-                Nav::kKRows == KDramBlockWindowTmp{}.get_window_lengths()[I0] &&
-                Nav::kPageSize * Nav::kX == KDramBlockWindowTmp{}.get_window_lengths()[I1] &&
-                Nav::kVRows == VDramBlockWindowTmp{}.get_window_lengths()[I0] &&
-                Nav::kHeadDim * Nav::kX == VDramBlockWindowTmp{}.get_window_lengths()[I1] &&
-                Layout::kKBytes == kN0 * kQKHeaddim * sizeof(KDataType) &&
-                Layout::kVBytes == kN0 * kN1 * sizeof(VDataType));
-        }
+        static_assert(!kPaged5D,
+                      "the 5D paged instances run BlockFmhaPipelineQRKSVSTdmDecodePagedKV");
         // Block GEMM
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetPVBlockGemm<Problem>();
@@ -664,18 +651,6 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
             }
         }
 
-        // 5D: tile i is the page row[i_page_start + i] of the block table, as a split starts on a
-        // multiple of kN0 (SplitKVAttentionMask, through SplitTileRange). The first id is read
-        // here, behind the empty-range exit (an empty sequence has no page) and ahead of the Q
-        // transfer that hides the load.
-        [[maybe_unused]] index_t i_page_start = 0;
-        [[maybe_unused]] index_t page_id      = 0;
-        if constexpr(kPaged5D)
-        {
-            i_page_start = logical_seqlen_k_start / kN0;
-            page_id      = paged5d_nav.page_id(i_page_start);
-        }
-
         // TDM configs for Q / K / V; the LDS padding comes from the policy.
         TDMConfig tdm_config_q =
             MakeTdmConfig<typename Policy::template LdsPaddingConfigQ<Problem>>();
@@ -707,18 +682,6 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
                              Policy::template MakeQRegTileDistribution<Problem>());
 
         load_tile_tdm(tdm_config_q, q_lds_store_window, q_dram_window);
-        // page id * page stride of the tile in flight, shared by its K and V
-        [[maybe_unused]] long_index_t page_off = 0;
-        // 5D: the first page id's users, and so its wait, stay behind the Q transfer. Without
-        // the empty asm the id's sign extension still lands next to its load, ahead of the
-        // barrier.
-        if constexpr(kPaged5D)
-        {
-            __builtin_amdgcn_sched_barrier(0);
-            asm volatile("" : "+s"(page_id));
-            page_off = paged5d_nav.page_offset(page_id);
-        }
-
         // K tile in LDS
         // For sink: kv_load_start is 0 when there are sink tokens (we start
         // reading from seq position 0), otherwise seqlen_k_start.
@@ -739,7 +702,7 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
         // buffered: the next tile goes into the buffer this trip does not read.
         auto k_dram_window =
             make_tile_window(k_dram_block_window_tmp,
-                             {kPaged5D ? 0 : kv_load_start, 0},
+                             {kv_load_start, 0},
                              Policy::template MakeKDramTileDistribution<Problem, true>());
 
         // Both K buffers share one descriptor; the ping/pong only swaps the
@@ -754,23 +717,13 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
 
         auto k_lds_write_window = make_tile_window(
             k_lds_view, Policy::template MakeKLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
-        // a 5D page is read back through the page layout
-        const auto k_lds_read_view = [&]() {
-            if constexpr(kPaged5D)
-                return make_tensor_view<address_space_enum::lds>(
-                    k_smem_buf0, Policy::template MakeKLdsReadDescriptor<Problem>());
-            else
-                return k_lds_view;
-        }();
         auto k_lds_read_window =
-            make_tile_window(k_lds_read_view,
+            make_tile_window(k_lds_view,
                              make_tuple(number<kN0>{}, number<kK0>{}),
                              {0, 0},
                              Policy::template MakeKRegTileDistribution<Problem>());
 
         // issued while Q is still in flight
-        if constexpr(kPaged5D)
-            k_dram_window.set_bottom_tensor_view_data_ptr(paged5d_nav.k_page_at(page_off));
         load_tile_tdm(tdm_config_k, k_lds_write_window, k_dram_window);
 
         // S tile in LDS, only used with the gemm_0 warps on N
@@ -788,30 +741,21 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
         // V tile in LDS
         auto v_dram_window =
             make_tile_window(v_dram_block_window_tmp,
-                             {kPaged5D ? 0 : kv_load_start, 0},
+                             {kv_load_start, 0},
                              Policy::template MakeVDramTileDistribution<Problem>());
 
         // written by the TDM, read back with ds_load_tr through the same row-major descriptor
-        // (5D: read untransposed through the page layout)
         VDataType* const v_smem =
             reinterpret_cast<VDataType*>(static_cast<char*>(smem_arena) + Layout::kV0Offset);
         auto v_lds_view = make_tensor_view<address_space_enum::lds>(
             v_smem, Policy::template MakeVLdsBlockDescriptor<Problem>());
         auto v_lds_write_window = make_tile_window(
             v_lds_view, Policy::template MakeVLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
-        const auto v_lds_read_view = [&]() {
-            if constexpr(kPaged5D)
-                return make_tensor_view<address_space_enum::lds>(
-                    v_smem, Policy::template MakeVLdsReadDescriptor<Problem>());
-            else
-                return v_lds_view;
-        }();
-
-        auto v_lds_read_window = make_tile_window(
-            v_lds_read_view,
-            make_tuple(number<(kPaged5D ? kN1 : kK1)>{}, number<(kPaged5D ? kK1 : kN1)>{}),
-            {0, 0},
-            Policy::template MakeVRegTileDistribution<Problem>());
+        auto v_lds_read_window =
+            make_tile_window(v_lds_view,
+                             make_tuple(number<kK1>{}, number<kN1>{}),
+                             {0, 0},
+                             Policy::template MakeVRegTileDistribution<Problem>());
 
         // dynamic Q: scale_s times the Q dequant scale of each row, in s_acc's row layout
         using SaccRowTileType           = decltype(block_tile_reduce<SMPLComputeDataType>(
@@ -846,46 +790,8 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
             // K_i, so the count is <0>; dscnt 0 also retires the Q reads.
             s_wait_tensorcnt_barrier<0, 0>();
 
-            // 5D: V from this tile's page. On a tile cut short by the split end each warp copies
-            // its kX-token chunk through the tail view, which zero-fills the tokens past the end
-            // (P is 0 there, but 0 * NaN is not). The next tile's page id is read under the gemm.
-            [[maybe_unused]] index_t page_id_next = 0;
-            if constexpr(kPaged5D)
-            {
-                page_id_next = paged5d_nav.page_id(i_page_start + i_total_loops + 1);
-
-                const index_t split_end     = physical_seqlen_k_end;
-                const index_t kv_tile_start = physical_seqlen_k_start + i_total_loops * kN0;
-                const index_t tile_valid    = min(max(split_end - kv_tile_start, 0), kN0);
-                if(tile_valid < kN0)
-                {
-                    using Nav = remove_cvref_t<Paged5DNavigator>;
-                    const index_t v_tail_len =
-                        min(max(tile_valid - Nav::kX * get_warp_id(), 0), Nav::kX);
-                    constexpr auto tail_desc =
-                        Policy::template MakeVTailLdsBlockDescriptor<Problem>();
-                    auto v_tail_lds_window = make_tile_window(
-                        make_tensor_view<address_space_enum::lds>(v_smem, tail_desc),
-                        tail_desc.get_lengths(),
-                        {0, 0});
-                    auto v_tail_dram_window =
-                        make_tile_window(paged5d_nav.make_v_tail_view(page_off, v_tail_len),
-                                         tail_desc.get_lengths(),
-                                         {0, 0},
-                                         Policy::template MakeVTailDramTileDistribution<Problem>());
-                    load_tile_tdm(tdm_config_v, v_tail_lds_window, v_tail_dram_window);
-                }
-                else
-                {
-                    v_dram_window.set_bottom_tensor_view_data_ptr(paged5d_nav.v_page_at(page_off));
-                    load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
-                }
-            }
-            else
-            {
-                load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
-                move_tile_window(v_dram_window, {kN0, 0});
-            }
+            load_tile_tdm(tdm_config_v, v_lds_write_window, v_dram_window);
+            move_tile_window(v_dram_window, {kN0, 0});
 
             // STAGE 1, QK gemm
             clear_tile(s_acc); // initialize C
@@ -964,14 +870,7 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
 
             // move K and bias tile windows after current status checked
             // prefetch next-tile along [K]ey sequence length dimension
-            if constexpr(kPaged5D)
-            {
-                // the next trip's V reads the same page
-                page_off = paged5d_nav.page_offset(page_id_next);
-                k_dram_window.set_bottom_tensor_view_data_ptr(paged5d_nav.k_page_at(page_off));
-            }
-            else
-                move_tile_window(k_dram_window, {kN0, 0});
+            move_tile_window(k_dram_window, {kN0, 0});
             move_tile_window(bias_dram_window, {0, kN0});
 
             // Next K, into the buffer nobody reads this trip, so no barrier.
@@ -1125,12 +1024,7 @@ struct BlockFmhaPipelineQRKSVSTdmPingPong : BlockFmhaPipelineQRKSVSTdm<Problem_,
             // under the PV gemm.
             s_wait_tensorcnt_barrier<1>();
 
-            auto v_tile = [&]() {
-                if constexpr(kPaged5D)
-                    return load_tile(v_lds_read_window);
-                else
-                    return load_tile_transpose(v_lds_read_window);
-            }();
+            auto v_tile = load_tile_transpose(v_lds_read_window);
 
             if constexpr(1 < k1_loops)
             {

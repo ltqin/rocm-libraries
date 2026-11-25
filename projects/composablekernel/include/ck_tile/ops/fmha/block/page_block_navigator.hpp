@@ -350,11 +350,6 @@ struct is_kv_layout_5d<Problem, std::void_t<decltype(Problem::kKVLayout5D)>>
 template <typename Problem>
 inline constexpr bool is_kv_layout_5d_v = is_kv_layout_5d<Problem>::value;
 
-// what the pipelines take in place of a Paged5DTileNavigator on linear KV
-struct no_paged5d_navigator
-{
-};
-
 } // namespace detail
 
 // sglang's 5D paged KV cache with one page per tile: per (page, kv head), K is [d / X][token][X]
