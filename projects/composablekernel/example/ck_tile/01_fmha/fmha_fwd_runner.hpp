@@ -20,6 +20,7 @@
 #include <numeric>
 #include <optional>
 #include <ostream>
+#include <chrono>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -320,6 +321,9 @@ struct fmha_fwd_splitkv_options
     // with -v=1: rerun this many times on NaN outputs and split workspace, each run bitwise equal
     // to the validated one
     int rerun = 0;
+    // capture this many calls into a HIP graph and time its replay; with -v=1 a replay on NaN
+    // outputs and split workspace must be bitwise equal to the validated run. 0: no graph
+    int graph_calls = 0;
 };
 
 // qscale=dynq: Q goes to the split-kv kernel in bf16, which quantizes each row to fp8
@@ -2708,6 +2712,39 @@ fwd_result fmha_fwd_run(mode_enum mode,
                   << gb_per_sec << " GB/s" << std::flush;
     }
 
+    // The calls as a serving stack issues them: captured once into a HIP graph and replayed.
+    hipStream_t graph_stream  = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    if(0 < splitkv.graph_calls)
+    {
+        HIP_CHECK_ERROR(hipStreamCreate(&graph_stream));
+        HIP_CHECK_ERROR(hipStreamBeginCapture(graph_stream, hipStreamCaptureModeGlobal));
+        for(int i = 0; i < splitkv.graph_calls; ++i)
+            run_fwd(ck_tile::stream_config{graph_stream, false, 0});
+        hipGraph_t graph = nullptr;
+        HIP_CHECK_ERROR(hipStreamEndCapture(graph_stream, &graph));
+        HIP_CHECK_ERROR(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        HIP_CHECK_ERROR(hipGraphDestroy(graph));
+        if(stream_config.time_kernel_)
+        {
+            const int replays =
+                std::max(1, stream_config.nrepeat_ / std::max(1, splitkv.graph_calls));
+            for(int i = 0; i < 3; ++i)
+                HIP_CHECK_ERROR(hipGraphLaunch(graph_exec, graph_stream));
+            HIP_CHECK_ERROR(hipStreamSynchronize(graph_stream));
+            const auto t0 = std::chrono::steady_clock::now();
+            for(int i = 0; i < replays; ++i)
+                HIP_CHECK_ERROR(hipGraphLaunch(graph_exec, graph_stream));
+            HIP_CHECK_ERROR(hipStreamSynchronize(graph_stream));
+            const double us =
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                    .count() /
+                (static_cast<double>(replays) * splitkv.graph_calls);
+            std::cout << std::fixed << ", graph:" << std::setprecision(2) << us << " us"
+                      << std::flush;
+        }
+    }
+
     bool pass = true;
     if(do_validation == 0)
     {
@@ -3939,7 +3976,38 @@ fwd_result fmha_fwd_run(mode_enum mode,
             pass &= same_o && same_lse;
         }
 
+        // a replay of the captured graph, as the reruns above
+        if(pass && graph_exec != nullptr)
+        {
+            o_buf.SetBytePattern(nan_byte);
+            lse_buf.SetBytePattern(nan_byte);
+            o_acc_buf.SetBytePattern(nan_byte);
+            lse_acc_buf.SetBytePattern(nan_byte);
+            HIP_CHECK_ERROR(hipGraphLaunch(graph_exec, graph_stream));
+            HIP_CHECK_ERROR(hipStreamSynchronize(graph_stream));
+            ck_tile::HostTensor<ODataType> o_graph(o_host.get_lengths());
+            ck_tile::HostTensor<LSEDataType> lse_graph(lse_host.get_lengths());
+            o_buf.FromDevice(o_graph.data());
+            lse_buf.FromDevice(lse_graph.data());
+            const bool same_o = std::memcmp(o_graph.data(),
+                                            o_host.data(),
+                                            o_host.get_element_space_size_in_bytes()) == 0;
+            const bool same_lse =
+                !lse || std::memcmp(lse_graph.data(),
+                                    lse_host.data(),
+                                    lse_host.get_element_space_size_in_bytes()) == 0;
+            std::cout << ", graph_replay:" << (same_o && same_lse ? "same" : "differ")
+                      << std::flush;
+            pass &= same_o && same_lse;
+        }
+
         std::cout << ", valid:" << (pass ? "y" : "n") << std::flush << std::endl;
+    }
+
+    if(graph_exec != nullptr)
+    {
+        HIP_CHECK_ERROR(hipGraphExecDestroy(graph_exec));
+        HIP_CHECK_ERROR(hipStreamDestroy(graph_stream));
     }
 
     if(json)

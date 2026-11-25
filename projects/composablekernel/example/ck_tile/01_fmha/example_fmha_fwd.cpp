@@ -155,6 +155,10 @@ auto create_args(int argc, char* argv[])
                 "0",
                 "v=1: rerun this many times on NaN outputs and split-kv workspace, each run "
                 "bitwise equal to the validated one")
+        .insert("graph",
+                "0",
+                "capture this many calls into a HIP graph and print the time of a replayed "
+                "call; with v=1 a replay must be bitwise equal to the validated run")
         .insert("q_fill",
                 "init",
                 "qscale=dynq: the bf16 Q rows,\n"
@@ -219,7 +223,8 @@ auto run(const ck_tile::ArgParser& arg_parser)
     kv.host_seqlen_k = arg_parser.get_int("vec5d_host_sk");
     kv.diff_linear   = arg_parser.get_bool("vec5d_diff");
     fmha_fwd_splitkv_options splitkv;
-    splitkv.rerun = arg_parser.get_int("rerun");
+    splitkv.rerun       = arg_parser.get_int("rerun");
+    splitkv.graph_calls = arg_parser.get_int("graph");
     fmha_fwd_dynq_options dynq;
     dynq.q_fill     = arg_parser.get_str("q_fill");
     dynq.zero_heads = arg_parser.get_int_vec("q_zero_heads");

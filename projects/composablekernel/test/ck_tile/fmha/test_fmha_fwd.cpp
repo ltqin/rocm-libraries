@@ -3964,7 +3964,9 @@ TEST_P(SplitKVPaged5D, DataTypeConfig)
         std::nullopt,
         nullptr,
         c.kv,
-        fmha_fwd_splitkv_options{c.rerun});
+        // every case is also replayed from a HIP graph of a few calls: the splits of a tile are
+        // a workgroup cluster, which the capture has to keep
+        fmha_fwd_splitkv_options{c.rerun, 4});
     const std::string out = testing::internal::GetCapturedStdout();
     ASSERT_EQ(result, fwd_result::success) << out;
     // the 5D instance ran, through the split-kv api even with one split
