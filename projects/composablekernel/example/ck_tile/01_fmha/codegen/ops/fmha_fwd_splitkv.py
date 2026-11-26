@@ -404,6 +404,11 @@ float fmha_fwd_splitkv(fmha_fwd_splitkv_traits t, fmha_fwd_splitkv_args a, const
         t.has_sink))
         return r;
 
+    // Without has_lse there is no LSE output: the combine kernel has an instance for it, and
+    // the split kernel, where it combines the splits itself, goes by the pointer.
+    if(!t.has_lse)
+        a.lse_ptr = nullptr;
+
     [[maybe_unused]] const std::string device_name = ck_tile::get_device_name();
 
 {F_dispatch}

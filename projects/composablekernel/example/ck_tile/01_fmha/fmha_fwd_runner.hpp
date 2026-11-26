@@ -2844,7 +2844,9 @@ fwd_result fmha_fwd_run(mode_enum mode,
         o_buf.FromDevice(o_host.data());
         lse_buf.FromDevice(lse_host.data());
         randval_buf.FromDevice(randval_host.data());
-        if(force_split)
+        // (a single split without an LSE output may write the output directly and leave the O
+        // workspace alone)
+        if(force_split && !(num_splits == 1 && !lse))
         {
             // Every split row is finite, or empty: LSE -inf and O 0 (an empty split must write).
             // A row holds hdim_v values of OaccDataType, or of ODataType in its leading bytes

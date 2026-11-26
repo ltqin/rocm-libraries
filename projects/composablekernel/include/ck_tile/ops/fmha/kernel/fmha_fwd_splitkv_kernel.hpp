@@ -1466,10 +1466,35 @@ struct FmhaFwdSplitKVKernel
         {
             if(kargs.combine.o_ptr != nullptr)
             {
-                // The cluster combines the partials itself: they are stored in the output's
-                // type, in the leading bytes of the rows the workspace has for this split.
                 using FinalODataType = FinalODataType_;
                 static_assert(sizeof(FinalODataType) <= sizeof(OaccDataType));
+                // One split is the result: it goes straight to the output. (With an LSE output
+                // the split takes the general path, which copies the LSE.)
+                if(kargs.num_splits == 1 && kargs.combine.lse_ptr == nullptr)
+                {
+                    FinalODataType* const o_ptr =
+                        reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
+                        static_cast<long_index_t>(i_nhead) * kargs.nhead_ratio_qk *
+                            kargs.combine.nhead_stride_o +
+                        static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o;
+                    const auto o_dram = pad_tensor_view(
+                        make_naive_tensor_view<address_space_enum::global>(
+                            o_ptr,
+                            make_tuple(kargs.nhead_ratio_qk, kargs.hdim_v),
+                            make_tuple(kargs.combine.nhead_stride_o, 1),
+                            number<FmhaPipeline::kAlignmentOacc>{},
+                            number<1>{}),
+                        make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
+                        sequence<kPadSeqLenQ, kPadHeadDimV>{});
+                    auto o_dram_window = make_tile_window(
+                        o_dram,
+                        make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
+                        {i_m0, i_n1});
+                    store_tile(o_dram_window, cast_tile<FinalODataType>(o_acc_tile));
+                    return;
+                }
+                // The cluster combines the partials itself: they are stored in the output's
+                // type, in the leading bytes of the rows the workspace has for this split.
                 // seqlen_q is 1 here (see ClusterCombine), so a row is a Q head of the group and
                 // the view needs no merged-row transform
                 constexpr index_t kScale = sizeof(OaccDataType) / sizeof(FinalODataType);
