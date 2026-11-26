@@ -1428,8 +1428,18 @@ struct FmhaFwdSplitKVKernel
                 // type, in the leading bytes of the rows the workspace has for this split.
                 using FinalODataType = FinalODataType_;
                 static_assert(sizeof(FinalODataType) <= sizeof(OaccDataType));
-                const auto part_dram = make_o_acc_dram(reinterpret_cast<FinalODataType*>(o_acc_ptr),
-                                                       number<FmhaPipeline::kAlignmentOacc>{});
+                // seqlen_q is 1 here (see ClusterCombine), so a row is a Q head of the group and
+                // the view needs no merged-row transform
+                constexpr index_t kScale = sizeof(OaccDataType) / sizeof(FinalODataType);
+                const auto part_dram     = pad_tensor_view(
+                    make_naive_tensor_view<address_space_enum::global>(
+                        reinterpret_cast<FinalODataType*>(o_acc_ptr),
+                        make_tuple(kargs.nhead_ratio_qk, kargs.hdim_v),
+                        make_tuple(kargs.nhead_stride_o_acc * kScale, 1),
+                        number<FmhaPipeline::kAlignmentOacc>{},
+                        number<1>{}),
+                    make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
+                    sequence<kPadSeqLenQ, kPadHeadDimV>{});
                 auto part_dram_window = make_tile_window(
                     part_dram,
                     make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
