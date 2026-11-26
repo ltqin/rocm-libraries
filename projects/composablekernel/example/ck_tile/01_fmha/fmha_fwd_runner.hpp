@@ -1179,9 +1179,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
         // - long ranges, where the paged instances run every warp on tiles of its own
         //   (8 tiles or more a split): a grid of at most 256 workgroups, or half of it when
-        //   that makes the splits long enough;
+        //   that makes the splits long enough; 512 workgroups while a split has 10 to 32
+        //   tiles (longer splits are bound by memory, which more workgroups do not help);
         // - very long ranges of a few sequences leave most of that grid idle: there the paged
-        //   instances take several clusters a tile.
+        //   instances take several clusters a tile, with 8 tiles or more a split.
         // The linear instances have the cooperative loop of qr_tdm_pingpong only: they take
         // the first rule up to a cluster of splits, and on longer ranges keep the split count
         // above and the combine kernel.
@@ -1193,8 +1194,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
             constexpr int kN0            = 64;
             constexpr int kMaxWorkgroup  = 512;
             constexpr int kLongWorkgroup = 256;
-            constexpr int kLongTiles     = 8; // a split
-            constexpr int kGroupedTiles  = 256;
+            constexpr int kLongTiles     = 8;  // a split
+            constexpr int kWideTiles     = 10; // a split, from which the grid may be wide
+            constexpr int kWideTilesEnd  = 32;
+            constexpr int kGroupedTiles  = 512;
             constexpr int kMaxClusters   = 8; // a tile
             const int num_kv_tiles       = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
             const int num_m_blocks       = ck_tile::integer_divide_ceil(max_seqlen_q_merged, 16);
@@ -1206,12 +1209,18 @@ fwd_result fmha_fwd_run(mode_enum mode,
                 return n;
             };
             const int long_splits = power_of_two(std::min(max_cluster, kLongWorkgroup / num_heads));
+            const int wide_splits = power_of_two(std::min(max_cluster, kMaxWorkgroup / num_heads));
             const int short_splits =
                 power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
             const int clusters =
-                power_of_two(std::min(kMaxClusters, kLongWorkgroup / (num_heads * max_cluster)));
+                power_of_two(std::min({kMaxClusters,
+                                       kLongWorkgroup / (num_heads * max_cluster),
+                                       num_kv_tiles / (kLongTiles * max_cluster)}));
             if(kv_vec5d && 1 < clusters && kGroupedTiles <= num_kv_tiles)
                 num_splits = clusters * max_cluster;
+            else if(kv_vec5d && kWideTiles * wide_splits <= num_kv_tiles &&
+                    num_kv_tiles < kWideTilesEnd * wide_splits)
+                num_splits = wide_splits;
             else if(kv_vec5d)
             {
                 const int wave_splits = kLongTiles * long_splits <= num_kv_tiles
