@@ -248,13 +248,15 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                              make_tuple(number<kN1>{}, number<kK1>{}),
                              {0, 0},
                              make_static_tile_distribution(Gemm1::MakeBBlockDistributionEncode()));
-        // V as the X tokens of every (token / X, d), to clear the tokens past the range
-        auto v_lds_tokens_window =
+        // a token chunk of V as words, to clear the tokens past the range
+        constexpr auto v_words_desc = Policy::template MakeVChunkWordsLdsBlockDescriptor<Problem>();
+        constexpr index_t kWords    = Nav::kX * sizeof(VDataType) / sizeof(uint32_t);
+        auto v_lds_words_window =
             make_tile_window(make_tensor_view<address_space_enum::lds>(
-                                 v_buf0, Policy::template MakeVTailLdsBlockDescriptor<Problem>()),
-                             Policy::template MakeVTailLdsBlockDescriptor<Problem>().get_lengths(),
+                                 reinterpret_cast<uint32_t*>(v_buf0), v_words_desc),
+                             make_tuple(number<Nav::kHeadDim>{}, number<kWords>{}),
                              {0, 0},
-                             Policy::template MakeVTokensRegTileDistribution<Problem>());
+                             Policy::template MakeVChunkWordsRegTileDistribution<Problem>());
 
         // K, then V, of the tile on page `page`, into the buffers of `stage`
         const auto issue_tile = [&](index_t page, index_t stage) {
@@ -394,14 +396,30 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             const index_t tile_valid = min(max(seqlen_k_end - kv_tile_start, 0), kN0);
             if(tile_valid < kN0)
             {
-                v_lds_tokens_window.set_bottom_tensor_view_data_ptr(v_buf0 + stage * kVStride);
-                auto v_tokens = load_tile(v_lds_tokens_window);
-                set_tile_if(v_tokens, type_convert<VDataType>(0.f), [&](auto tile_idx) {
-                    const index_t token =
-                        (tile_idx.at(I0) / Nav::kHeadDim) * Nav::kX + tile_idx.at(I1);
-                    return tile_valid <= token;
-                });
-                store_tile(v_lds_tokens_window, v_tokens);
+                // the chunk the range ends in keeps its first tokens, the ones behind it none
+                v_lds_words_window.set_bottom_tensor_view_data_ptr(
+                    reinterpret_cast<uint32_t*>(v_buf0 + stage * kVStride));
+                for(index_t i_chunk = tile_valid / Nav::kX; i_chunk < kN0 / Nav::kX; ++i_chunk)
+                {
+                    v_lds_words_window.set_window_origin({i_chunk * Nav::kHeadDim, 0});
+                    const index_t keep = max(tile_valid - i_chunk * Nav::kX, 0) * sizeof(VDataType);
+                    auto words         = make_static_distributed_tensor<uint32_t>(
+                        v_lds_words_window.get_tile_distribution());
+                    if(keep > 0)
+                        words = load_tile(v_lds_words_window);
+                    static_for<0, decltype(words)::get_thread_buffer_size(), 1>{}([&](auto i) {
+                        // bytes of word (i % kWords) that stay
+                        const index_t n =
+                            min(max(keep - static_cast<index_t>(i % kWords * sizeof(uint32_t)), 0),
+                                static_cast<index_t>(sizeof(uint32_t)));
+                        const uint32_t kept = n >= static_cast<index_t>(sizeof(uint32_t))
+                                                  ? ~uint32_t{0}
+                                                  : (uint32_t{1} << (8 * n)) - 1;
+                        words.get_thread_buffer()(i) =
+                            keep > 0 ? words.get_thread_buffer()[i] & kept : uint32_t{0};
+                    });
+                    store_tile(v_lds_words_window, words);
+                }
             }
 
             // STAGE 4, PV gemm

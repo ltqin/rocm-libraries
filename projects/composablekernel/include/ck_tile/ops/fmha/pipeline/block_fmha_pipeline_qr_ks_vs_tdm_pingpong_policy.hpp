@@ -596,18 +596,31 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
         return MakeWarpWholeDramTileDistribution<Problem, P::kVRows, P::kHeadDim * P::kX>();
     }
 
-    // A V page in LDS as rows of the X tokens of a (token / X, d), every lane of a warp with
-    // its share of the rows: to clear the tokens past the end of a tile.
+    // To clear the tokens of a V page in LDS past the end of a tile: the X tokens (one 16-byte
+    // vector) of every head dim of one token chunk, as 32-bit words, a lane of the warp with
+    // its share of the head dims.
     template <typename Problem>
-    CK_TILE_HOST_DEVICE static constexpr auto MakeVTokensRegTileDistribution()
+    CK_TILE_HOST_DEVICE static constexpr auto MakeVChunkWordsLdsBlockDescriptor()
     {
-        using P                 = Page<Problem>;
-        constexpr index_t kRows = P::kVRows * P::kHeadDim;
-        static_assert(kRows % get_warp_size() == 0);
+        using P                  = Page<Problem>;
+        constexpr index_t kWords = P::kX * sizeof(typename Problem::VDataType) / sizeof(uint32_t);
+        return make_naive_tensor_descriptor(
+            make_tuple(number<P::kVRows * P::kHeadDim>{}, number<kWords>{}),
+            make_tuple(number<kWords>{}, number<1>{}),
+            number<kWords>{},
+            number<1>{});
+    }
+
+    template <typename Problem>
+    CK_TILE_HOST_DEVICE static constexpr auto MakeVChunkWordsRegTileDistribution()
+    {
+        using P                  = Page<Problem>;
+        constexpr index_t kWords = P::kX * sizeof(typename Problem::VDataType) / sizeof(uint32_t);
+        static_assert(P::kHeadDim % get_warp_size() == 0);
         return make_static_tile_distribution(
             tile_distribution_encoding<
                 sequence<>,
-                tuple<sequence<kRows / get_warp_size(), get_warp_size()>, sequence<P::kX>>,
+                tuple<sequence<P::kHeadDim / get_warp_size(), get_warp_size()>, sequence<kWords>>,
                 tuple<sequence<1>>,
                 tuple<sequence<1>>,
                 sequence<1, 2>,

@@ -1178,7 +1178,8 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // holds, a power of two:
         // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
         // - long ranges, where the paged instances run every warp on tiles of its own
-        //   (12 tiles or more a split pay for it): a grid of at most 256 workgroups;
+        //   (8 tiles or more a split): a grid of at most 256 workgroups, or half of it when
+        //   that makes the splits long enough;
         // - very long ranges of a few sequences leave most of that grid idle: there the paged
         //   instances take several clusters a tile.
         // The linear instances have the cooperative loop of qr_tdm_pingpong only: they take
@@ -1192,7 +1193,7 @@ fwd_result fmha_fwd_run(mode_enum mode,
             constexpr int kN0            = 64;
             constexpr int kMaxWorkgroup  = 512;
             constexpr int kLongWorkgroup = 256;
-            constexpr int kLongTiles     = 12; // a split
+            constexpr int kLongTiles     = 8; // a split
             constexpr int kGroupedTiles  = 256;
             constexpr int kMaxClusters   = 8; // a tile
             const int num_kv_tiles       = ck_tile::integer_divide_ceil(seqlen_k_in_mask, kN0);
@@ -1212,7 +1213,12 @@ fwd_result fmha_fwd_run(mode_enum mode,
             if(kv_vec5d && 1 < clusters && kGroupedTiles <= num_kv_tiles)
                 num_splits = clusters * max_cluster;
             else if(kv_vec5d)
-                num_splits = kLongTiles * long_splits <= num_kv_tiles ? long_splits : short_splits;
+            {
+                const int wave_splits = kLongTiles * long_splits <= num_kv_tiles
+                                            ? long_splits
+                                            : std::max(1, long_splits / 2);
+                num_splits = kLongTiles * wave_splits <= num_kv_tiles ? wave_splits : short_splits;
+            }
             else if(num_splits <= max_cluster)
                 num_splits = std::max(num_splits, short_splits);
         }
