@@ -172,6 +172,9 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                                      RowTile& l) const
     {
         using Nav = remove_cvref_t<PageNavigator>;
+        // no bias (see operator())
+        ignore = bias_dram_window;
+        ignore = position_encoding;
 
         constexpr auto gemm_0 = Policy::template GetQKWarpBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetPVWarpBlockGemm<Problem>();
@@ -327,16 +330,19 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             k_lds_read_window.set_bottom_tensor_view_data_ptr(k_buf0 + stage * kKStride);
             gemm_0(s_acc, q_tile, load_tile(k_lds_read_window));
 
-            // STAGE 2: scale_s and the mask
-            Base::ApplyScaleAndBias(s_acc,
-                                    bias_dram_window,
-                                    q_origin,
-                                    kv_tile_start,
-                                    scale_s,
-                                    position_encoding,
-                                    row_scale);
+            // STAGE 2: the mask. The scale of the scores (scale_s, times the row's Q dequant
+            // scale with dynamic Q; positive) is not applied to them: it goes into the row max
+            // and into the exponent of P.
             Base::MaskScores(
                 s_acc, mask, q_origin, kv_tile_start, i_tile == num_total_loop - 1, seqlen_k_end);
+            const SMPLComputeDataType s_scale = [&]() {
+                // a zero row has scale 0, and 0 times a masked score (-inf) would be NaN
+                if constexpr(kDynamicQ)
+                    return max(row_scale.get_thread_buffer()[0],
+                               std::numeric_limits<SMPLComputeDataType>::min());
+                else
+                    return scale_s;
+            }();
 
             // STAGE 3, softmax
             const auto s = cast_tile<SMPLComputeDataType>(s_acc);
@@ -344,7 +350,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 auto m_tile = block_tile_reduce<SMPLComputeDataType>(
                     s, sequence<1>{}, f_max, -numeric<SMPLComputeDataType>::infinity());
                 Base::ReduceRowSync(m_tile, f_max);
-                m_w = max(m_w, m_tile.get_thread_buffer()[0]);
+                m_w = max(m_w, m_tile.get_thread_buffer()[0] * s_scale);
             }
             const SMPLComputeDataType gap = m_w - m_base_w;
             if(gap > 0)
@@ -364,10 +370,16 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                     return m_base_w;
             }();
 
+            // kPScale * p in one step: exp2(s * s_scale + log2(kPScale) - row max). l_w sums
+            // it, so it is kPScale times the row sum until the merge.
+            constexpr SMPLComputeDataType kLog2PScale = 8.807354922057604f;
+            static_assert(kPScale == 448.f);
+            const SMPLComputeDataType p_bias = kLog2PScale - row_exp;
             auto p_compute =
                 make_static_distributed_tensor<SMPLComputeDataType>(s.get_tile_distribution());
             static_for<0, decltype(p_compute)::get_thread_buffer_size(), 1>{}([&](auto i) {
-                p_compute.get_thread_buffer()(i) = exp2(s.get_thread_buffer()[i] - row_exp);
+                p_compute.get_thread_buffer()(i) =
+                    exp2(__builtin_fmaf(s.get_thread_buffer()[i], s_scale, p_bias));
             });
             {
                 auto l_tile = block_tile_reduce<SMPLComputeDataType>(
@@ -376,9 +388,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 l_w += l_tile.get_thread_buffer()[0];
             }
 
-            // P as fp8 (kPScale * p, rounded once): gemm_0's result layout of a warp is
-            // gemm_1's A layout
-            tile_elementwise_inout([](auto& x) { x *= kPScale; }, p_compute);
+            // P as fp8 (rounded once): gemm_0's result layout of a warp is gemm_1's A layout
             const auto p_fp8 = cast_tile<PDataType>(p_compute);
             auto p_tile      = make_static_distributed_tensor<PDataType>(
                 make_static_tile_distribution(Gemm1::MakeABlockDistributionEncode()));
@@ -492,7 +502,8 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 [&](auto j) { o_acc.get_thread_buffer()(j) += w_i * o_i.get_thread_buffer()[j]; });
         });
         m_base.get_thread_buffer()(0) = m_block;
-        l.get_thread_buffer()(0)      = l_block;
+        // the warps' sums are of kPScale * p
+        l.get_thread_buffer()(0) = l_block * (1.f / kPScale);
     }
 
     template <typename QDramBlockWindowTmp,
@@ -640,13 +651,6 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
 
             const index_t physical_seqlen_k_start = logical_seqlen_k_start;
             const index_t physical_seqlen_k_end   = logical_seqlen_k_end;
-
-            const auto bias_origin = bias_dram_block_window_tmp.get_window_origin();
-            auto bias_dram_window =
-                make_tile_window(bias_dram_block_window_tmp.get_bottom_tensor_view(),
-                                 bias_dram_block_window_tmp.get_window_lengths(),
-                                 {bias_origin.at(number<0>{}), 0},
-                                 gemm_0.MakeCBlockTile().get_tile_distribution());
 
             // K: a warp copies the keys it reads itself, into a block of its own, so K takes no
             // barrier.
@@ -826,14 +830,15 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 k_lds_read_window.set_bottom_tensor_view_data_ptr(k_read_ptr);
                 gemm_0(s_acc, q_tile, load_tile(k_lds_read_window));
 
-                // STAGE 2: scale_s and the mask
-                Base::ApplyScaleAndBias(s_acc,
-                                        bias_dram_window,
-                                        q_origin,
-                                        kv_tile_start,
-                                        scale_s,
-                                        position_encoding,
-                                        row_scale);
+                // STAGE 2: the mask. The scale of the scores goes into the row max and into the
+                // exponent of P (see RunWaveSplit).
+                const SMPLComputeDataType s_scale = [&]() {
+                    if constexpr(kDynamicQ)
+                        return max(row_scale.get_thread_buffer()[0],
+                                   std::numeric_limits<SMPLComputeDataType>::min());
+                    else
+                        return scale_s;
+                }();
                 Base::MaskScores(s_acc,
                                  mask,
                                  q_origin,
@@ -852,7 +857,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                     auto m_warp = block_tile_reduce<SMPLComputeDataType>(
                         s, sequence<1>{}, f_max, -numeric<SMPLComputeDataType>::infinity());
                     Base::ReduceRowSync(m_warp, f_max);
-                    row_partial.get_thread_buffer()(0) = m_warp.get_thread_buffer()[0];
+                    row_partial.get_thread_buffer()(0) = m_warp.get_thread_buffer()[0] * s_scale;
                 }
                 store_tile(max_lds_write_window, row_partial);
                 block_sync_lds();
@@ -892,11 +897,16 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
 
                 auto p_compute =
                     make_static_distributed_tensor<SMPLComputeDataType>(s.get_tile_distribution());
+                // kPScale * p in one step; l sums it until the end of the loop
+                constexpr SMPLComputeDataType kLog2PScale = 8.807354922057604f;
+                static_assert(kPScale == 448.f);
+                const SMPLComputeDataType p_bias = kLog2PScale - row_exp;
                 static_for<0, decltype(p_compute)::get_thread_buffer_size(), 1>{}([&](auto i) {
-                    p_compute.get_thread_buffer()(i) = exp2(s.get_thread_buffer()[i] - row_exp);
+                    p_compute.get_thread_buffer()(i) =
+                        exp2(__builtin_fmaf(s.get_thread_buffer()[i], s_scale, p_bias));
                 });
 
-                // the row sum of the warp's keys, and P as fp8 (kPScale * p, rounded once)
+                // the row sum of the warp's keys, and P as fp8 (rounded once)
                 {
                     auto l_warp = block_tile_reduce<SMPLComputeDataType>(
                         p_compute, sequence<1>{}, f_sum, SMPLComputeDataType{0});
@@ -904,7 +914,6 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                     row_partial.get_thread_buffer()(0) = l_warp.get_thread_buffer()[0];
                 }
                 store_tile(sum_lds_write_window, row_partial);
-                tile_elementwise_inout([](auto& x) { x *= kPScale; }, p_compute);
                 store_tile(p_lds_write_window, cast_tile<PDataType>(p_compute));
 
                 // In flight: V, then the K and V of the tiles ahead. This retires V and leaves
@@ -930,6 +939,8 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 gemm_1(o_acc, load_tile(p_lds_read_window), load_tile(v_lds_read_window));
                 stage = stage + 1 == Layout::kStages ? 0 : stage + 1;
             } while(++i_total_loops < num_total_loop);
+            // the sums are of kPScale * p
+            l.get_thread_buffer()(0) *= 1.f / kPScale;
         }
 
         if constexpr(kStoreLSE)
