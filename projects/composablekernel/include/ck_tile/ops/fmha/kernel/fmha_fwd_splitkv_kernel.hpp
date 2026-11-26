@@ -1380,18 +1380,21 @@ struct FmhaFwdSplitKVKernel
             tile_elementwise_inout([v_descale](auto& x) { x *= v_descale; }, o_acc_tile);
         }
 
-        // Oacc DRAM and Oacc DRAM window
-        auto o_acc_dram = [&] {
+        // Oacc DRAM over the workspace rows of this split, of ptr's element type; the rows keep
+        // their place, which the strides give in OaccDataType elements
+        const auto make_o_acc_dram = [&](auto* ptr, auto alignment) {
+            constexpr index_t kScale    = sizeof(OaccDataType) / sizeof(*ptr);
             const auto o_acc_dram_naive = [&] {
                 if constexpr(kMergeNumHeadGroupsSeqLenQ)
                 {
                     // reshape: (nhead_ratio_qk, seqlen_q, hdim_v) -> (nhead_ratio_qk * seqlen_q,
                     // hdim_v)
                     const auto view = make_naive_tensor_view<address_space_enum::global>(
-                        o_acc_ptr,
+                        ptr,
                         make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q, kargs.hdim_v),
-                        make_tuple(kargs.nhead_stride_o_acc, kargs.stride_o_acc, 1),
-                        number<FmhaPipeline::kAlignmentOacc>{},
+                        make_tuple(
+                            kargs.nhead_stride_o_acc * kScale, kargs.stride_o_acc * kScale, 1),
+                        alignment,
                         number<1>{});
 
                     return transform_tensor_view(
@@ -1403,10 +1406,10 @@ struct FmhaFwdSplitKVKernel
                 else
                 {
                     return make_naive_tensor_view<address_space_enum::global>(
-                        o_acc_ptr,
+                        ptr,
                         make_tuple(kargs.seqlen_q, kargs.hdim_v),
-                        make_tuple(kargs.stride_o_acc, 1),
-                        number<FmhaPipeline::kAlignmentOacc>{},
+                        make_tuple(kargs.stride_o_acc * kScale, 1),
+                        alignment,
                         number<1>{});
                 }
             }();
@@ -1415,25 +1418,39 @@ struct FmhaFwdSplitKVKernel
                 o_acc_dram_naive,
                 make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
                 sequence<kPadSeqLenQ, kPadHeadDimV>{});
-        }();
+        };
 
+        if constexpr(kClusterCombine)
+        {
+            if(kargs.combine.o_ptr != nullptr)
+            {
+                // The cluster combines the partials itself: they are stored in the output's
+                // type, in the leading bytes of the rows the workspace has for this split.
+                using FinalODataType = FinalODataType_;
+                static_assert(sizeof(FinalODataType) <= sizeof(OaccDataType));
+                const auto part_dram = make_o_acc_dram(reinterpret_cast<FinalODataType*>(o_acc_ptr),
+                                                       number<FmhaPipeline::kAlignmentOacc>{});
+                auto part_dram_window = make_tile_window(
+                    part_dram,
+                    make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
+                    {i_m0, i_n1});
+                store_tile(part_dram_window, cast_tile<FinalODataType>(o_acc_tile));
+
+                if constexpr(kSeveralClusters)
+                    CombineClusters(kargs, i_m0, i_split, i_nhead, i_batch, smem_ptr);
+                else
+                    ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch);
+                return;
+            }
+        }
+
+        const auto o_acc_dram = make_o_acc_dram(o_acc_ptr, number<FmhaPipeline::kAlignmentOacc>{});
         auto o_acc_dram_window =
             make_tile_window(o_acc_dram,
                              make_tuple(number<FmhaPipeline::kM0>{}, number<FmhaPipeline::kN1>{}),
                              {i_m0, i_n1});
 
         EpiloguePipeline{}(o_acc_dram_window, o_acc_tile, nullptr);
-
-        if constexpr(kClusterCombine)
-        {
-            if(kargs.combine.o_ptr != nullptr)
-            {
-                if constexpr(kSeveralClusters)
-                    CombineClusters(kargs, i_m0, i_split, i_nhead, i_batch, smem_ptr);
-                else
-                    ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch);
-            }
-        }
     }
 
     // Combines the splits of this tile, one workgroup cluster (launch with cluster x =
@@ -1548,6 +1565,7 @@ struct FmhaFwdSplitKVKernel
     // kShares]) workgroups: kThreads threads per row with kDims head dims each (hdim_v is a
     // multiple of kDims), a 16-byte store of the output. A thread issues all its loads before it
     // uses one; partials past num_parts read the last one again and weigh nothing.
+    // The partials are of the output's type, in the leading bytes of the workspace's rows.
     // kDeviceScope: the partials were stored at device scope by other clusters.
     // kToOutput: into the final output, else into slot i_first at device scope.
     template <index_t kParts,
@@ -1579,11 +1597,14 @@ struct FmhaFwdSplitKVKernel
 
         // the workspace from slot i_first on
         const index_t i_head0 = i_nhead * kargs.nhead_ratio_qk;
-        OaccDataType* o_acc   = reinterpret_cast<OaccDataType*>(kargs.o_acc_ptr) +
-                              static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
-                              static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc +
-                              static_cast<long_index_t>(i_first) * kargs.split_stride_o_acc;
-        LSEDataType* lse_acc = reinterpret_cast<LSEDataType*>(kargs.lse_acc_ptr) +
+        // the slot of split i_first; the workspace's strides are in OaccDataType elements
+        FinalODataType* o_acc = reinterpret_cast<FinalODataType*>(
+            reinterpret_cast<OaccDataType*>(kargs.o_acc_ptr) +
+            static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
+            static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc +
+            static_cast<long_index_t>(i_first) * kargs.split_stride_o_acc);
+        constexpr index_t kOaccBytes = sizeof(OaccDataType);
+        LSEDataType* lse_acc         = reinterpret_cast<LSEDataType*>(kargs.lse_acc_ptr) +
                                static_cast<long_index_t>(i_head0) * kargs.nhead_stride_lse_acc +
                                static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc +
                                static_cast<long_index_t>(i_first) * kargs.split_stride_lse_acc;
@@ -1604,8 +1625,9 @@ struct FmhaFwdSplitKVKernel
             return;
 
         using OaccVec = ext_vector_t<OaccDataType, kDims>;
+        using PartVec = thread_buffer<FinalODataType, kDims>;
         LSEDataType lse[kRows][kParts];
-        OaccVec part[kRows][kParts];
+        PartVec part[kRows][kParts];
         for(index_t j = 0; j < kRows; ++j)
         {
             // rows past the share read its last row again and are not stored
@@ -1614,7 +1636,10 @@ struct FmhaFwdSplitKVKernel
             {
                 const index_t i_s    = min(s, num_parts - 1);
                 const index_t lse_at = i_s * lse_step + i_row * kargs.nhead_stride_lse_acc;
-                const index_t o_at   = i_s * o_step + i_row * kargs.nhead_stride_o_acc + i_d;
+                // byte offset of the thread's dims in the row of partial i_s
+                const index_t o_at =
+                    (i_s * o_step + i_row * kargs.nhead_stride_o_acc) * kOaccBytes +
+                    i_d * sizeof(FinalODataType);
                 if constexpr(kDeviceScope)
                 {
                     constexpr auto kScope  = amd_buffer_coherence_enum::DEVICE;
@@ -1622,14 +1647,14 @@ struct FmhaFwdSplitKVKernel
                     const auto lse_acc_res = make_wave_buffer_resource(lse_acc, 0x7ffffffe);
                     lse[j][s]              = amd_buffer_load_impl<LSEDataType, 1, kScope>(
                         lse_acc_res, lse_at * sizeof(LSEDataType), 0)[number<0>{}];
-                    const auto v = amd_buffer_load_impl<OaccDataType, kDims, kScope>(
-                        o_acc_res, o_at * sizeof(OaccDataType), 0);
-                    __builtin_memcpy(&part[j][s], &v, sizeof(OaccVec));
+                    part[j][s] =
+                        amd_buffer_load_impl<FinalODataType, kDims, kScope>(o_acc_res, o_at, 0);
                 }
                 else
                 {
                     lse[j][s] = lse_acc[lse_at];
-                    __builtin_memcpy(&part[j][s], o_acc + o_at, sizeof(OaccVec));
+                    __builtin_memcpy(
+                        &part[j][s], reinterpret_cast<const char*>(o_acc) + o_at, sizeof(PartVec));
                 }
             }
         }
@@ -1658,7 +1683,10 @@ struct FmhaFwdSplitKVKernel
                     empty ? LSEDataType(0)
                           : ck_tile::exp2((lse[j][s] - lse_max) * log2e_v<LSEDataType>);
                 sum += w;
-                acc += w * part[j][s];
+                OaccVec p = {};
+                for(index_t d = 0; d < kDims; ++d)
+                    p[d] = type_convert<OaccDataType>(part[j][s][d]);
+                acc += w * p;
             }
             const LSEDataType rcp = empty ? LSEDataType(0) : LSEDataType(1) / sum;
             // taken only where the lse is stored
@@ -1690,13 +1718,13 @@ struct FmhaFwdSplitKVKernel
                 // those loads.
                 const auto o_acc_res   = make_wave_buffer_resource(o_acc, 0x7ffffffe);
                 const auto lse_acc_res = make_wave_buffer_resource(lse_acc, 0x7ffffffe);
-                const OaccVec out      = acc * rcp;
-                thread_buffer<OaccDataType, kDims> v;
-                __builtin_memcpy(&v, &out, sizeof(out));
-                amd_buffer_store_impl<OaccDataType, kDims, amd_buffer_coherence_enum::DEVICE>(
+                PartVec v;
+                for(index_t d = 0; d < kDims; ++d)
+                    v[d] = type_convert<FinalODataType>(acc[d] * rcp);
+                amd_buffer_store_impl<FinalODataType, kDims, amd_buffer_coherence_enum::DEVICE>(
                     v,
                     o_acc_res,
-                    (i_row * kargs.nhead_stride_o_acc + i_d) * sizeof(OaccDataType),
+                    i_row * kargs.nhead_stride_o_acc * kOaccBytes + i_d * sizeof(FinalODataType),
                     0);
                 if(i_d == 0)
                 {
