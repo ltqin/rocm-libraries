@@ -148,14 +148,14 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
     // and its own K / V buffers, so the loop has no barrier. At the end the warps exchange
     // their O and row statistics through LDS and combine them into the block's o_acc,
     // m_base and l.
-    template <typename QLdsView,
+    template <typename QInputTile,
               typename BiasDramWindow,
               typename QOrigin,
               typename PositionEncoding,
               typename PageNavigator,
               typename OaccTile,
               typename RowTile>
-    CK_TILE_DEVICE void RunWaveSplit(const QLdsView& q_lds_view,
+    CK_TILE_DEVICE void RunWaveSplit(const QInputTile& q_in,
                                      const BiasDramWindow& bias_dram_window,
                                      const FmhaMask& mask,
                                      const QOrigin& q_origin,
@@ -287,16 +287,18 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 issue_tile(page_ids[i], i);
         index_t page_id_ahead = page_ids[kStages - 1];
 
-        // retire Q only; the tiles, issued after it, stay in flight
-        wait_transfers(2 * min(num_trips, kStages - 1));
-        block_sync_lds();
-        auto q_lds_read_window =
-            make_tile_window(q_lds_view,
-                             Policy::template MakeQLdsBlockDescriptor<Problem>().get_lengths(),
-                             {0, 0},
-                             make_static_tile_distribution(Gemm0::MakeABlockDistributionEncode()));
+        // Q arrives in the cooperative gemm's operand layout. A warp holds the whole tile there
+        // as it does in the warp gemm's, element for element; only the encoding differs (the
+        // cooperative one names the warps that share it).
+        __builtin_amdgcn_sched_barrier(0);
         [[maybe_unused]] auto row_scale = SRowTile{};
-        const auto q_tile = MakeQTile(load_tile(q_lds_read_window), scale_s, row_scale);
+        const auto q_coop               = MakeQTile(q_in, scale_s, row_scale);
+        auto q_tile                     = make_static_distributed_tensor<QDataType>(
+            make_static_tile_distribution(Gemm0::MakeABlockDistributionEncode()));
+        static_assert(decltype(q_tile)::get_thread_buffer_size() ==
+                      remove_cvref_t<decltype(q_coop)>::get_thread_buffer_size());
+        static_for<0, decltype(q_tile)::get_thread_buffer_size(), 1>{}(
+            [&](auto i) { q_tile.get_thread_buffer()(i) = q_coop.get_thread_buffer()[i]; });
 
         // the warp's softmax state, of a lane's row: the row max, the row sum of p, and the
         // row max o_w and l_w are normalised to (see the cooperative loop)
@@ -549,6 +551,15 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetPVBlockGemm<Problem>();
 
+        // Q: every warp loads the whole tile from global memory,
+        // straight into gemm_0's operand layout. The loads are issued first of all: they
+        // depend on nothing the key range does, so they are under way while the sequence
+        // length and the page ids are fetched. Both loops take Q from here.
+        auto q_coop_dram_window = make_tile_window(
+            q_dram_block_window_tmp, Policy::template MakeQRegTileDistribution<Problem>());
+        const auto q_in = load_tile(q_coop_dram_window);
+        __builtin_amdgcn_sched_barrier(0);
+
         using SaccBlockTileType = decltype(gemm_0.MakeCBlockTile());
         auto s_acc              = SaccBlockTileType{};
 
@@ -598,27 +609,9 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         TDMConfig tdm_config_v =
             Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigV<Problem>>();
 
-        // Q through LDS. Issued next to the page ids of the main loop: neither depends on the
-        // other.
-        TDMConfig tdm_config_q =
-            Base::template MakeTdmConfig<typename Policy::template LdsPaddingConfigQ<Problem>>();
-        auto q_dram_window = make_tile_window(
-            q_dram_block_window_tmp, Policy::template MakeQDramTileDistribution<Problem>());
-        auto q_lds_view = make_tensor_view<address_space_enum::lds>(
-            reinterpret_cast<QInputDataType*>(static_cast<char*>(smem_arena) + Layout::kQOffset),
-            Policy::template MakeQLdsBlockDescriptor<Problem>());
-        auto q_lds_store_window = make_tile_window(
-            q_lds_view, Policy::template MakeQLdsBlockDescriptor<Problem>().get_lengths(), {0, 0});
-        auto q_lds_read_window =
-            make_tile_window(q_lds_view,
-                             Policy::template MakeQLdsBlockDescriptor<Problem>().get_lengths(),
-                             {0, 0},
-                             Policy::template MakeQRegTileDistribution<Problem>());
-        load_tile_tdm(tdm_config_q, q_lds_store_window, q_dram_window);
-
         if(kWaveSplitMinTiles <= num_total_loop)
         {
-            RunWaveSplit(q_lds_view,
+            RunWaveSplit(q_in,
                          bias_dram_block_window_tmp,
                          mask,
                          q_origin,
@@ -642,7 +635,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
             static_assert(Layout::kStages == 3);
             index_t page_id_1 = page_nav.page_id(i_page_start + 1);
 
-            // the page ids' users, and so their wait, stay behind the Q transfer
+            // the page ids' users, and so their wait, stay behind the loads above
             __builtin_amdgcn_sched_barrier(0);
             asm volatile("" : "+s"(page_id));
             asm volatile("" : "+s"(page_id_1));
@@ -783,7 +776,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 }
             };
             // The first two tiles, K then V of each as in every trip: the waits count on that
-            // order. They are issued while Q is in flight, and stay in flight when Q is retired.
+            // order. They are in flight while Q is quantized.
             issue_k(page_off, k_smem_buf0);
             issue_v(0, page_off, v_smem_buf0);
             if(1 < num_total_loop)
@@ -791,12 +784,9 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 const long_index_t page_off_1 = page_nav.page_offset(page_id_1);
                 issue_k(page_off_1, k_smem_buf0 + kKStride);
                 issue_v(1, page_off_1, v_smem_buf0 + kVStride);
-                s_wait_tensorcnt<4>();
             }
-            else
-                s_wait_tensorcnt<2>();
-            block_sync_lds();
-            const auto q_tile = MakeQTile(load_tile(q_lds_read_window), scale_s, row_scale);
+            __builtin_amdgcn_sched_barrier(0);
+            const auto q_tile = MakeQTile(q_in, scale_s, row_scale);
 
             index_t i_total_loops = 0;
             index_t stage         = 0;
