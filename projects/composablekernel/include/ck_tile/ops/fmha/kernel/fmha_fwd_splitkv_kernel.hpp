@@ -365,6 +365,13 @@ struct FmhaFwdSplitKVKernel
         ck_tile::index_t batch_stride_o_acc;
 
         std::conditional_t<kClusterCombine, ClusterCombineKargs, EmptyKargs<6>> combine = {};
+        // magic division numbers of seqlen_q (magic_division::calculate_magic_numbers), set by
+        // MakeKargs for the merged-row views: computed on the device they are a 64-bit division
+        uint32_t seqlen_q_magic_multiplier = 0;
+        uint32_t seqlen_q_magic_shift      = 0;
+        // the same for num_splits, which the grid's x is divided by
+        uint32_t num_splits_magic_multiplier = 0;
+        uint32_t num_splits_magic_shift      = 0;
     };
 
     struct GroupModeKargs
@@ -540,6 +547,16 @@ struct FmhaFwdSplitKVKernel
             kargs.v_descale_ptr = v_descale_ptr;
         }
 
+        {
+            const auto magic =
+                magic_division::calculate_magic_numbers(static_cast<uint32_t>(seqlen_q));
+            kargs.seqlen_q_magic_multiplier = magic[number<0>{}];
+            kargs.seqlen_q_magic_shift      = magic[number<1>{}];
+            const auto splits_magic =
+                magic_division::calculate_magic_numbers(static_cast<uint32_t>(num_splits));
+            kargs.num_splits_magic_multiplier = splits_magic[number<0>{}];
+            kargs.num_splits_magic_shift      = splits_magic[number<1>{}];
+        }
         return kargs;
     }
 
@@ -705,7 +722,17 @@ struct FmhaFwdSplitKVKernel
             return ck_tile::make_tuple(quotient, modulus);
         };
 
-        const auto [mn, i_split]        = f(blockIdx.x, kargs.num_splits);
+        const auto [mn, i_split] = [&]() {
+            if constexpr(kIsGroupMode)
+                return f(blockIdx.x, kargs.num_splits);
+            else
+            {
+                const index_t quotient = magic_division::do_magic_division(
+                    blockIdx.x, kargs.num_splits_magic_multiplier, kargs.num_splits_magic_shift);
+                return ck_tile::make_tuple(
+                    quotient, static_cast<index_t>(blockIdx.x) - quotient * kargs.num_splits);
+            }
+        }();
         const auto [i_tile_m, i_tile_n] = f(mn, num_tile_n1);
         const index_t i_nhead           = blockIdx.y;
         const index_t i_batch           = blockIdx.z;
@@ -920,11 +947,26 @@ struct FmhaFwdSplitKVKernel
 
         // Q/K/V DRAM and DRAM window
         // The merged rows, (Q head of the group, seqlen_q), of the Q, lse_acc and o_acc views.
-        // Built once: the transform computes the magic numbers of its division from the
-        // run-time lengths.
+        // Built once.
         [[maybe_unused]] const auto merge_rows = [&] {
             if constexpr(kMergeNumHeadGroupsSeqLenQ)
-                return make_merge_transform(make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q));
+            {
+                if constexpr(kIsGroupMode)
+                    return make_merge_transform(make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q));
+                else
+                {
+                    // batch mode: the host has the magic numbers of seqlen_q (the only length
+                    // the transform divides by)
+                    auto transform         = decltype(make_merge_transform(
+                        make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q))){};
+                    transform.low_lengths_ = make_tuple(kargs.nhead_ratio_qk, kargs.seqlen_q);
+                    transform.low_lengths_magic_divisor_ = make_tuple(
+                        make_tuple(uint32_t{0}, uint32_t{0}),
+                        make_tuple(kargs.seqlen_q_magic_multiplier, kargs.seqlen_q_magic_shift));
+                    transform.up_lengths_ = make_tuple(kargs.nhead_ratio_qk * kargs.seqlen_q);
+                    return transform;
+                }
+            }
             else
                 return 0;
         }();
