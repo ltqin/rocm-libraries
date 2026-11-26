@@ -762,6 +762,22 @@ struct FmhaFwdSplitKVKernel
         // this is the only __shared__ here and lands at offset 0 anyway.
         alignas(256) __shared__ char smem_ptr[GetSmemSize()];
 
+        if constexpr(kClusterCombine)
+        {
+            // The kernel arguments span several cache lines, and a load of a line not yet
+            // fetched takes a memory round trip: one load per line, all issued here, so that
+            // the round trips overlap instead of following each other down the prologue.
+            constexpr index_t kLine = 64;
+            uint32_t touched        = 0;
+            for(index_t at = kLine; at + sizeof(uint32_t) <= sizeof(Kargs); at += kLine)
+            {
+                uint32_t word;
+                __builtin_memcpy(&word, reinterpret_cast<const char*>(&kargs) + at, sizeof(word));
+                touched |= word;
+            }
+            asm volatile("" : : "s"(touched));
+        }
+
         // divide problem
         const auto [i_tile_m, i_tile_n, i_split, i_nhead, i_batch] = GetTileIndex(kargs);
 

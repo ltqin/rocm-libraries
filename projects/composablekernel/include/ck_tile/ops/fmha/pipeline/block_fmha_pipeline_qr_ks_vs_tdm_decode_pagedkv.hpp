@@ -128,6 +128,21 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
         }
     }
 
+    // LSE of the rows from the row max m (log2 domain, of the scaled scores) and the row sum l,
+    // in single precision throughout.
+    template <typename LSEaccDramBlockWindowTmp, typename RowTile>
+    CK_TILE_DEVICE static void
+    StoreLse(LSEaccDramBlockWindowTmp& lse_acc_dram_window, const RowTile& m, const RowTile& l)
+    {
+        constexpr LSEDataType kLn2 = static_cast<LSEDataType>(1.0 / C_LOG2E);
+        auto lse_acc = make_static_distributed_tensor<LSEDataType>(m.get_tile_distribution());
+        static_for<0, RowTile::get_thread_buffer_size(), 1>{}([&](auto i) {
+            lse_acc.get_thread_buffer()(i) =
+                m.get_thread_buffer()[i] * kLn2 + log(l.get_thread_buffer()[i]);
+        });
+        store_tile(lse_acc_dram_window, lse_acc);
+    }
+
     // The wave-split main loop, for long ranges: every warp runs whole kN0-key tiles on its
     // own, tile (kNumWarps * j + warp) of the range in its trip j, with its own softmax state
     // and its own K / V buffers, so the loop has no barrier. At the end the warps exchange
@@ -905,7 +920,7 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                     },
                     m_lse);
             }
-            Base::StoreLse(lse_acc_dram_window_tmp, m_lse, l, scale_s);
+            StoreLse(lse_acc_dram_window_tmp, m_lse, l);
         }
 
         tile_elementwise_inout([](auto& x) { x *= kPScale; }, l);
