@@ -614,14 +614,17 @@ struct BlockFmhaPipelineQRKSVSTdmPingPongPaged5DPolicy : BlockFmhaPipelineQRKSVS
                 sequence<0, 0>>{});
     }
 
-    // a warp's O (kM0 x kN1) for the merge of the wave-split loop
+    // A warp's O (kM0 x kN1) for the merge of the wave-split loop. A lane holds 16 bytes of a
+    // row: a row is padded by 16 bytes, so that the rows a wave accesses at once spread over the
+    // LDS banks (an unpadded row is a whole number of bank spans, and every row hits the same).
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto MakeOaccLdsBlockDescriptor()
     {
-        using Shape = typename Problem::BlockFmhaShape;
+        using Shape            = typename Problem::BlockFmhaShape;
+        constexpr index_t kVec = 16 / sizeof(typename Problem::OaccDataType);
         return make_naive_tensor_descriptor(make_tuple(number<Shape::kM0>{}, number<Shape::kN1>{}),
-                                            make_tuple(number<Shape::kN1>{}, number<1>{}),
-                                            number<16 / sizeof(typename Problem::OaccDataType)>{},
+                                            make_tuple(number<Shape::kN1 + kVec>{}, number<1>{}),
+                                            number<kVec>{},
                                             number<1>{});
     }
 
