@@ -1638,33 +1638,47 @@ struct FmhaFwdSplitKVKernel
         using PartVec = thread_buffer<FinalODataType, kDims>;
         LSEDataType lse[kRows][kParts];
         PartVec part[kRows][kParts];
+        // The byte offset of every load, all set up ahead of the first one: a load that had to
+        // wait for the address register of the one before it would follow it only then.
+        uint32_t lse_at[kRows][kParts];
+        uint32_t o_at[kRows][kParts];
         for(index_t j = 0; j < kRows; ++j)
         {
             // rows past the share read its last row again and are not stored
             const index_t i_row = i_m0 + min(row0 + j * kRowSlots + i_slot, row_end - 1);
             for(index_t s = 0; s < kParts; ++s)
             {
-                const index_t i_s    = min(s, num_parts - 1);
-                const index_t lse_at = i_s * lse_step + i_row * kargs.nhead_stride_lse_acc;
-                // byte offset of the thread's dims in the row of partial i_s
-                const index_t o_at =
-                    (i_s * o_step + i_row * kargs.nhead_stride_o_acc) * kOaccBytes +
-                    i_d * sizeof(FinalODataType);
+                const index_t i_s = min(s, num_parts - 1);
+                lse_at[j][s] =
+                    (i_s * lse_step + i_row * kargs.nhead_stride_lse_acc) * sizeof(LSEDataType);
+                // the thread's dims in the row of partial i_s
+                o_at[j][s] = (i_s * o_step + i_row * kargs.nhead_stride_o_acc) * kOaccBytes +
+                             i_d * sizeof(FinalODataType);
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        for(index_t j = 0; j < kRows; ++j)
+        {
+            for(index_t s = 0; s < kParts; ++s)
+            {
                 if constexpr(kDeviceScope)
                 {
                     constexpr auto kScope  = amd_buffer_coherence_enum::DEVICE;
                     const auto o_acc_res   = make_wave_buffer_resource(o_acc, 0x7ffffffe);
                     const auto lse_acc_res = make_wave_buffer_resource(lse_acc, 0x7ffffffe);
                     lse[j][s]              = amd_buffer_load_impl<LSEDataType, 1, kScope>(
-                        lse_acc_res, lse_at * sizeof(LSEDataType), 0)[number<0>{}];
-                    part[j][s] =
-                        amd_buffer_load_impl<FinalODataType, kDims, kScope>(o_acc_res, o_at, 0);
+                        lse_acc_res, lse_at[j][s], 0)[number<0>{}];
+                    part[j][s] = amd_buffer_load_impl<FinalODataType, kDims, kScope>(
+                        o_acc_res, o_at[j][s], 0);
                 }
                 else
                 {
-                    lse[j][s] = lse_acc[lse_at];
-                    __builtin_memcpy(
-                        &part[j][s], reinterpret_cast<const char*>(o_acc) + o_at, sizeof(PartVec));
+                    __builtin_memcpy(&lse[j][s],
+                                     reinterpret_cast<const char*>(lse_acc) + lse_at[j][s],
+                                     sizeof(LSEDataType));
+                    __builtin_memcpy(&part[j][s],
+                                     reinterpret_cast<const char*>(o_acc) + o_at[j][s],
+                                     sizeof(PartVec));
                 }
             }
         }
