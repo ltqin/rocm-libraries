@@ -723,7 +723,8 @@ struct FmhaFwdSplitKVKernel
 
     CK_TILE_DEVICE static constexpr auto GetTileIndex(const Kargs& kargs)
     {
-        const index_t num_tile_n1 = ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
+        [[maybe_unused]] const index_t num_tile_n1 =
+            ck_tile::integer_divide_ceil(kargs.hdim_v, FmhaPipeline::kN1);
 
         const auto f = [](index_t dividend, index_t divisor) {
             index_t quotient = dividend / divisor;
@@ -731,26 +732,37 @@ struct FmhaFwdSplitKVKernel
             return ck_tile::make_tuple(quotient, modulus);
         };
 
-        const auto [mn, i_split] = [&]() {
+        // batch mode divides by num_splits with the host's magic numbers
+        const auto by_num_splits = [&](index_t dividend) {
             if constexpr(kIsGroupMode)
-                return f(blockIdx.x, kargs.num_splits);
+                return f(dividend, kargs.num_splits);
             else
             {
                 const index_t quotient = magic_division::do_magic_division(
-                    blockIdx.x, kargs.num_splits_magic_multiplier, kargs.num_splits_magic_shift);
-                return ck_tile::make_tuple(
-                    quotient, static_cast<index_t>(blockIdx.x) - quotient * kargs.num_splits);
+                    dividend, kargs.num_splits_magic_multiplier, kargs.num_splits_magic_shift);
+                return ck_tile::make_tuple(quotient, dividend - quotient * kargs.num_splits);
             }
+        };
+        const auto [mn, i_split]        = by_num_splits(blockIdx.x);
+        const auto [i_tile_m, i_tile_n] = [&]() {
+            // A decode instance's rows are one tile along n: the cluster combine takes rows
+            // of kN1 head dims at most.
+            if constexpr(kClusterCombine)
+                return ck_tile::make_tuple(mn, index_t{0});
+            else
+                return f(mn, num_tile_n1);
         }();
-        const auto [i_tile_m, i_tile_n] = f(mn, num_tile_n1);
-        const index_t i_nhead           = blockIdx.y;
-        const index_t i_batch           = blockIdx.z;
+        const index_t i_nhead = blockIdx.y;
+        const index_t i_batch = blockIdx.z;
 
         if constexpr(kHasMask)
         {
             // assume that num_tile_n1 is always 1
-            return ck_tile::make_tuple(
-                (gridDim.x / kargs.num_splits) - 1 - i_tile_m, i_tile_n, i_split, i_nhead, i_batch);
+            return ck_tile::make_tuple(by_num_splits(gridDim.x).at(number<0>{}) - 1 - i_tile_m,
+                                       i_tile_n,
+                                       i_split,
+                                       i_nhead,
+                                       i_batch);
         }
         else
         {
@@ -802,12 +814,6 @@ struct FmhaFwdSplitKVKernel
         if constexpr(kClusterCombine)
             fetch_kernel_arguments(kargs);
 
-        // divide problem
-        const auto [i_tile_m, i_tile_n, i_split, i_nhead, i_batch] = GetTileIndex(kargs);
-
-        const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * FmhaPipeline::kM0);
-        const index_t i_n1 = amd_wave_read_first_lane(i_tile_n * FmhaPipeline::kN1);
-
         // The decode instances issue the sequence length's load here, first of the prologue:
         // the key range, the page ids and the K / V transfers wait on it in turn. The lengths
         // are read-only and the index is the wave's, so it is a scalar load, waited for where
@@ -818,9 +824,15 @@ struct FmhaFwdSplitKVKernel
 #if defined(__HIP_DEVICE_COMPILE__)
             if(kargs.seqlen_k_ptr != nullptr)
                 kargs.seqlen_k = cast_pointer_to_constant_address_space(
-                    kargs.seqlen_k_ptr)[amd_wave_read_first_lane(i_batch)];
+                    kargs.seqlen_k_ptr)[amd_wave_read_first_lane(blockIdx.z)];
 #endif
         }
+
+        // divide problem
+        const auto [i_tile_m, i_tile_n, i_split, i_nhead, i_batch] = GetTileIndex(kargs);
+
+        const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * FmhaPipeline::kM0);
+        const index_t i_n1 = amd_wave_read_first_lane(i_tile_n * FmhaPipeline::kN1);
 
         long_index_t batch_offset_q       = 0;
         long_index_t batch_offset_k       = 0; // unused for paged-kvcache
