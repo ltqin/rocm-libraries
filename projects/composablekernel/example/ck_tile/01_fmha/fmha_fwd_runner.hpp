@@ -1176,7 +1176,10 @@ fwd_result fmha_fwd_run(mode_enum mode,
         // The fp8bf16 d128 decode instances combine up to a cluster of splits themselves
         // (FmhaFwdSplitKVKernel::ClusterCombine), so they take no more splits than a cluster
         // holds, a power of two:
-        // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups;
+        // - short ranges: two tiles or more a split, on a grid of at most 512 workgroups; the
+        //   paged instances take a split a tile from four tiles on (fewer tiles run faster
+        //   as one split, which writes the output itself) while the grid stays within 256
+        //   workgroups, the split count rounded up to a power of two;
         // - long ranges, where the paged instances run every warp on tiles of its own
         //   (8 tiles or more a split): a grid of at most 256 workgroups, or half of it when
         //   that makes the splits long enough; 512 workgroups while a split has 10 to 32
@@ -1212,6 +1215,19 @@ fwd_result fmha_fwd_run(mode_enum mode,
             const int wide_splits = power_of_two(std::min(max_cluster, kMaxWorkgroup / num_heads));
             const int short_splits =
                 power_of_two(std::min({max_cluster, num_kv_tiles / 2, kMaxWorkgroup / num_heads}));
+            const auto power_of_two_ceil = [](int n) {
+                int p = 1;
+                while(p < n)
+                    p *= 2;
+                return p;
+            };
+            constexpr int kPerTileTiles = 4; // from which a split takes one tile
+            const int per_tile_splits =
+                kPerTileTiles <= num_kv_tiles
+                    ? std::min(power_of_two(
+                                   std::min(max_cluster, std::max(1, kLongWorkgroup / num_heads))),
+                               power_of_two_ceil(num_kv_tiles))
+                    : 1;
             const int clusters =
                 power_of_two(std::min({kMaxClusters,
                                        kLongWorkgroup / (num_heads * max_cluster),
@@ -1226,7 +1242,9 @@ fwd_result fmha_fwd_run(mode_enum mode,
                 const int wave_splits = kLongTiles * long_splits <= num_kv_tiles
                                             ? long_splits
                                             : std::max(1, long_splits / 2);
-                num_splits = kLongTiles * wave_splits <= num_kv_tiles ? wave_splits : short_splits;
+                num_splits            = kLongTiles * wave_splits <= num_kv_tiles
+                                            ? wave_splits
+                                            : std::max(short_splits, per_tile_splits);
             }
             else if(num_splits <= max_cluster)
                 num_splits = std::max(num_splits, short_splits);
