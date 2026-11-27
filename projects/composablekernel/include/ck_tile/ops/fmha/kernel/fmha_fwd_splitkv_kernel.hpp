@@ -7,6 +7,7 @@
 #include "ck_tile/ops/common.hpp"
 #include "ck_tile/ops/fmha/block/block_attention_bias_enum.hpp"
 #include "ck_tile/ops/fmha/block/block_attention_quant_scale_enum.hpp"
+#include "ck_tile/ops/fmha/block/block_fmha_splitkv_cluster_combine.hpp"
 #include "ck_tile/ops/fmha/block/page_block_navigator.hpp"
 #include "ck_tile/ops/fmha/block/variants.hpp"
 #include "ck_tile/ops/fmha/detail/fmha_fwd_kernel_path_markers.hpp"
@@ -147,6 +148,14 @@ struct FmhaFwdSplitKVKernel
                   "cluster combine: merged-head batch mode on the gfx1250 TDM pipelines");
     // splits one cluster combines; a cluster holds at most 16 workgroups
     static constexpr index_t kMaxClusterSplits = 16;
+    // the combine of the splits of a tile by the workgroups of its cluster(s)
+    template <typename FinalO = FinalODataType_>
+    using ClusterCombiner = BlockFmhaSplitKVClusterCombine<OaccDataType,
+                                                           FinalO,
+                                                           LSEDataType,
+                                                           FmhaPipeline::kM0,
+                                                           kBlockSize / 2>;
+    static_assert(kMaxClusterSplits == ClusterCombiner<int>::kMaxShares);
 
     // clang-format off
     template <typename T> struct t2s;
@@ -789,21 +798,9 @@ struct FmhaFwdSplitKVKernel
         // this is the only __shared__ here and lands at offset 0 anyway.
         alignas(256) __shared__ char smem_ptr[GetSmemSize()];
 
+        // the decode instances are short enough for the argument round trips to show
         if constexpr(kClusterCombine)
-        {
-            // The kernel arguments span several cache lines, and a load of a line not yet
-            // fetched takes a memory round trip: one load per line, all issued here, so that
-            // the round trips overlap instead of following each other down the prologue.
-            constexpr index_t kLine = 64;
-            uint32_t touched        = 0;
-            for(index_t at = kLine; at + sizeof(uint32_t) <= sizeof(Kargs); at += kLine)
-            {
-                uint32_t word;
-                __builtin_memcpy(&word, reinterpret_cast<const char*>(&kargs) + at, sizeof(word));
-                touched |= word;
-            }
-            asm volatile("" : : "s"(touched));
-        }
+            fetch_kernel_arguments(kargs);
 
         // divide problem
         const auto [i_tile_m, i_tile_n, i_split, i_nhead, i_batch] = GetTileIndex(kargs);
@@ -1513,10 +1510,33 @@ struct FmhaFwdSplitKVKernel
                     {i_m0, i_n1});
                 store_tile(part_dram_window, cast_tile<FinalODataType>(o_acc_tile));
 
+                // The workgroups of the tile's cluster combine the partials: launch with cluster
+                // x = the splits of one (<= kMaxClusterSplits).
+                const auto parts = MakeCombinePartials(kargs, i_nhead, i_batch);
+                const auto out   = MakeCombineOutput(kargs, i_nhead, i_batch);
                 if constexpr(kSeveralClusters)
-                    CombineClusters(kargs, i_m0, i_split, i_nhead, i_batch, smem_ptr);
+                    ClusterCombiner<>::CombineClusters(
+                        parts,
+                        out,
+                        i_m0,
+                        i_split,
+                        kargs.combine.group_splits,
+                        kargs.num_splits,
+                        kargs.nhead_ratio_qk,
+                        kargs.hdim_v,
+                        kargs.combine.counters_ptr +
+                            (static_cast<long_index_t>(i_batch) * kargs.combine.counter_heads +
+                             blockIdx.y) *
+                                kMaxClusterSplits,
+                        smem_ptr);
                 else
-                    ClusterCombine(kargs, i_m0, i_split, i_nhead, i_batch);
+                    ClusterCombiner<>::Combine(parts,
+                                               out,
+                                               i_m0,
+                                               i_split,
+                                               kargs.num_splits,
+                                               kargs.nhead_ratio_qk,
+                                               kargs.hdim_v);
                 return;
             }
         }
@@ -1530,307 +1550,40 @@ struct FmhaFwdSplitKVKernel
         EpiloguePipeline{}(o_acc_dram_window, o_acc_tile, nullptr);
     }
 
-    // Combines the splits of this tile, one workgroup cluster (launch with cluster x =
-    // num_splits <= kMaxClusterSplits), into the final output; seqlen_q must be 1, so that a row
-    // is a Q head. After the cluster barrier the o_acc / lse_acc of the splits are visible, and
-    // each workgroup combines its share of the rows.
+    // The partials and outputs of the head group of (i_nhead, i_batch), for ClusterCombiner.
     template <bool Cond = kClusterCombine>
-    CK_TILE_DEVICE static std::enable_if_t<Cond> ClusterCombine(
-        const Kargs& kargs, index_t i_m0, index_t i_split, index_t i_nhead, index_t i_batch)
+    CK_TILE_DEVICE static std::enable_if_t<Cond, typename ClusterCombiner<>::Partials>
+    MakeCombinePartials(const Kargs& kargs, index_t i_nhead, index_t i_batch)
     {
-#if defined(__gfx125__)
-        const index_t count = kargs.num_splits;
-        if(count > 1)
-        {
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
-            cluster_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
-        }
-        // the splits padded to a power of two, so that a thread's loads are a constant count
-        if(count <= 2)
-            CombineRows<2, 2, false, true>(
-                kargs, i_m0, 0, 1, count, i_split, count, i_nhead, i_batch);
-        else if(count <= 4)
-            CombineRows<4, 4, false, true>(
-                kargs, i_m0, 0, 1, count, i_split, count, i_nhead, i_batch);
-        else if(count <= 8)
-            CombineRows<8, 8, false, true>(
-                kargs, i_m0, 0, 1, count, i_split, count, i_nhead, i_batch);
-        else
-            CombineRows<16, 16, false, true>(
-                kargs, i_m0, 0, 1, count, i_split, count, i_nhead, i_batch);
-#else
-        ignore = kargs;
-        ignore = i_m0;
-        ignore = i_split;
-        ignore = i_nhead;
-        ignore = i_batch;
-#endif
+        const long_index_t i_head0 = static_cast<long_index_t>(i_nhead) * kargs.nhead_ratio_qk;
+        return {reinterpret_cast<OaccDataType*>(kargs.o_acc_ptr) +
+                    i_head0 * kargs.nhead_stride_o_acc +
+                    static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc,
+                reinterpret_cast<LSEDataType*>(kargs.lse_acc_ptr) +
+                    i_head0 * kargs.nhead_stride_lse_acc +
+                    static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc,
+                kargs.nhead_stride_o_acc,
+                kargs.nhead_stride_lse_acc,
+                kargs.split_stride_o_acc,
+                kargs.split_stride_lse_acc};
     }
-
-    // ClusterCombine for a tile of several clusters of combine.group_splits splits each. A
-    // cluster combines its splits into the workspace slot of its first split, at device scope.
-    // Split s of every cluster then counts on the tile's counter s, and the one of the last
-    // cluster to arrive combines the clusters' rows of share s into the output.
-    // smem: LDS no longer in use, one int32.
     template <bool Cond = kClusterCombine>
-    CK_TILE_DEVICE static std::enable_if_t<Cond> CombineClusters(const Kargs& kargs,
-                                                                 index_t i_m0,
-                                                                 index_t i_split,
-                                                                 index_t i_nhead,
-                                                                 index_t i_batch,
-                                                                 void* smem)
-    {
-#if defined(__gfx125__)
-        constexpr index_t kShares = kMaxClusterSplits;
-        const index_t count       = kargs.combine.group_splits;
-        const index_t i_local     = i_split % count;
-        const index_t i_first     = i_split - i_local;
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
-        cluster_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
-        CombineRows<kShares, kShares, false, false>(
-            kargs, i_m0, i_first, 1, count, i_local, count, i_nhead, i_batch);
-
-        // every wave's stores are acknowledged before the workgroup counts
-        asm volatile("s_wait_storecnt 0x0" ::: "memory");
-        int32_t* const is_last = static_cast<int32_t*>(smem);
-        block_sync_lds();
-        const index_t clusters = kargs.num_splits / count;
-        if(threadIdx.x == 0)
-        {
-            int32_t* const counter =
-                kargs.combine.counters_ptr +
-                (static_cast<long_index_t>(i_batch) * kargs.combine.counter_heads + blockIdx.y) *
-                    kShares +
-                i_local;
-            const bool last =
-                __scoped_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) ==
-                clusters - 1;
-            if(last) // every cluster has counted: zero for the next launch
-                __scoped_atomic_store_n(counter, 0, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-            *is_last = last ? 1 : 0;
-        }
-        block_sync_lds();
-        if(*is_last == 0)
-            return;
-        if(clusters <= 2)
-            CombineRows<2, kShares, true, true>(
-                kargs, i_m0, 0, count, clusters, i_local, count, i_nhead, i_batch);
-        else if(clusters <= 4)
-            CombineRows<4, kShares, true, true>(
-                kargs, i_m0, 0, count, clusters, i_local, count, i_nhead, i_batch);
-        else if(clusters <= 8)
-            CombineRows<8, kShares, true, true>(
-                kargs, i_m0, 0, count, clusters, i_local, count, i_nhead, i_batch);
-        else
-            CombineRows<16, kShares, true, true>(
-                kargs, i_m0, 0, count, clusters, i_local, count, i_nhead, i_batch);
-#else
-        ignore = kargs;
-        ignore = i_m0;
-        ignore = i_split;
-        ignore = i_nhead;
-        ignore = i_batch;
-        ignore = smem;
-#endif
-    }
-
-#if defined(__gfx125__)
-    // Combines num_parts <= kParts partials of a tile: the workspace slots i_first + i * step.
-    // This workgroup takes share i_share of the rows, split over num_shares (in (kShares / 2,
-    // kShares]) workgroups: kThreads threads per row with kDims head dims each (hdim_v is a
-    // multiple of kDims), a 16-byte store of the output. A thread issues all its loads before it
-    // uses one; partials past num_parts read the last one again and weigh nothing.
-    // The partials are of the output's type, in the leading bytes of the workspace's rows.
-    // kDeviceScope: the partials were stored at device scope by other clusters.
-    // kToOutput: into the final output, else into slot i_first at device scope.
-    template <index_t kParts,
-              index_t kShares,
-              bool kDeviceScope,
-              bool kToOutput,
-              bool Cond = kClusterCombine>
-    CK_TILE_DEVICE static std::enable_if_t<Cond> CombineRows(const Kargs& kargs,
-                                                             index_t i_m0,
-                                                             index_t i_first,
-                                                             index_t step,
-                                                             index_t num_parts,
-                                                             index_t i_share,
-                                                             index_t num_shares,
-                                                             index_t i_nhead,
-                                                             index_t i_batch)
+    CK_TILE_DEVICE static std::enable_if_t<Cond, typename ClusterCombiner<>::Output>
+    MakeCombineOutput(const Kargs& kargs, index_t i_nhead, index_t i_batch)
     {
         using FinalODataType       = FinalODataType_;
-        constexpr index_t kDims    = 16 / sizeof(FinalODataType);
-        constexpr index_t kThreads = 16; // per row
-        constexpr index_t kM0      = FmhaPipeline::kM0;
-        static_assert(kM0 <= kMaxClusterSplits && kBlockSize % kThreads == 0);
-        static_assert(std::is_same_v<OaccDataType, float> && std::is_same_v<LSEDataType, float>);
-        // rows the wave32 block takes at once, and the most a share has
-        constexpr index_t kRowSlots = kBlockSize / 2 / kThreads;
-        constexpr index_t kMaxRowsPer =
-            kShares == 2 ? kM0 : (kM0 + kShares / 2) / (kShares / 2 + 1);
-        constexpr index_t kRows = (kMaxRowsPer + kRowSlots - 1) / kRowSlots;
-
-        // the workspace from slot i_first on
-        const index_t i_head0 = i_nhead * kargs.nhead_ratio_qk;
-        // the slot of split i_first; the workspace's strides are in OaccDataType elements
-        FinalODataType* o_acc = reinterpret_cast<FinalODataType*>(
-            reinterpret_cast<OaccDataType*>(kargs.o_acc_ptr) +
-            static_cast<long_index_t>(i_head0) * kargs.nhead_stride_o_acc +
-            static_cast<long_index_t>(i_batch) * kargs.batch_stride_o_acc +
-            static_cast<long_index_t>(i_first) * kargs.split_stride_o_acc);
-        constexpr index_t kOaccBytes = sizeof(OaccDataType);
-        LSEDataType* lse_acc         = reinterpret_cast<LSEDataType*>(kargs.lse_acc_ptr) +
-                               static_cast<long_index_t>(i_head0) * kargs.nhead_stride_lse_acc +
-                               static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse_acc +
-                               static_cast<long_index_t>(i_first) * kargs.split_stride_lse_acc;
-        FinalODataType* o = reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
-                            static_cast<long_index_t>(i_head0) * kargs.combine.nhead_stride_o +
-                            static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o;
-        const index_t o_step   = step * kargs.split_stride_o_acc;
-        const index_t lse_step = step * kargs.split_stride_lse_acc;
-
-        // rows [row0, row_end) of the tile are this share's
-        const index_t num_rows = min(kargs.nhead_ratio_qk - i_m0, kM0);
-        const index_t rows_per = (kM0 + num_shares - 1) / num_shares;
-        const index_t row0     = i_share * rows_per;
-        const index_t row_end  = min(row0 + rows_per, num_rows);
-        const index_t i_slot   = threadIdx.x / kThreads;
-        const index_t i_d      = (threadIdx.x % kThreads) * kDims;
-        if(i_d >= kargs.hdim_v || row0 + i_slot >= row_end)
-            return;
-
-        using OaccVec = ext_vector_t<OaccDataType, kDims>;
-        using PartVec = thread_buffer<FinalODataType, kDims>;
-        LSEDataType lse[kRows][kParts];
-        PartVec part[kRows][kParts];
-        // The byte offset of every load, all set up ahead of the first one: a load that had to
-        // wait for the address register of the one before it would follow it only then.
-        uint32_t lse_at[kRows][kParts];
-        uint32_t o_at[kRows][kParts];
-        for(index_t j = 0; j < kRows; ++j)
-        {
-            // rows past the share read its last row again and are not stored
-            const index_t i_row = i_m0 + min(row0 + j * kRowSlots + i_slot, row_end - 1);
-            for(index_t s = 0; s < kParts; ++s)
-            {
-                const index_t i_s = min(s, num_parts - 1);
-                lse_at[j][s] =
-                    (i_s * lse_step + i_row * kargs.nhead_stride_lse_acc) * sizeof(LSEDataType);
-                // the thread's dims in the row of partial i_s
-                o_at[j][s] = (i_s * o_step + i_row * kargs.nhead_stride_o_acc) * kOaccBytes +
-                             i_d * sizeof(FinalODataType);
-            }
-        }
-        __builtin_amdgcn_sched_barrier(0);
-        for(index_t j = 0; j < kRows; ++j)
-        {
-            for(index_t s = 0; s < kParts; ++s)
-            {
-                if constexpr(kDeviceScope)
-                {
-                    constexpr auto kScope  = amd_buffer_coherence_enum::DEVICE;
-                    const auto o_acc_res   = make_wave_buffer_resource(o_acc, 0x7ffffffe);
-                    const auto lse_acc_res = make_wave_buffer_resource(lse_acc, 0x7ffffffe);
-                    lse[j][s]              = amd_buffer_load_impl<LSEDataType, 1, kScope>(
-                        lse_acc_res, lse_at[j][s], 0)[number<0>{}];
-                    part[j][s] = amd_buffer_load_impl<FinalODataType, kDims, kScope>(
-                        o_acc_res, o_at[j][s], 0);
-                }
-                else
-                {
-                    __builtin_memcpy(&lse[j][s],
-                                     reinterpret_cast<const char*>(lse_acc) + lse_at[j][s],
-                                     sizeof(LSEDataType));
-                    __builtin_memcpy(&part[j][s],
-                                     reinterpret_cast<const char*>(o_acc) + o_at[j][s],
-                                     sizeof(PartVec));
-                }
-            }
-        }
-        __builtin_amdgcn_sched_barrier(0);
-
-        for(index_t j = 0; j < kRows; ++j)
-        {
-            const index_t row = row0 + j * kRowSlots + i_slot;
-            if(row >= row_end)
-                break;
-            const index_t i_row = i_m0 + row;
-
-            LSEDataType lse_max = -numeric<LSEDataType>::infinity();
-            for(index_t s = 0; s < kParts; ++s)
-            {
-                lse[j][s] = s < num_parts ? lse[j][s] : -numeric<LSEDataType>::infinity();
-                lse_max   = max(lse_max, lse[j][s]);
-            }
-            // a row without keys in any partial is all zeros
-            const bool empty = lse_max == -numeric<LSEDataType>::infinity();
-            LSEDataType sum  = 0;
-            OaccVec acc      = {};
-            for(index_t s = 0; s < kParts; ++s)
-            {
-                const LSEDataType w =
-                    empty ? LSEDataType(0)
-                          : ck_tile::exp2((lse[j][s] - lse_max) * log2e_v<LSEDataType>);
-                sum += w;
-                OaccVec p = {};
-                for(index_t d = 0; d < kDims; ++d)
-                    p[d] = type_convert<OaccDataType>(part[j][s][d]);
-                acc += w * p;
-            }
-            const LSEDataType rcp = empty ? LSEDataType(0) : LSEDataType(1) / sum;
-            // taken only where the lse is stored
-            const auto lse_row = [&]() { return empty ? lse_max : ck_tile::log(sum) + lse_max; };
-
-            if constexpr(kToOutput)
-            {
-                FinalODataType out[kDims];
-                for(index_t d = 0; d < kDims; ++d)
-                    out[d] = type_convert<FinalODataType>(acc[d] * rcp);
-                __builtin_memcpy(
-                    o + static_cast<long_index_t>(i_row) * kargs.combine.nhead_stride_o + i_d,
-                    out,
-                    sizeof(out));
-
-                if(kargs.combine.lse_ptr != nullptr && i_d == 0)
-                {
-                    LSEDataType* lse_out =
-                        reinterpret_cast<LSEDataType*>(kargs.combine.lse_ptr) +
-                        static_cast<long_index_t>(i_head0 + i_row) *
-                            kargs.combine.nhead_stride_lse +
-                        static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_lse;
-                    *lse_out = lse_row();
-                }
-            }
-            else
-            {
-                // Only this workgroup reads the rows it writes to the slot, and it has issued
-                // those loads.
-                const auto o_acc_res   = make_wave_buffer_resource(o_acc, 0x7ffffffe);
-                const auto lse_acc_res = make_wave_buffer_resource(lse_acc, 0x7ffffffe);
-                PartVec v;
-                for(index_t d = 0; d < kDims; ++d)
-                    v[d] = type_convert<FinalODataType>(acc[d] * rcp);
-                amd_buffer_store_impl<FinalODataType, kDims, amd_buffer_coherence_enum::DEVICE>(
-                    v,
-                    o_acc_res,
-                    i_row * kargs.nhead_stride_o_acc * kOaccBytes + i_d * sizeof(FinalODataType),
-                    0);
-                if(i_d == 0)
-                {
-                    thread_buffer<LSEDataType, 1> l;
-                    l[number<0>{}] = lse_row();
-                    amd_buffer_store_impl<LSEDataType, 1, amd_buffer_coherence_enum::DEVICE>(
-                        l,
-                        lse_acc_res,
-                        i_row * kargs.nhead_stride_lse_acc * sizeof(LSEDataType),
-                        0);
-                }
-            }
-        }
+        const long_index_t i_head0 = static_cast<long_index_t>(i_nhead) * kargs.nhead_ratio_qk;
+        return {reinterpret_cast<FinalODataType*>(kargs.combine.o_ptr) +
+                    i_head0 * kargs.combine.nhead_stride_o +
+                    static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_o,
+                kargs.combine.lse_ptr == nullptr
+                    ? nullptr
+                    : reinterpret_cast<LSEDataType*>(kargs.combine.lse_ptr) +
+                          i_head0 * kargs.combine.nhead_stride_lse +
+                          static_cast<long_index_t>(i_batch) * kargs.combine.batch_stride_lse,
+                kargs.combine.nhead_stride_o,
+                kargs.combine.nhead_stride_lse};
     }
-#endif
 };
 
 } // namespace ck_tile

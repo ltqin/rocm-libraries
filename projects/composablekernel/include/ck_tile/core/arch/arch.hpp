@@ -1918,4 +1918,26 @@ CK_TILE_HOST_DEVICE static constexpr auto get_max_mem_vec_inst_width()
     return 16;
 }
 
+// Issues a load of every cache line of a kernel's argument struct at once and waits for them.
+// A kernel whose prologue reads its arguments group by group pays a memory round trip per line
+// it has not touched yet, one after another; called first, this makes them overlap.
+template <typename Kargs>
+CK_TILE_DEVICE void fetch_kernel_arguments(const Kargs& kargs)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    constexpr index_t kLine = 64;
+    uint32_t touched        = 0;
+    for(index_t at = kLine; at + sizeof(uint32_t) <= sizeof(Kargs); at += kLine)
+    {
+        uint32_t word;
+        __builtin_memcpy(&word, reinterpret_cast<const char*>(&kargs) + at, sizeof(word));
+        touched |= word;
+    }
+    // the empty use keeps the loads here
+    asm volatile("" : : "s"(touched));
+#else
+    ignore = kargs;
+#endif
+}
+
 } // namespace ck_tile

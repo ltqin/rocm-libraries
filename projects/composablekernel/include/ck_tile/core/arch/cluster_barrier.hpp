@@ -35,6 +35,17 @@ CK_TILE_DEVICE void cluster_barrier()
 #endif
 }
 
+/// Publishes the workgroup's stores to its cluster and takes in the stores of the cluster's other
+/// workgroups: a release fence, the cluster barrier and an acquire fence, all of cluster scope.
+CK_TILE_DEVICE void cluster_sync_memory()
+{
+#if defined(__gfx125__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "cluster");
+    cluster_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "cluster");
+#endif
+}
+
 /// The first half of cluster_barrier(): the workgroup barrier, then the workgroup's first wave
 /// signals the cluster barrier.
 CK_TILE_DEVICE void cluster_barrier_arrive()

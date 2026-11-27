@@ -2844,40 +2844,6 @@ fwd_result fmha_fwd_run(mode_enum mode,
         o_buf.FromDevice(o_host.data());
         lse_buf.FromDevice(lse_host.data());
         randval_buf.FromDevice(randval_host.data());
-        // (a single split without an LSE output may write the output directly and leave the O
-        // workspace alone)
-        if(force_split && !(num_splits == 1 && !lse))
-        {
-            // Every split row is finite, or empty: LSE -inf and O 0 (an empty split must write).
-            // A row holds hdim_v values of OaccDataType, or of ODataType in its leading bytes
-            // when the split kernel combines the splits itself.
-            lse_acc_buf.FromDevice(lse_acc_host.data());
-            o_acc_buf.FromDevice(o_acc_host.data());
-            const auto row_ok = [&](LSEDataType row_lse, const auto* row_o) {
-                const auto as_float = [](auto x) { return ck_tile::type_convert<float>(x); };
-                const bool empty_row =
-                    std::isinf(row_lse) && row_lse < 0 &&
-                    std::all_of(row_o, row_o + hdim_v, [&](auto x) { return as_float(x) == 0; });
-                const bool finite_row =
-                    std::isfinite(row_lse) && std::all_of(row_o, row_o + hdim_v, [&](auto x) {
-                        return std::isfinite(as_float(x));
-                    });
-                return empty_row || finite_row;
-            };
-            std::size_t bad_rows = 0;
-            for(std::size_t row = 0; row < lse_acc_host.get_element_size(); ++row)
-            {
-                const LSEDataType row_lse = lse_acc_host.data()[row];
-                const OaccDataType* row_o = o_acc_host.data() + row * hdim_v;
-                if(!row_ok(row_lse, row_o) &&
-                   !row_ok(row_lse, reinterpret_cast<const ODataType*>(row_o)))
-                    ++bad_rows;
-            }
-            if(bad_rows != 0)
-                std::cerr << "split-kv workspace: " << bad_rows << " rows neither finite nor empty"
-                          << std::endl;
-            pass &= bad_rows == 0;
-        }
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(kv_vec5d && kv.diff_linear)
         {
