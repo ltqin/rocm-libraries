@@ -808,6 +808,20 @@ struct FmhaFwdSplitKVKernel
         const index_t i_m0 = amd_wave_read_first_lane(i_tile_m * FmhaPipeline::kM0);
         const index_t i_n1 = amd_wave_read_first_lane(i_tile_n * FmhaPipeline::kN1);
 
+        // The decode instances issue the sequence length's load here, first of the prologue:
+        // the key range, the page ids and the K / V transfers wait on it in turn. The lengths
+        // are read-only and the index is the wave's, so it is a scalar load, waited for where
+        // the length is first used.
+        constexpr bool kSeqlenKFirst = kClusterCombine && !kIsGroupMode;
+        if constexpr(kSeqlenKFirst)
+        {
+#if defined(__HIP_DEVICE_COMPILE__)
+            if(kargs.seqlen_k_ptr != nullptr)
+                kargs.seqlen_k = cast_pointer_to_constant_address_space(
+                    kargs.seqlen_k_ptr)[amd_wave_read_first_lane(i_batch)];
+#endif
+        }
+
         long_index_t batch_offset_q       = 0;
         long_index_t batch_offset_k       = 0; // unused for paged-kvcache
         long_index_t batch_offset_v       = 0; // unused for paged-kvcache
@@ -915,9 +929,12 @@ struct FmhaFwdSplitKVKernel
                 batch_offset_bias = static_cast<long_index_t>(i_batch) * kargs.batch_stride_bias;
             }
 
-            if(kargs.seqlen_k_ptr != nullptr)
+            if constexpr(!kSeqlenKFirst)
             {
-                kargs.seqlen_k = kargs.seqlen_k_ptr[i_batch];
+                if(kargs.seqlen_k_ptr != nullptr)
+                {
+                    kargs.seqlen_k = kargs.seqlen_k_ptr[i_batch];
+                }
             }
         }
         // for simplicity, batch stride we just modify the pointer
