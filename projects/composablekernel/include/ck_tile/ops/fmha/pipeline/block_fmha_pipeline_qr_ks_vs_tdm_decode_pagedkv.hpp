@@ -390,16 +390,6 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 l_w += l_tile.get_thread_buffer()[0];
             }
 
-            // P as fp8 (rounded once): gemm_0's result layout of a warp is gemm_1's A layout
-            const auto p_fp8 = cast_tile<PDataType>(p_compute);
-            auto p_tile      = make_static_distributed_tensor<PDataType>(
-                make_static_tile_distribution(Gemm1::MakeABlockDistributionEncode()));
-            static_assert(decltype(p_tile)::get_thread_buffer_size() ==
-                              decltype(p_fp8)::get_thread_buffer_size() &&
-                          Gemm1::MIterPerWarp == 1 && Gemm1::KIterPerWarp == 1);
-            static_for<0, decltype(p_tile)::get_thread_buffer_size(), 1>{}(
-                [&](auto i) { p_tile.get_thread_buffer()(i) = p_fp8.get_thread_buffer()[i]; });
-
             // retire this trip's V
             wait_transfers(2 * tiles_in_flight - 2);
 
@@ -441,9 +431,25 @@ struct BlockFmhaPipelineQRKSVSTdmDecodePagedKV
                 }
             }
 
-            // STAGE 4, PV gemm
+            // The V operand is read here, ahead of P's conversion, which covers the reads'
+            // latency: gemm_1's WMMAs then follow each other. The barriers keep the reads here.
             v_lds_read_window.set_bottom_tensor_view_data_ptr(v_buf0 + stage * kVStride);
-            gemm_1(o_w, p_tile, load_tile(v_lds_read_window));
+            __builtin_amdgcn_sched_barrier(0);
+            const auto v_tile = load_tile(v_lds_read_window);
+            __builtin_amdgcn_sched_barrier(0);
+
+            // P as fp8 (rounded once): gemm_0's result layout of a warp is gemm_1's A layout
+            const auto p_fp8 = cast_tile<PDataType>(p_compute);
+            auto p_tile      = make_static_distributed_tensor<PDataType>(
+                make_static_tile_distribution(Gemm1::MakeABlockDistributionEncode()));
+            static_assert(decltype(p_tile)::get_thread_buffer_size() ==
+                              decltype(p_fp8)::get_thread_buffer_size() &&
+                          Gemm1::MIterPerWarp == 1 && Gemm1::KIterPerWarp == 1);
+            static_for<0, decltype(p_tile)::get_thread_buffer_size(), 1>{}(
+                [&](auto i) { p_tile.get_thread_buffer()(i) = p_fp8.get_thread_buffer()[i]; });
+
+            // STAGE 4, PV gemm
+            gemm_1(o_w, p_tile, v_tile);
             stage = stage + 1 == kStages ? 0 : stage + 1;
         }
 
